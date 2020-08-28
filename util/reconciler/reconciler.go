@@ -69,5 +69,5 @@ func RequeueWithError(err error) (ctrl.Result, error) {
 }
 
 func RequeueAfter(requeueTime time.Duration) (ctrl.Result, error) {
-	return ctrl.Result{RequeueAfter: requeueTime}, nil
+	return ctrl.Result{Requeue: true, RequeueAfter: requeueTime}, nil
 }
