@@ -14,10 +14,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 )
 
-var log = logf.Log.WithName("util")
+var log = logf.Log.WithName("operator-utils").WithName("reconciler")
 
 //ManageError will set status of the passed CR to a error condition
-func ManageError(client client.Client, obj apis.Resource, issue error) (ctrl.Result, error) {
+func ManageError(client client.Client, obj apis.Resource, issue error, isRetriable bool) (ctrl.Result, error) {
 	if reconcileStatusAware, updateStatus := (obj).(apis.ConditionsStatusAware); updateStatus {
 		condition := status.Condition{
 			Type:               "ReconcileError",
@@ -35,7 +35,11 @@ func ManageError(client client.Client, obj apis.Resource, issue error) (ctrl.Res
 	} else {
 		log.Info("object is not ReconcileStatusAware, not setting status")
 	}
-	return ctrl.Result{}, issue
+
+	if isRetriable {
+		return ctrl.Result{}, issue
+	}
+	return ctrl.Result{}, nil
 }
 
 // ManageSuccess will update the status of the CR and return a successful reconcile result
