@@ -39,6 +39,12 @@ func ManageError(client client.Client, obj apis.Resource, issue error, isRetriab
 	if isRetriable {
 		return ctrl.Result{}, issue
 	}
+
+	// Log error in case it's not Retriable error
+	if issue != nil {
+		log.Error(issue, "reconciliation error")
+	}
+
 	return ctrl.Result{}, nil
 }
 
