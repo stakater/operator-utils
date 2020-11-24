@@ -1,3 +1,5 @@
+// Inspired by https://github.com/redhat-cop/operator-utils/blob/master/pkg/util/reconciler.go
+
 package reconciler
 
 import (
@@ -8,24 +10,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
-)
-
-const (
-	// RunningReason - Condition is running
-	RunningReason = "Running"
-	// SuccessfulReason - Condition is running due to reconcile being successful
-	SuccessfulReason = "Successful"
-	// FailedReason - Condition is failed due to ansible failure
-	FailedReason = "Failed"
-	// UnknownFailedReason - Condition is unknown
-	UnknownFailedReason = "Unknown"
-)
-
-const (
-	// RunningMessage - message for running reason.
-	RunningMessage = "Running reconciliation"
-	// SuccessfulMessage - message for successful reason.
-	SuccessfulMessage = "Awaiting next reconciliation"
 )
 
 var log = logf.Log.WithName("operator-utils").WithName("reconciler")
