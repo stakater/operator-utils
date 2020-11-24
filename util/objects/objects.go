@@ -18,7 +18,6 @@ const (
 // CreateOrUpdate wraps the function provided by controller-runtime to include
 // some additional logging and common functionality across all resources.
 func CreateOrUpdate(ctx context.Context, c client.Client, obj runtime.Object, f controllerutil.MutateFn) (controllerutil.OperationResult, error) {
-
 	return controllerutil.CreateOrUpdate(ctx, c, obj, func() error {
 		original := obj.DeepCopyObject()
 
