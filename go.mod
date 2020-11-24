@@ -4,6 +4,7 @@ go 1.15
 
 require (
 	github.com/go-logr/zapr v0.1.1 // indirect
+	github.com/google/go-cmp v0.5.0
 	github.com/prometheus/client_golang v1.5.1 // indirect
 	github.com/stretchr/testify v1.6.1 // indirect
 	go.uber.org/zap v1.14.1 // indirect
