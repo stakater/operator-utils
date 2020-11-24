@@ -3,7 +3,7 @@ module github.com/stakater/operator-utils
 go 1.15
 
 require (
-	github.com/go-logr/logr v0.2.1
+	github.com/go-logr/logr v0.3.0 // indirect
 	github.com/go-logr/zapr v0.3.0 // indirect
 	github.com/google/go-cmp v0.5.3
 	github.com/prometheus/client_golang v1.5.1 // indirect
