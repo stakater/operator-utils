@@ -25,24 +25,23 @@ jobs:
           go-version: ${{ env.GOLANG_VERSION }}
         id: go
 
-      - run: |
-          git fetch --prune --unshallow --tags
-
-      - name: Create changelogs
-        id: changelogs
-        uses: heineiuo/create-changelogs@master
-
+      - name: Changelog
+        uses: scottbrenner/generate-changelog-action@master
+        id: Changelog
+        env:
+          REPO: ${{ github.repository }}
       - name: Create Release
         id: create_release
         uses: actions/create-release@latest
         env:
-          GITHUB_TOKEN: ${{ secrets.STAKATER_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.STAKATER_GITHUB_TOKEN }} 
         with:
           tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
-          body: ${{ steps.changelogs.outputs.changelogs }}
+          release_name: Release ${{ github.ref }}
+          body: |
+            ${{ steps.Changelog.outputs.changelog }}
           draft: false
-          prerelease: ${{ steps.changelogs.outputs.release_type == 'prerelease' }}
+          prerelease: false
 
       - name: Notify Slack
         uses: 8398a7/action-slack@v3
