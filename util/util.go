@@ -11,8 +11,8 @@ var readNamespace = func() ([]byte, error) {
 	return ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 }
 
-// getOperatorNamespace returns the namespace the operator should be running in.
-func getOperatorNamespace() (string, error) {
+// GetOperatorNamespace returns the namespace the operator should be running in.
+func GetOperatorNamespace() (string, error) {
 	nsBytes, err := readNamespace()
 	if err != nil {
 		if os.IsNotExist(err) {
