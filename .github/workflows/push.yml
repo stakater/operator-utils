@@ -7,8 +7,8 @@ on:
 
 env:
   DOCKER_FILE_PATH: Dockerfile
-  GOLANG_VERSION: 1.15.2
-  GOLANG_CI_LINT_VERSION: v1.32.2
+  GOLANG_VERSION: 1.16
+  GOLANG_CI_LINT_VERSION: v1.39.0
 
 jobs:
   build:
