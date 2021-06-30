@@ -47,6 +47,34 @@ func ManageError(client client.Client, obj Resource, issue error, isRetriable bo
 	return ctrl.Result{}, nil
 }
 
+//ManageErrors will set status of the passed CR to errors condition
+func ManageErrors(client client.Client, obj Resource, issues []error) (ctrl.Result, error) {
+	if reconcileStatusAware, updateStatus := (obj).(ConditionsStatusAware); updateStatus {
+		conditions := []metav1.Condition{}
+		for _, err := range issues {
+			condition := metav1.Condition{
+				Type:               "ReconcileError",
+				LastTransitionTime: metav1.Now(),
+				Message:            err.Error(),
+				Reason:             FailedReason,
+				Status:             "True",
+			}
+
+			conditions = append(conditions, condition)
+		}
+		reconcileStatusAware.SetReconcileStatus(conditions)
+		err := client.Status().Update(context.Background(), obj)
+		if err != nil {
+			log.Error(err, "unable to update status")
+			return ctrl.Result{}, err
+		}
+	} else {
+		log.Info("object is not ReconcileStatusAware, not setting status")
+	}
+
+	return ctrl.Result{}, nil
+}
+
 // ManageSuccess will update the status of the CR and return a successful reconcile result
 func ManageSuccess(client client.Client, obj Resource) (ctrl.Result, error) {
 	if reconcileStatusAware, updateStatus := (obj).(ConditionsStatusAware); updateStatus {
