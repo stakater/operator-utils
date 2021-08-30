@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 var readNamespace = func() ([]byte, error) {
@@ -33,4 +35,26 @@ func TimeElapsed(functionName string) func() {
 	return func() {
 		fmt.Printf("%s took %v\n", functionName, time.Since(start))
 	}
+}
+
+// StringP Returns a pointer of a string variable
+func StringP(val string) *string {
+	return &val
+}
+
+// PString Returns a string value from a pointer
+func PString(val *string) string {
+	if val == nil {
+		return ""
+	}
+	return *val
+}
+
+// GetLabelSelector returns label selector
+func GetLabelSelector(key string, value string) labels.Selector {
+	// Key is empty
+	if len(key) == 0 {
+		return labels.SelectorFromSet(map[string]string{})
+	}
+	return labels.SelectorFromSet(labels.Set{key: value})
 }
