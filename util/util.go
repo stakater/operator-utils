@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 var readNamespace = func() ([]byte, error) {
