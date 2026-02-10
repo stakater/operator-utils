@@ -6,8 +6,8 @@ on:
       - master
 
 env:
-  GOLANG_VERSION: 1.16
-  GOLANG_CI_LINT_VERSION: v1.39.0
+  GOLANG_VERSION: 1.25
+  GOLANG_CI_LINT_VERSION: v1.64.0
 
 jobs:
   build:
@@ -16,19 +16,19 @@ jobs:
     if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"    
     steps:
     - name: Check out code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v5
       with:
         ref: ${{github.event.pull_request.head.sha}}
 
     - name: Set up Go
       id: go
-      uses: actions/setup-go@v2
+      uses: actions/setup-go@v6
       with:
         go-version: ${{ env.GOLANG_VERSION }}
 
     - name: Lint
-      uses: golangci/golangci-lint-action@v2.3.0
+      uses: golangci/golangci-lint-action@v9
       with:
-        version: v1.39.0
+        version: ${{ env.GOLANG_CI_LINT_VERSION }}
         only-new-issues: false
         args: --timeout 10m
