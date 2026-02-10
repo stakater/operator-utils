@@ -1,8 +1,10 @@
+// +kubebuilder:object:generate=true
 package resourcefiltering
 
 import "slices"
 
 // Matcher determines whether a given string passes a filter rule.
+// +kubebuilder:object:generate=false
 type Matcher interface {
 	Pass(s string) bool
 }
@@ -63,33 +65,4 @@ func IsAllowed(ad *AllowDeny, name string) bool {
 		return false
 	}
 	return ad.Pass(name)
-}
-
-// DeepCopyInto copies the receiver into out. in must be non-nil.
-func (in *AllowDeny) DeepCopyInto(out *AllowDeny) {
-	*out = *in
-	if in.Allow != nil {
-		out.Allow = &Allow{}
-		if in.Allow.Literal != nil {
-			out.Allow.Literal = make([]string, len(in.Allow.Literal))
-			copy(out.Allow.Literal, in.Allow.Literal)
-		}
-	}
-	if in.Deny != nil {
-		out.Deny = &Deny{}
-		if in.Deny.Literal != nil {
-			out.Deny.Literal = make([]string, len(in.Deny.Literal))
-			copy(out.Deny.Literal, in.Deny.Literal)
-		}
-	}
-}
-
-// DeepCopy returns a deep copy of the AllowDeny.
-func (in *AllowDeny) DeepCopy() *AllowDeny {
-	if in == nil {
-		return nil
-	}
-	out := new(AllowDeny)
-	in.DeepCopyInto(out)
-	return out
 }
