@@ -7,7 +7,7 @@ on:
 
 env:
   GOLANG_VERSION: 1.25
-  GOLANG_CI_LINT_VERSION: v1.64.0
+  GOLANG_CI_LINT_VERSION: v2.8.0
 
 jobs:
   build:
