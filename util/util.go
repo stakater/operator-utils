@@ -3,7 +3,6 @@ package util
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -12,7 +11,7 @@ import (
 )
 
 var readNamespace = func() ([]byte, error) {
-	return ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	return os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 }
 
 // GetOperatorNamespace returns the namespace the operator should be running in.
