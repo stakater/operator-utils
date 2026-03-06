@@ -105,28 +105,46 @@ Releases all watches for a consumer. Idempotent — calling on an unknown consum
 
 ## Convenience Callbacks
 
-Three callback helpers are provided for common patterns. All use non-blocking channel sends (dropped events are recovered by informer resync).
+Callback helpers are provided for common patterns. All use non-blocking channel sends (dropped events are recovered by informer resync).
 
-### `EnqueueOwnersCallback`
+### `EventCallbackFromMapFunc`
 
-Routes events to the owning resource by resolving `OwnerReferences`:
+The foundational helper. Takes a `MapFunc` that maps an event object to zero or more `reconcile.Request`s, giving the consumer full control over what gets enqueued:
 
 ```go
-ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
 eventCh := make(chan event.GenericEvent, 1024)
 
-callback := di.EnqueueOwnersCallback(ownerGVK, eventCh)
+callback := di.EventCallbackFromMapFunc(
+    func(obj *unstructured.Unstructured) []reconcile.Request {
+        annotations := obj.GetAnnotations()
+        name := annotations["example.com/owner-name"]
+        ns := annotations["example.com/owner-namespace"]
+        if name == "" || ns == "" {
+            return nil
+        }
+        return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}}
+    },
+    eventCh,
+)
 ```
 
 ### `LabelSelectorCallback`
 
-Routes events for objects matching a label selector:
+Filters events by label selector, then delegates to a `MapFunc` to determine which reconcile requests to enqueue:
 
 ```go
 selector, _ := labels.Parse("app=nginx")
 eventCh := make(chan event.GenericEvent, 1024)
 
-callback := di.LabelSelectorCallback(selector, eventCh)
+callback := di.LabelSelectorCallback(selector,
+    func(obj *unstructured.Unstructured) []reconcile.Request {
+        return []reconcile.Request{{NamespacedName: types.NamespacedName{
+            Name:      obj.GetAnnotations()["example.com/owner-name"],
+            Namespace: obj.GetAnnotations()["example.com/owner-namespace"],
+        }}}
+    },
+    eventCh,
+)
 ```
 
 ### `EnqueueByOwnerAnnotationCallback`
@@ -155,9 +173,16 @@ func SetupWithManager(mgr ctrl.Manager) error {
     eventCh := make(chan event.GenericEvent, 1024)
 
     // Stable callback — created once, resolves ownership from annotations at event time
-    ownerCallback := di.EnqueueByOwnerAnnotationCallback(
-        "example.com/owner-name",
-        "example.com/owner-namespace",
+    ownerCallback := di.EventCallbackFromMapFunc(
+        func(obj *unstructured.Unstructured) []reconcile.Request {
+            annotations := obj.GetAnnotations()
+            name := annotations["example.com/owner-name"]
+            ns := annotations["example.com/owner-namespace"]
+            if name == "" || ns == "" {
+                return nil
+            }
+            return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}}
+        },
         eventCh,
     )
 
@@ -217,7 +242,7 @@ func (r *MyReconciler) reconcileDelete(ctx context.Context, obj *v1alpha1.MyReso
 
 ## Optional Cache Sync
 
-Handlers registered before the informer's initial list completes may miss events. Consumers who need to guarantee no missed events can wait:
+Handlers registered before the informer's initial list completes may miss events. If your consumer needs to guarantee no missed events, wait for cache sync before proceeding:
 
 ```go
 regs, err := registry.EnsureWatchSet(ctx, consumerID, watches)

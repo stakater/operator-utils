@@ -6,14 +6,15 @@ import (
 	"testing"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var (
@@ -866,26 +867,28 @@ func TestEnsureWatchSet_EmptySliceUnknownConsumer(t *testing.T) {
 	}
 }
 
-// --- EnqueueOwnersCallback tests ---
+// --- EventCallbackFromMapFunc tests ---
 
-func TestEnqueueOwnersCallback_MatchingOwner(t *testing.T) {
+func testMapFunc(obj *unstructured.Unstructured) []reconcile.Request {
+	return []reconcile.Request{
+		{NamespacedName: types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}},
+	}
+}
+
+func TestEventCallbackFromMapFunc_OnAdd(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
+	cb := EventCallbackFromMapFunc(testMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
-	obj.SetName("my-pod")
+	obj.SetName("my-obj")
 	obj.SetNamespace("default")
-	obj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "my-deploy"},
-	})
 
 	cb.OnAdd(obj)
 
 	select {
 	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-deploy" {
-			t.Errorf("expected owner name my-deploy, got %s", evt.Object.GetName())
+		if evt.Object.GetName() != "my-obj" {
+			t.Errorf("expected name my-obj, got %s", evt.Object.GetName())
 		}
 		if evt.Object.GetNamespace() != "default" {
 			t.Errorf("expected namespace default, got %s", evt.Object.GetNamespace())
@@ -895,79 +898,79 @@ func TestEnqueueOwnersCallback_MatchingOwner(t *testing.T) {
 	}
 }
 
-func TestEnqueueOwnersCallback_NonMatchingOwner(t *testing.T) {
+func TestEventCallbackFromMapFunc_OnUpdate(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
+	cb := EventCallbackFromMapFunc(testMapFunc, eventCh)
 
-	obj := &unstructured.Unstructured{}
-	obj.SetName("my-pod")
-	obj.SetNamespace("default")
-	obj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "my-sts"},
-	})
+	oldObj := &unstructured.Unstructured{}
+	oldObj.SetName("old-name")
+	oldObj.SetNamespace("default")
 
-	cb.OnAdd(obj)
+	newObj := &unstructured.Unstructured{}
+	newObj.SetName("new-name")
+	newObj.SetNamespace("default")
+
+	cb.OnUpdate(oldObj, newObj)
 
 	select {
-	case <-eventCh:
-		t.Error("expected no event for non-matching owner kind")
+	case evt := <-eventCh:
+		if evt.Object.GetName() != "new-name" {
+			t.Errorf("expected name new-name (from newObj), got %s", evt.Object.GetName())
+		}
 	default:
-		// expected
+		t.Error("expected event from OnUpdate")
 	}
 }
 
-func TestEnqueueOwnersCallback_NoOwnerReferences(t *testing.T) {
+func TestEventCallbackFromMapFunc_OnDelete(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
+	cb := EventCallbackFromMapFunc(testMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
-	obj.SetName("orphan")
+	obj.SetName("deleted-obj")
 	obj.SetNamespace("default")
 
-	cb.OnAdd(obj)
+	cb.OnDelete(obj)
 
 	select {
-	case <-eventCh:
-		t.Error("expected no event for object without owner references")
+	case evt := <-eventCh:
+		if evt.Object.GetName() != "deleted-obj" {
+			t.Errorf("expected name deleted-obj, got %s", evt.Object.GetName())
+		}
 	default:
-		// expected
+		t.Error("expected event from OnDelete")
 	}
 }
 
-func TestEnqueueOwnersCallback_MultipleOwners(t *testing.T) {
+func TestEventCallbackFromMapFunc_MultipleRequests(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
+	cb := EventCallbackFromMapFunc(func(obj *unstructured.Unstructured) []reconcile.Request {
+		return []reconcile.Request{
+			{NamespacedName: types.NamespacedName{Name: "owner-a", Namespace: "ns-a"}},
+			{NamespacedName: types.NamespacedName{Name: "owner-b", Namespace: "ns-b"}},
+		}
+	}, eventCh)
 
 	obj := &unstructured.Unstructured{}
-	obj.SetName("my-pod")
+	obj.SetName("child")
 	obj.SetNamespace("default")
-	obj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "v1", Kind: "ReplicaSet", Name: "my-rs"},
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "deploy-a"},
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "deploy-b"},
-	})
 
 	cb.OnAdd(obj)
 
-	// Should enqueue both matching owners
 	names := make(map[string]bool)
 	for range 2 {
 		select {
 		case evt := <-eventCh:
 			names[evt.Object.GetName()] = true
 		default:
-			t.Fatal("expected 2 events for 2 matching owners")
+			t.Fatal("expected 2 events")
 		}
 	}
 
-	if !names["deploy-a"] || !names["deploy-b"] {
-		t.Errorf("expected both deploy-a and deploy-b, got %v", names)
+	if !names["owner-a"] || !names["owner-b"] {
+		t.Errorf("expected owner-a and owner-b, got %v", names)
 	}
 
-	// No more events
 	select {
 	case <-eventCh:
 		t.Error("expected no more events")
@@ -975,126 +978,48 @@ func TestEnqueueOwnersCallback_MultipleOwners(t *testing.T) {
 	}
 }
 
-func TestEnqueueOwnersCallback_OnUpdate(t *testing.T) {
+func TestEventCallbackFromMapFunc_NilReturn(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
-
-	oldObj := &unstructured.Unstructured{}
-	oldObj.SetName("my-pod")
-	oldObj.SetNamespace("default")
-
-	newObj := &unstructured.Unstructured{}
-	newObj.SetName("my-pod")
-	newObj.SetNamespace("default")
-	newObj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "my-deploy"},
-	})
-
-	cb.OnUpdate(oldObj, newObj)
-
-	select {
-	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-deploy" {
-			t.Errorf("expected owner name my-deploy, got %s", evt.Object.GetName())
-		}
-	default:
-		t.Error("expected event from OnUpdate")
-	}
-}
-
-func TestEnqueueOwnersCallback_OnUpdateUsesNewObjOnly(t *testing.T) {
-	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
-
-	// oldObj has a matching owner, but newObj does NOT
-	oldObj := &unstructured.Unstructured{}
-	oldObj.SetName("my-pod")
-	oldObj.SetNamespace("default")
-	oldObj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "old-deploy"},
-	})
-
-	newObj := &unstructured.Unstructured{}
-	newObj.SetName("my-pod")
-	newObj.SetNamespace("default")
-	// No owner references on newObj
-
-	cb.OnUpdate(oldObj, newObj)
-
-	// Should NOT enqueue anything — OnUpdate only looks at newObj
-	select {
-	case evt := <-eventCh:
-		t.Errorf("expected no event, but got one for %s", evt.Object.GetName())
-	default:
-		// expected — oldObj's owners are ignored
-	}
-}
-
-func TestEnqueueOwnersCallback_OnDelete(t *testing.T) {
-	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
+	cb := EventCallbackFromMapFunc(func(obj *unstructured.Unstructured) []reconcile.Request {
+		return nil
+	}, eventCh)
 
 	obj := &unstructured.Unstructured{}
-	obj.SetName("my-pod")
+	obj.SetName("my-obj")
 	obj.SetNamespace("default")
-	obj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "my-deploy"},
-	})
-
-	cb.OnDelete(obj)
-
-	select {
-	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-deploy" {
-			t.Errorf("expected owner name my-deploy, got %s", evt.Object.GetName())
-		}
-	default:
-		t.Error("expected event from OnDelete")
-	}
-}
-
-func TestEnqueueOwnersCallback_ChannelFull(t *testing.T) {
-	eventCh := make(chan event.GenericEvent) // unbuffered = always full
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
-
-	obj := &unstructured.Unstructured{}
-	obj.SetName("my-pod")
-	obj.SetNamespace("default")
-	obj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "apps/v1", Kind: "Deployment", Name: "my-deploy"},
-	})
-
-	// Should not block or panic when channel is full
-	cb.OnAdd(obj)
-}
-
-func TestEnqueueOwnersCallback_InvalidAPIVersion(t *testing.T) {
-	eventCh := make(chan event.GenericEvent, 10)
-	ownerGVK := schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
-	cb := EnqueueOwnersCallback(ownerGVK, eventCh)
-
-	obj := &unstructured.Unstructured{}
-	obj.SetName("my-pod")
-	obj.SetNamespace("default")
-	obj.SetOwnerReferences([]metav1.OwnerReference{
-		{APIVersion: "not/a/valid/version", Kind: "Deployment", Name: "my-deploy"},
-	})
 
 	cb.OnAdd(obj)
 
 	select {
 	case <-eventCh:
-		t.Error("expected no event for invalid APIVersion")
+		t.Error("expected no event when MapFunc returns nil")
 	default:
-		// expected - ParseGroupVersion fails, ref is skipped
 	}
 }
 
+func TestEventCallbackFromMapFunc_ChannelFull(t *testing.T) {
+	eventCh := make(chan event.GenericEvent) // unbuffered = always full
+	cb := EventCallbackFromMapFunc(testMapFunc, eventCh)
+
+	obj := &unstructured.Unstructured{}
+	obj.SetName("my-obj")
+	obj.SetNamespace("default")
+
+	// Should not block or panic when channel is full
+	cb.OnAdd(obj)
+}
+
 // --- LabelSelectorCallback tests ---
+
+func ownerAnnotationMapFunc(obj *unstructured.Unstructured) []reconcile.Request {
+	annotations := obj.GetAnnotations()
+	name := annotations["example.com/owner-name"]
+	ns := annotations["example.com/owner-namespace"]
+	if name == "" || ns == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}}
+}
 
 func TestLabelSelectorCallback_MatchingLabels(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
@@ -1103,22 +1028,26 @@ func TestLabelSelectorCallback_MatchingLabels(t *testing.T) {
 		t.Fatalf("unexpected error parsing selector: %v", err)
 	}
 
-	cb := LabelSelectorCallback(selector, eventCh)
+	cb := LabelSelectorCallback(selector, ownerAnnotationMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
 	obj.SetName("my-pod")
 	obj.SetNamespace("default")
 	obj.SetLabels(map[string]string{"app": "nginx", "env": "prod"})
+	obj.SetAnnotations(map[string]string{
+		"example.com/owner-name":      "my-owner",
+		"example.com/owner-namespace": "platform",
+	})
 
 	cb.OnAdd(obj)
 
 	select {
 	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-pod" {
-			t.Errorf("expected name my-pod, got %s", evt.Object.GetName())
+		if evt.Object.GetName() != "my-owner" {
+			t.Errorf("expected name my-owner, got %s", evt.Object.GetName())
 		}
-		if evt.Object.GetNamespace() != "default" {
-			t.Errorf("expected namespace default, got %s", evt.Object.GetNamespace())
+		if evt.Object.GetNamespace() != "platform" {
+			t.Errorf("expected namespace platform, got %s", evt.Object.GetNamespace())
 		}
 	default:
 		t.Error("expected event for matching labels")
@@ -1132,12 +1061,16 @@ func TestLabelSelectorCallback_NonMatchingLabels(t *testing.T) {
 		t.Fatalf("unexpected error parsing selector: %v", err)
 	}
 
-	cb := LabelSelectorCallback(selector, eventCh)
+	cb := LabelSelectorCallback(selector, ownerAnnotationMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
 	obj.SetName("my-pod")
 	obj.SetNamespace("default")
 	obj.SetLabels(map[string]string{"app": "redis"})
+	obj.SetAnnotations(map[string]string{
+		"example.com/owner-name":      "my-owner",
+		"example.com/owner-namespace": "platform",
+	})
 
 	cb.OnAdd(obj)
 
@@ -1145,7 +1078,6 @@ func TestLabelSelectorCallback_NonMatchingLabels(t *testing.T) {
 	case <-eventCh:
 		t.Error("expected no event for non-matching labels")
 	default:
-		// expected
 	}
 }
 
@@ -1156,11 +1088,15 @@ func TestLabelSelectorCallback_NoLabels(t *testing.T) {
 		t.Fatalf("unexpected error parsing selector: %v", err)
 	}
 
-	cb := LabelSelectorCallback(selector, eventCh)
+	cb := LabelSelectorCallback(selector, ownerAnnotationMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
 	obj.SetName("my-pod")
 	obj.SetNamespace("default")
+	obj.SetAnnotations(map[string]string{
+		"example.com/owner-name":      "my-owner",
+		"example.com/owner-namespace": "platform",
+	})
 
 	cb.OnAdd(obj)
 
@@ -1168,7 +1104,6 @@ func TestLabelSelectorCallback_NoLabels(t *testing.T) {
 	case <-eventCh:
 		t.Error("expected no event for object without labels")
 	default:
-		// expected
 	}
 }
 
@@ -1179,7 +1114,7 @@ func TestLabelSelectorCallback_OnUpdate(t *testing.T) {
 		t.Fatalf("unexpected error parsing selector: %v", err)
 	}
 
-	cb := LabelSelectorCallback(selector, eventCh)
+	cb := LabelSelectorCallback(selector, ownerAnnotationMapFunc, eventCh)
 
 	oldObj := &unstructured.Unstructured{}
 	oldObj.SetName("my-pod")
@@ -1190,13 +1125,17 @@ func TestLabelSelectorCallback_OnUpdate(t *testing.T) {
 	newObj.SetName("my-pod")
 	newObj.SetNamespace("default")
 	newObj.SetLabels(map[string]string{"app": "nginx"})
+	newObj.SetAnnotations(map[string]string{
+		"example.com/owner-name":      "my-owner",
+		"example.com/owner-namespace": "platform",
+	})
 
 	cb.OnUpdate(oldObj, newObj)
 
 	select {
 	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-pod" {
-			t.Errorf("expected name my-pod, got %s", evt.Object.GetName())
+		if evt.Object.GetName() != "my-owner" {
+			t.Errorf("expected name my-owner, got %s", evt.Object.GetName())
 		}
 	default:
 		t.Error("expected event from OnUpdate when newObj matches")
@@ -1210,19 +1149,23 @@ func TestLabelSelectorCallback_OnDelete(t *testing.T) {
 		t.Fatalf("unexpected error parsing selector: %v", err)
 	}
 
-	cb := LabelSelectorCallback(selector, eventCh)
+	cb := LabelSelectorCallback(selector, ownerAnnotationMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
 	obj.SetName("my-pod")
 	obj.SetNamespace("default")
 	obj.SetLabels(map[string]string{"app": "nginx"})
+	obj.SetAnnotations(map[string]string{
+		"example.com/owner-name":      "my-owner",
+		"example.com/owner-namespace": "platform",
+	})
 
 	cb.OnDelete(obj)
 
 	select {
 	case evt := <-eventCh:
-		if evt.Object.GetName() != "my-pod" {
-			t.Errorf("expected name my-pod, got %s", evt.Object.GetName())
+		if evt.Object.GetName() != "my-owner" {
+			t.Errorf("expected name my-owner, got %s", evt.Object.GetName())
 		}
 	default:
 		t.Error("expected event from OnDelete")
@@ -1236,12 +1179,16 @@ func TestLabelSelectorCallback_ChannelFull(t *testing.T) {
 		t.Fatalf("unexpected error parsing selector: %v", err)
 	}
 
-	cb := LabelSelectorCallback(selector, eventCh)
+	cb := LabelSelectorCallback(selector, ownerAnnotationMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
 	obj.SetName("my-pod")
 	obj.SetNamespace("default")
 	obj.SetLabels(map[string]string{"app": "nginx"})
+	obj.SetAnnotations(map[string]string{
+		"example.com/owner-name":      "my-owner",
+		"example.com/owner-namespace": "platform",
+	})
 
 	// Should not block or panic when channel is full
 	cb.OnAdd(obj)
@@ -1249,7 +1196,7 @@ func TestLabelSelectorCallback_ChannelFull(t *testing.T) {
 
 func TestLabelSelectorCallback_EverythingSelector(t *testing.T) {
 	eventCh := make(chan event.GenericEvent, 10)
-	cb := LabelSelectorCallback(labels.Everything(), eventCh)
+	cb := LabelSelectorCallback(labels.Everything(), testMapFunc, eventCh)
 
 	obj := &unstructured.Unstructured{}
 	obj.SetName("anything")
