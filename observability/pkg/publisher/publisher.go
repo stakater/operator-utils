@@ -46,12 +46,13 @@ type Publisher struct {
 // As a side effect, calls otel.SetMeterProvider so package-level
 // instruments (via otel.GetMeterProvider) use this provider.
 func New(ctx context.Context, cfg Config) (*Publisher, error) {
+	applyDefaults(&cfg)
+	applyEnvOverrides(&cfg)
+
 	if cfg.OperatorName == "" {
 		return nil, fmt.Errorf("OperatorName is required")
 	}
 
-	applyDefaults(&cfg)
-	applyEnvOverrides(&cfg)
 	// Re-apply OTLP defaults in case env materialized a fresh OTLP block.
 	// applyEnvOverrides already calls applyOTLPDefaults in that path; this
 	// call is a no-op safety net.
