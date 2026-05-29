@@ -48,6 +48,9 @@ func (c *CustomMetrics) Counter(name, description string) (instrument.Counter, e
 	}
 	inst, err := c.meter.Int64Counter(name, metric.WithDescription(description))
 	if err != nil {
+		c.mu.Lock()
+		delete(c.names, name)
+		c.mu.Unlock()
 		return nil, fmt.Errorf("create counter %q: %w", name, err)
 	}
 	return &counterImpl{inst: inst}, nil
@@ -60,6 +63,9 @@ func (c *CustomMetrics) Gauge(name, description string) (instrument.Gauge, error
 	}
 	inst, err := c.meter.Int64Gauge(name, metric.WithDescription(description))
 	if err != nil {
+		c.mu.Lock()
+		delete(c.names, name)
+		c.mu.Unlock()
 		return nil, fmt.Errorf("create gauge %q: %w", name, err)
 	}
 	return &gaugeImpl{inst: inst}, nil
@@ -72,6 +78,9 @@ func (c *CustomMetrics) Histogram(name, description string) (instrument.Histogra
 	}
 	inst, err := c.meter.Float64Histogram(name, metric.WithDescription(description))
 	if err != nil {
+		c.mu.Lock()
+		delete(c.names, name)
+		c.mu.Unlock()
 		return nil, fmt.Errorf("create histogram %q: %w", name, err)
 	}
 	return &histogramImpl{inst: inst}, nil

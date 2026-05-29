@@ -126,10 +126,13 @@ through the bridge to OTLP, are not visible on stdout.
 Typical local dev configuration:
 
 ```go
-pub, _ := publisher.New(ctx, publisher.Config{
+pub, err := publisher.New(ctx, publisher.Config{
     OperatorName: "demo",
     Stdout:       true,
 })
+if err != nil {
+    panic(err)
+}
 ```
 
 ## Controller-runtime bridge producer

@@ -47,10 +47,13 @@ A standalone Go module ([`observability/`](observability/README.md)) that wires 
 - **Custom metric registry** — `pub.Custom().MustCounter/Gauge/Histogram(name, description)` with strict naming validation and duplicate-name guards.
 
 ```go
-pub, _ := publisher.New(ctx, publisher.Config{
+pub, err := publisher.New(ctx, publisher.Config{
     OperatorName: "my-operator",
     OTLP:         &publisher.OTLPConfig{Endpoint: "collector:4317", Insecure: true},
 })
+if err != nil {
+    panic(err)
+}
 defer pub.Shutdown(context.Background())
 
 reconcileTotal := pub.Custom().MustCounter("reconcile_total", "...")
