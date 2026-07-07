@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gin-gonic/gin v1.10.0
-	github.com/stakater/operator-utils/telemetry-web v0.0.0
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260706130603-d145d167121d
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
 )
@@ -47,5 +47,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/stakater/operator-utils/telemetry-web => ../../
