@@ -209,12 +209,22 @@ Same as any integration — use the core clients/logger so the trace propagates 
 logs correlate:
 
 ```go
-resp, err := nethttp.HTTPClient().Do(reqWithContext(ctx)) // injects traceparent
+// Build the request with the inbound ctx — the transport injects traceparent
+// from req.Context(), so a plain http.NewRequest silently dead-ends the trace.
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet, downstreamURL, nil)
+resp, err := nethttp.HTTPClient().Do(req) // injects traceparent
 logging.Logger().ErrorContext(ctx, "downstream failed", "err", err)
 ```
 
 Wrap an existing client once at startup with `nethttp.WrapClient(client)` to add
-propagation in place.
+propagation in place, or wrap just the transport of a client you build yourself:
+
+```go
+client := &http.Client{
+    Timeout:   5 * time.Second,
+    Transport: nethttp.Transport(nil), // or nethttp.Transport(yourCustomTransport)
+}
+```
 
 ---
 

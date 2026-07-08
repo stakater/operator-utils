@@ -245,8 +245,14 @@ func WrapClient(c *http.Client) *http.Client          // add propagation to an e
 
 ```go
 http.ListenAndServe(":8080", nethttp.Handler(mux))
-resp, err := nethttp.HTTPClient().Do(req) // trace rides along
+
+req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+resp, err := nethttp.HTTPClient().Do(req) // trace rides along, via req.Context()
 ```
+
+The outbound request must be built with `http.NewRequestWithContext(ctx, …)` —
+the transport injects `traceparent` from the request's context, so a request
+made without `ctx` dead-ends the trace even through a propagating client.
 
 ---
 

@@ -151,6 +151,8 @@ These come from the **core** packages and are identical to any other integration
 
 ```go
 import (
+    "net/http"
+
     "github.com/stakater/operator-utils/telemetry-web/endpoint"
     "github.com/stakater/operator-utils/telemetry-web/logging"
     "github.com/stakater/operator-utils/telemetry-web/nethttp"
@@ -161,8 +163,12 @@ func getTenant(c *gin.Context) {
 
     logging.Logger().InfoContext(ctx, "fetching tenant", "id", c.Param("id"))
 
-    // Outbound call that carries the trace to the next hop:
-    resp, err := nethttp.HTTPClient().Do(reqWithContext(ctx))
+    // Outbound call that carries the trace to the next hop. Building the request
+    // with the inbound ctx is what makes propagation work: the transport injects
+    // traceparent from req.Context(). A plain http.NewRequest silently dead-ends
+    // the trace, even through this client.
+    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, tenantSvcURL, nil)
+    resp, err := nethttp.HTTPClient().Do(req)
     _ = resp; _ = err
 
     // Optional: instrument an internal operation by name (outcome from err):
@@ -174,7 +180,15 @@ func getTenant(c *gin.Context) {
 ```
 
 To route an existing client (e.g. a generated SDK's `*http.Client`) through trace
-propagation, wrap it once at startup: `nethttp.WrapClient(sdkClient)`.
+propagation, wrap it once at startup: `nethttp.WrapClient(sdkClient)`. And if you
+build your own client (timeouts, connection pools), wrap just its transport:
+
+```go
+client := &http.Client{
+    Timeout:   5 * time.Second,
+    Transport: nethttp.Transport(nil), // or nethttp.Transport(yourCustomTransport)
+}
+```
 
 ---
 
