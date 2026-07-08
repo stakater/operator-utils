@@ -55,25 +55,34 @@ Dependency direction inside the module (no cycles):
 
 ## Installation
 
-The library is a module nested in this repo (not yet published/tagged), so
-consumers point at it with a `replace` directive. In the consuming service's
-`go.mod`:
+The library is a module nested in this repo (not yet tagged), so pin it to a
+commit and let Go resolve the pseudo-version:
+
+```sh
+go get github.com/stakater/operator-utils/telemetry-web@<commit-sha>
+```
+
+which records something like:
 
 ```gomod
-require github.com/stakater/operator-utils/telemetry-web v0.0.0
-replace github.com/stakater/operator-utils/telemetry-web => ../telemetry   // adjust path
+require github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
 ```
 
 The framework adapters are **separate** nested modules — add one the same way
-only if you use it (same pattern for `adapters/echo`):
+only if you use it:
 
-```gomod
-require github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0
-replace github.com/stakater/operator-utils/telemetry-web/adapters/gin => ../telemetry/adapters/gin
+```sh
+go get github.com/stakater/operator-utils/telemetry-web/adapters/gin@<commit-sha>   # or adapters/echo
 ```
 
-Then `go mod tidy`. (For local multi-module dev you can use a `go.work` file
-instead of `replace`.)
+Then `go mod tidy`. Prefer this pinned pseudo-version over a local `replace`
+directive: it is reproducible for every clone and in CI, while a `replace`
+points at a path that only exists on your machine. Reserve `replace` (or a
+`go.work` file) for developing the library itself against a consuming service:
+
+```gomod
+replace github.com/stakater/operator-utils/telemetry-web => ../operator-utils/telemetry-web   // local dev only
+```
 
 ---
 

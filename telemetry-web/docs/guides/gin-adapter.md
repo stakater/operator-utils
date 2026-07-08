@@ -12,21 +12,27 @@ See also: [API reference](../reference.md) · [Echo adapter guide](echo-adapter.
 
 ## 1. Add the modules
 
-Both the core and the adapter are nested modules in this repo, so point at them
-with `replace`. In your service's `go.mod`:
+Both the core and the adapter are nested modules in this repo (not yet tagged),
+so pin them to a commit — Go resolves it to a pseudo-version:
+
+```sh
+go get github.com/stakater/operator-utils/telemetry-web@<commit-sha>
+go get github.com/stakater/operator-utils/telemetry-web/adapters/gin@<commit-sha>
+go mod tidy
+```
+
+Your `go.mod` then records something like:
 
 ```gomod
 require (
-    github.com/stakater/operator-utils/telemetry-web v0.0.0
-    github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0
+    github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
+    github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0-20260707172313-d97fce7d0cfb
 )
-
-replace github.com/stakater/operator-utils/telemetry-web => ../telemetry
-replace github.com/stakater/operator-utils/telemetry-web/adapters/gin => ../telemetry/adapters/gin
 ```
 
-Adjust the paths to wherever `telemetry/` sits relative to your service, then
-`go mod tidy`.
+Prefer this pinned version over a local `replace` directive — it is reproducible
+for every clone and in CI. Reserve `replace`/`go.work` for developing the
+library itself.
 
 ---
 

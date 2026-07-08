@@ -32,15 +32,22 @@ whole engine exactly like it would a stdlib mux.
 
 ## 1. Add the core module
 
-In your service's `go.mod`:
+Pin the core module to a commit — Go resolves it to a pseudo-version:
 
-```gomod
-require github.com/stakater/operator-utils/telemetry-web v0.0.0
-replace github.com/stakater/operator-utils/telemetry-web => ../telemetry   // adjust path
+```sh
+go get github.com/stakater/operator-utils/telemetry-web@<commit-sha>
+go mod tidy
 ```
 
-Then `go mod tidy`. (You do **not** add the `adapters/gin` module for an Echo
-service.)
+Your `go.mod` then records something like:
+
+```gomod
+require github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
+```
+
+Prefer this pinned version over a local `replace` directive — it is reproducible
+for every clone and in CI; reserve `replace`/`go.work` for developing the library
+itself. (You do **not** add an adapter module when wiring raw.)
 
 ---
 
