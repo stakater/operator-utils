@@ -19,7 +19,7 @@ require (
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -31,5 +31,3 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )
-
-replace github.com/stakater/operator-utils/telemetry-web => ../../

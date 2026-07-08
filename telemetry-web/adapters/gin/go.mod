@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gin-gonic/gin v1.10.0
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
 )
 
 require (
@@ -47,5 +47,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/stakater/operator-utils/telemetry-web => ../../
