@@ -1,10 +1,10 @@
-// Package echo wires the telemetry library into an Echo engine: recovery,
+// Package echotel wires the telemetry library into an Echo engine: recovery,
 // automatic per-endpoint metrics keyed by the matched route template, and the
-// core net/http Handler (spans + server metrics). Import it under an alias since
-// labstack/echo is usually imported as "echo":
+// core net/http Handler (spans + server metrics). The package name differs from
+// the directory so it never collides with labstack's "echo" — no alias needed:
 //
-//	import telee "github.com/stakater/operator-utils/telemetry-web/adapters/echo"
-package echo
+//	import "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // package echotel
+package echotel
 
 import (
 	"errors"
@@ -47,14 +47,19 @@ func Recovery() echo.MiddlewareFunc {
 
 // Metrics records one per-endpoint data point per request, keyed by the matched
 // route template (c.Path()), with outcome from the handler's returned error and
-// response status. Unmatched routes are skipped to avoid 404-scan cardinality.
-// A panicking handler unwinds past the record call, so panics surface on the
-// panic counter, not here.
+// response status. It also stamps http.route on the server span and the otelhttp
+// duration metric (via the request Labeler), so standard semconv telemetry is
+// route-attributed too. Unmatched routes are skipped to avoid 404-scan
+// cardinality. A panicking handler unwinds past the record call, so panics
+// surface on the panic counter, not here.
 func Metrics() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			err := next(c)
 			route := c.Path()
+			if route != "" {
+				nethttp.StampRoute(c.Request().Context(), route)
+			}
+			err := next(c)
 			if route == "" {
 				return err
 			}

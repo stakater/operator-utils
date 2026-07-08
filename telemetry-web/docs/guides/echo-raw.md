@@ -187,6 +187,17 @@ That emits `http.endpoint.requests{endpoint="/users/:id", outcome}` for every
 matched route — identical to the Gin adapter's output. Unmatched requests have an
 empty `c.Path()` and are skipped, keeping cardinality bounded.
 
+The adapters additionally stamp `http.route` on the server span and the
+`http.server.request.duration` metric. To match that here, add this where the
+route is known (imports: `otelhttp`, `semconv`, `otel/trace`):
+
+```go
+attr := semconv.HTTPRoute(route)
+labeler, _ := otelhttp.LabelerFromContext(c.Request().Context())
+labeler.Add(attr)                                                  // -> duration metric
+trace.SpanFromContext(c.Request().Context()).SetAttributes(attr)   // -> span
+```
+
 ---
 
 ## 5. Per-handler instrumentation (alternative / addition)

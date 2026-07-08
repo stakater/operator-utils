@@ -1,10 +1,10 @@
-// Package gin wires the telemetry library into a Gin engine: recovery,
+// Package gintel wires the telemetry library into a Gin engine: recovery,
 // automatic per-endpoint metrics keyed by the matched route template, and the
-// core net/http Handler (spans + server metrics). Import it under an alias since
-// gin-gonic is usually imported as "gin":
+// core net/http Handler (spans + server metrics). The package name differs from
+// the directory so it never collides with gin-gonic's "gin" — no alias needed:
 //
-//	import teleg "github.com/stakater/operator-utils/telemetry-web/adapters/gin"
-package gin
+//	import "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // package gintel
+package gintel
 
 import (
 	"net/http"
@@ -42,12 +42,17 @@ func Recovery() gin.HandlerFunc {
 }
 
 // Metrics records one per-endpoint data point per request, keyed by the matched
-// route template (c.FullPath()), with outcome from the response status. Unmatched
-// routes are skipped to avoid 404-scan cardinality. A panicking handler unwinds
-// past the record call, so panics surface on the panic counter, not here.
+// route template (c.FullPath()), with outcome from the response status. It also
+// stamps http.route on the server span and the otelhttp duration metric (via the
+// request Labeler), so standard semconv telemetry is route-attributed too.
+// Unmatched routes are skipped to avoid 404-scan cardinality. A panicking handler
+// unwinds past the record call, so panics surface on the panic counter, not here.
 func Metrics() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		route := c.FullPath()
+		if route != "" {
+			nethttp.StampRoute(c.Request.Context(), route)
+		}
 		c.Next()
 		if route == "" {
 			return

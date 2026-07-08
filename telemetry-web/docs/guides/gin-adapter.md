@@ -38,7 +38,7 @@ library itself.
 
 ## 2. Wire `main`
 
-Two calls do it: `telemetry.Init` once, and `teleg.Instrument(engine)` to get the
+Two calls do it: `telemetry.Init` once, and `gintel.Instrument(engine)` to get the
 servable handler.
 
 ```go
@@ -55,7 +55,7 @@ import (
     "github.com/gin-gonic/gin"
 
     "github.com/stakater/operator-utils/telemetry-web"
-    teleg "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // aliased: gin-gonic already owns "gin"
+    "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // package gintel — no alias needed
 )
 
 func main() {
@@ -75,7 +75,7 @@ func main() {
     // 2. Build the engine and instrument it BEFORE registering routes.
     engine := gin.New()
     engine.Use(gin.Logger()) // optional; do NOT use gin.Default() (its recovery would pre-empt ours)
-    handler := teleg.Instrument(engine)
+    handler := gintel.Instrument(engine)
 
     // ... register routes on `engine` here ...
     engine.GET("/api/v1/tenants/:id", getTenant)
@@ -97,7 +97,7 @@ func main() {
 }
 ```
 
-**Ordering rule:** call `teleg.Instrument(engine)` right after `gin.New()`, before
+**Ordering rule:** call `gintel.Instrument(engine)` right after `gin.New()`, before
 `engine.GET/POST/...`. Gin binds a route's middleware chain at registration time,
 so global middleware must be installed first. The returned `handler` wraps the
 engine *by reference*, so routes you register afterward are still served.
@@ -114,8 +114,13 @@ For every matched route, with **zero per-handler code**:
 
 - `http.endpoint.requests{endpoint="/api/v1/tenants/:id", outcome="success|failure"}`
   — `failure` when the response status is `≥ 500` or the handler set `c.Error(...)`.
+- `http.route` stamped on the server span **and** the standard
+  `http.server.request.duration` metric, so traces and semconv metrics are
+  route-attributed too.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
+  Health-probe paths (`/healthz`, `/readyz`, `/livez`, `/metrics`) are not
+  instrumented by default — see `nethttp.WithSkipPaths` to change the list.
 - Panics → `http.server.panics` + an exception/stack on the span + an error log,
   and a `500` response. (`http.ErrAbortHandler` is re-raised untouched.)
 
@@ -139,14 +144,14 @@ If you maintain your own middleware chain, use the pieces directly instead of
 
 ```go
 engine := gin.New()
-engine.Use(teleg.Recovery()) // panic -> RecordPanic + 500
-engine.Use(teleg.Metrics())  // per-endpoint metrics by route template
+engine.Use(gintel.Recovery()) // panic -> RecordPanic + 500
+engine.Use(gintel.Metrics())  // per-endpoint metrics by route template
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + server metrics
 ```
 
-`teleg.Recovery()` must sit inside `nethttp.Handler` (it does here, because it's a
+`gintel.Recovery()` must sit inside `nethttp.Handler` (it does here, because it's a
 Gin middleware inside the engine, and `nethttp.Handler` wraps the engine).
 
 ---

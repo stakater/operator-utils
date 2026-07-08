@@ -9,6 +9,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
 var (
@@ -23,14 +25,21 @@ var (
 func ensure() {
 	once.Do(func() {
 		m := otel.GetMeterProvider().Meter("telemetry")
-		requests, _ = m.Int64Counter("http.endpoint.requests",
+		var err error
+		requests, err = m.Int64Counter("http.endpoint.requests",
 			metric.WithUnit("{request}"),
 			metric.WithDescription("Per-endpoint request count, split by success/failure outcome."),
 		)
-		panics, _ = m.Int64Counter("http.server.panics",
+		if err != nil {
+			logging.Logger().Warn("failed to create http.endpoint.requests counter; per-endpoint metrics disabled", "err", err)
+		}
+		panics, err = m.Int64Counter("http.server.panics",
 			metric.WithUnit("{panic}"),
 			metric.WithDescription("Panics recovered from HTTP handlers."),
 		)
+		if err != nil {
+			logging.Logger().Warn("failed to create http.server.panics counter; panic metrics disabled", "err", err)
+		}
 	})
 }
 

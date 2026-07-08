@@ -38,7 +38,7 @@ library itself.
 
 ## 2. Wire `main`
 
-Two calls do it: `telemetry.Init` once, and `telee.Instrument(e)` to get the
+Two calls do it: `telemetry.Init` once, and `echotel.Instrument(e)` to get the
 servable handler.
 
 ```go
@@ -55,7 +55,7 @@ import (
     "github.com/labstack/echo/v4"
 
     "github.com/stakater/operator-utils/telemetry-web"
-    telee "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // aliased: labstack already owns "echo"
+    "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // package echotel — no alias needed
 )
 
 func main() {
@@ -75,7 +75,7 @@ func main() {
     // 2. Build the engine and instrument it.
     e := echo.New()
     e.HideBanner = true
-    handler := telee.Instrument(e) // do NOT also add middleware.Recover() (it would pre-empt ours)
+    handler := echotel.Instrument(e) // do NOT also add middleware.Recover() (it would pre-empt ours)
 
     // ... register routes on `e` here (before or after Instrument — both work) ...
     e.GET("/users/:id", getUser)
@@ -117,8 +117,13 @@ For every matched route, with **zero per-handler code**:
   with code ≥ 500, or wrote a ≥ 500 status directly. A returned 4xx
   (`echo.NewHTTPError(http.StatusNotFound, …)`) is a *client* error and counts
   as `success`, consistent with the Gin adapter.
+- `http.route` stamped on the server span **and** the standard
+  `http.server.request.duration` metric, so traces and semconv metrics are
+  route-attributed too.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
+  Health-probe paths (`/healthz`, `/readyz`, `/livez`, `/metrics`) are not
+  instrumented by default — see `nethttp.WithSkipPaths` to change the list.
 - Panics → `http.server.panics` + an exception/stack on the span + an error log,
   and a `500` response. (`http.ErrAbortHandler` is re-raised untouched.)
 
@@ -142,8 +147,8 @@ If you maintain your own middleware chain, use the pieces directly instead of
 
 ```go
 e := echo.New()
-e.Use(telee.Recovery()) // panic -> RecordPanic + 500; keep it OUTSIDE Metrics
-e.Use(telee.Metrics())  // per-endpoint metrics by route template
+e.Use(echotel.Recovery()) // panic -> RecordPanic + 500; keep it OUTSIDE Metrics
+e.Use(echotel.Metrics())  // per-endpoint metrics by route template
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(e)} // spans + server metrics
