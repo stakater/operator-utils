@@ -10,6 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/stakater/operator-utils/telemetry-web/adaptertest"
+	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
 func TestMain(m *testing.M) {
@@ -91,5 +92,23 @@ func TestMetricsClassifiesHTTPErrorsByCode(t *testing.T) {
 	}
 	if got := adaptertest.EndpointOutcome(rm, "/echo/missing/:id", "failure"); got != 0 {
 		t.Errorf("4xx HTTPError must not be a failure, got %d", got)
+	}
+}
+
+// Instrument forwards nethttp options, so probe filtering is wireable through
+// the adapter's one-call path.
+func TestInstrumentForwardsSkipPaths(t *testing.T) {
+	e := echo.New()
+	h := Instrument(e, nethttp.WithSkipPaths("/echo/skipme"))
+	e.GET("/echo/skipme", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
+
+	if rec := get(t, h, "/echo/skipme"); rec.Code != http.StatusOK {
+		t.Fatalf("skipped path must still be served: status = %d", rec.Code)
+	}
+	if adaptertest.RouteOnDuration(adaptertest.Collect(t), "/echo/skipme") {
+		t.Error("skipped path must not appear on the duration metric")
+	}
+	if adaptertest.RouteOnSpan("/echo/skipme") {
+		t.Error("skipped path must not produce a span")
 	}
 }

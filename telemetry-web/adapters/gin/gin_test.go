@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/stakater/operator-utils/telemetry-web/adaptertest"
+	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
 func TestMain(m *testing.M) {
@@ -57,5 +58,26 @@ func TestMetricsRecordsFailureOnGinErrors(t *testing.T) {
 
 	if got := adaptertest.EndpointOutcome(adaptertest.Collect(t), "/gin/errs", "failure"); got != 1 {
 		t.Errorf("c.Error must mark the request failed: failure count = %d, want 1", got)
+	}
+}
+
+// Instrument forwards nethttp options, so probe filtering is wireable through
+// the adapter's one-call path.
+func TestInstrumentForwardsSkipPaths(t *testing.T) {
+	e := gin.New()
+	h := Instrument(e, nethttp.WithSkipPaths("/gin/skipme"))
+	e.GET("/gin/skipme", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	req := httptest.NewRequest(http.MethodGet, "/gin/skipme", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("skipped path must still be served: status = %d", rec.Code)
+	}
+	if adaptertest.RouteOnDuration(adaptertest.Collect(t), "/gin/skipme") {
+		t.Error("skipped path must not appear on the duration metric")
+	}
+	if adaptertest.RouteOnSpan("/gin/skipme") {
+		t.Error("skipped path must not produce a span")
 	}
 }

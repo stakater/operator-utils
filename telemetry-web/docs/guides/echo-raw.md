@@ -188,14 +188,13 @@ matched route — identical to the Gin adapter's output. Unmatched requests have
 empty `c.Path()` and are skipped, keeping cardinality bounded.
 
 The adapters additionally stamp `http.route` on the server span and the
-`http.server.request.duration` metric. To match that here, add this where the
-route is known (imports: `otelhttp`, `semconv`, `otel/trace`):
+`http.server.request.duration` metric (their `RouteTag` middleware). To match
+that here, call the core primitive where the route is known:
 
 ```go
-attr := semconv.HTTPRoute(route)
-labeler, _ := otelhttp.LabelerFromContext(c.Request().Context())
-labeler.Add(attr)                                                  // -> duration metric
-trace.SpanFromContext(c.Request().Context()).SetAttributes(attr)   // -> span
+if route := c.Path(); route != "" {
+    nethttp.StampRoute(c.Request().Context(), route)
+}
 ```
 
 ---

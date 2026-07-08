@@ -55,28 +55,46 @@ func get(h http.Handler, path string) {
 	h.ServeHTTP(httptest.NewRecorder(), req)
 }
 
-func TestHandlerWithSkipPathsReplacesDefault(t *testing.T) {
+func TestHandlerInstrumentsEverythingByDefault(t *testing.T) {
+	h := Handler(okHandler())
+
+	before := durationCount(t)
+	get(h, "/healthz")
+	get(h, "/api/v1/things")
+	if got := durationCount(t); got != before+2 {
+		t.Errorf("no path is skipped by default: duration count delta = %d, want 2", got-before)
+	}
+}
+
+func TestHandlerWithSkipPathsSkipsExactPaths(t *testing.T) {
 	h := Handler(okHandler(), WithSkipPaths("/internal/ping"))
 
 	before := durationCount(t)
 	get(h, "/internal/ping")
 	if got := durationCount(t); got != before {
-		t.Errorf("custom skip path must not be instrumented: delta = %d, want 0", got-before)
+		t.Errorf("skip path must not be instrumented: delta = %d, want 0", got-before)
+	}
+
+	get(h, "/other")
+	if got := durationCount(t); got != before+1 {
+		t.Errorf("non-skipped path must be instrumented: delta = %d, want 1", got-before)
 	}
 }
 
-func TestHandlerWithSkipPathsEmptyInstrumentsEverything(t *testing.T) {
-	h := Handler(okHandler(), WithSkipPaths())
+func TestHandlerWithDefaultSkipPaths(t *testing.T) {
+	h := Handler(okHandler(), WithSkipPaths(DefaultSkipPaths...))
 
 	before := durationCount(t)
-	get(h, "/healthz")
-	if got := durationCount(t); got != before+1 {
-		t.Errorf("WithSkipPaths() must disable filtering: /healthz delta = %d, want 1", got-before)
+	for _, p := range []string{"/healthz", "/readyz", "/livez", "/metrics"} {
+		get(h, p)
+	}
+	if got := durationCount(t); got != before {
+		t.Errorf("DefaultSkipPaths must cover the probe endpoints: delta = %d, want 0", got-before)
 	}
 }
 
 func TestHandlerSkippedPathsStillServed(t *testing.T) {
-	h := Handler(okHandler())
+	h := Handler(okHandler(), WithSkipPaths("/healthz"))
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

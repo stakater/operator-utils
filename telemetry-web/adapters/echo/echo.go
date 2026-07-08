@@ -16,13 +16,15 @@ import (
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
-// Instrument installs Recovery and Metrics on e and returns it wrapped in
-// nethttp.Handler, ready to serve. Unlike Gin, Echo applies Use middleware to
-// routes registered before or after the call, so ordering doesn't matter.
-// The returned handler wraps the engine by reference.
-func Instrument(e *echo.Echo) http.Handler {
-	e.Use(Recovery(), Metrics())
-	return nethttp.Handler(e)
+// Instrument installs Recovery, RouteTag, and Metrics on e and returns it
+// wrapped in nethttp.Handler, ready to serve. Extra nethttp options (e.g.
+// nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...)) are forwarded to the
+// Handler. Unlike Gin, Echo applies Use middleware to routes registered before
+// or after the call, so ordering doesn't matter. The returned handler wraps
+// the engine by reference.
+func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler {
+	e.Use(Recovery(), RouteTag(), Metrics())
+	return nethttp.Handler(e, opts...)
 }
 
 // Recovery forwards panics to endpoint.RecordPanic and responds 500. Use it
@@ -45,20 +47,30 @@ func Recovery() echo.MiddlewareFunc {
 	}
 }
 
+// RouteTag stamps http.route (the matched route template) on the server span
+// and the otelhttp duration metric via nethttp.StampRoute. It runs before the
+// handler, so even panicked requests carry the route on their span. Unmatched
+// requests are skipped. Use it without Metrics for a semconv-only setup.
+func RouteTag() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if route := c.Path(); route != "" {
+				nethttp.StampRoute(c.Request().Context(), route)
+			}
+			return next(c)
+		}
+	}
+}
+
 // Metrics records one per-endpoint data point per request, keyed by the matched
 // route template (c.Path()), with outcome from the handler's returned error and
-// response status. It also stamps http.route on the server span and the otelhttp
-// duration metric (via the request Labeler), so standard semconv telemetry is
-// route-attributed too. Unmatched routes are skipped to avoid 404-scan
-// cardinality. A panicking handler unwinds past the record call, so panics
-// surface on the panic counter, not here.
+// response status. Unmatched routes are skipped to avoid 404-scan cardinality.
+// A panicking handler unwinds past the record call, so panics surface on the
+// panic counter, not here.
 func Metrics() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			route := c.Path()
-			if route != "" {
-				nethttp.StampRoute(c.Request().Context(), route)
-			}
 			err := next(c)
 			if route == "" {
 				return err

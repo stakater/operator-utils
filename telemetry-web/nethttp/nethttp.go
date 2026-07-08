@@ -22,10 +22,17 @@ type config struct {
 	skipPaths []string
 }
 
-// WithSkipPaths replaces the default skip list (health probes and /metrics)
-// with the given exact request paths. Skipped paths get no span and no
-// http.server.* metrics but are still served (and recovery still applies).
-// Call with no arguments to instrument everything.
+// DefaultSkipPaths are the usual noise endpoints — k8s health probes and the
+// Prometheus scrape path. Handler does NOT skip them on its own; opt in with
+//
+//	nethttp.Handler(mux, nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...))
+//
+// or append your own: WithSkipPaths(append(nethttp.DefaultSkipPaths, "/ping")...).
+var DefaultSkipPaths = []string{"/healthz", "/readyz", "/livez", "/metrics"}
+
+// WithSkipPaths excludes the given exact request paths from instrumentation:
+// no span and no http.server.* metrics, but the request is still served (and
+// recovery still applies). By default nothing is skipped.
 func WithSkipPaths(paths ...string) Option {
 	return func(c *config) { c.skipPaths = paths }
 }
@@ -33,7 +40,7 @@ func WithSkipPaths(paths ...string) Option {
 // Handler is the composed inbound chain: otelhttp (spans + metrics) -> recovery
 // -> next. Frameworks that don't expose http.Handler chaining should instead
 // call endpoint.RecordPanic and endpoint.Record from their own middleware.
-// By default health probes and /metrics are not instrumented — see WithSkipPaths.
+// Every path is instrumented unless excluded via WithSkipPaths.
 func Handler(next http.Handler, opts ...Option) http.Handler {
 	cfg := config{}
 	for _, opt := range opts {
@@ -89,9 +96,10 @@ func WrapClient(c *http.Client) *http.Client {
 	return c
 }
 
-// stampRoute puts http.route on the active server span and on the otelhttp
-// metric attributes for this request. Stamped before the handler runs so even
-// panicked requests carry the route on their span.
+// StampRoute puts http.route on the active server span and on the otelhttp
+// metric attributes (via the request Labeler) for this request. The framework
+// adapters call it from their RouteTag middleware once the matched route
+// template is known; call it yourself when integrating a framework by hand.
 func StampRoute(ctx context.Context, route string) {
 	attr := semconv.HTTPRoute(route)
 	labeler, _ := otelhttp.LabelerFromContext(ctx)

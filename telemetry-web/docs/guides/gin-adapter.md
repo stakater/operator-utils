@@ -119,8 +119,8 @@ For every matched route, with **zero per-handler code**:
   route-attributed too.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
-  Health-probe paths (`/healthz`, `/readyz`, `/livez`, `/metrics`) are not
-  instrumented by default — see `nethttp.WithSkipPaths` to change the list.
+  To keep k8s probes and `/metrics` scrapes out of traces and metrics, opt in to
+  filtering: `Instrument(engine, nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...))`.
 - Panics → `http.server.panics` + an exception/stack on the span + an error log,
   and a `500` response. (`http.ErrAbortHandler` is re-raised untouched.)
 
@@ -145,7 +145,8 @@ If you maintain your own middleware chain, use the pieces directly instead of
 ```go
 engine := gin.New()
 engine.Use(gintel.Recovery()) // panic -> RecordPanic + 500
-engine.Use(gintel.Metrics())  // per-endpoint metrics by route template
+engine.Use(gintel.RouteTag()) // http.route -> span + duration metric
+engine.Use(gintel.Metrics())  // per-endpoint metrics by route template (optional if semconv is enough)
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + server metrics
