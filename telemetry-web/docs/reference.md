@@ -7,7 +7,7 @@ It is *composition over OpenTelemetry*: it wires the OTel SDK, `otelhttp`, and
 web framework**; framework glue lives in separate adapter modules.
 
 - **Module:** `github.com/stakater/operator-utils/telemetry-web`
-- **Guides:** [Gin (via adapter)](guides/gin-adapter.md) · [Echo (raw)](guides/echo-raw.md)
+- **Guides:** [Gin (via adapter)](guides/gin-adapter.md) · [Echo (via adapter)](guides/echo-adapter.md) · [Echo (raw)](guides/echo-raw.md)
 
 ---
 
@@ -23,6 +23,7 @@ web framework**; framework glue lives in separate adapter modules.
   - [`telemetry/endpoint`](#package-endpoint) — per-endpoint metrics & panics
   - [`telemetry/nethttp`](#package-nethttp) — net/http server & client
   - [`adapters/gin`](#package-adaptersgin) — Gin adapter
+  - [`adapters/echo`](#package-adaptersecho) — Echo adapter
 - [Correlation model](#correlation-model)
 - [Shutdown](#shutdown)
 - [Gotchas](#gotchas)
@@ -48,7 +49,7 @@ value you must thread is `context.Context` — that is what carries the active s
 (for exemplars and log correlation).
 
 Dependency direction inside the module (no cycles):
-`adapters/gin → nethttp → endpoint → logging → internal/scope → otel`.
+`adapters/{gin,echo} → nethttp → endpoint → logging → internal/scope → otel`.
 
 ---
 
@@ -63,8 +64,8 @@ require github.com/stakater/operator-utils/telemetry-web v0.0.0
 replace github.com/stakater/operator-utils/telemetry-web => ../telemetry   // adjust path
 ```
 
-The Gin adapter is a **separate** nested module — add it the same way only if you
-use it:
+The framework adapters are **separate** nested modules — add one the same way
+only if you use it (same pattern for `adapters/echo`):
 
 ```gomod
 require github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0
@@ -268,6 +269,32 @@ func Metrics() gin.HandlerFunc                    // per-endpoint metric keyed b
 `Metrics()` records `http.endpoint.requests{endpoint=<c.FullPath()>, outcome}`
 per request — real route templates, closing the `http.route` gap. See the
 [Gin guide](guides/gin-adapter.md).
+
+---
+
+### package `adapters/echo`
+
+Separate module `github.com/stakater/operator-utils/telemetry-web/adapters/echo`,
+package name `echo`. Import it **under an alias** because labstack/echo is
+usually imported as `echo`:
+
+```go
+import telee "github.com/stakater/operator-utils/telemetry-web/adapters/echo"
+```
+
+```go
+func Instrument(e *echo.Echo) http.Handler // Recovery + Metrics + nethttp.Handler, one call
+func Recovery() echo.MiddlewareFunc         // panic -> endpoint.RecordPanic + 500 (ErrAbortHandler re-raised)
+func Metrics() echo.MiddlewareFunc          // per-endpoint metric keyed by matched route template
+```
+
+`Metrics()` records `http.endpoint.requests{endpoint=<c.Path()>, outcome}` per
+request. Outcome classification is Echo-aware: a returned `*echo.HTTPError`
+counts as `failure` only when its code is ≥ 500 (a returned 4xx is a client
+error, hence `success`), any other returned error is a `failure` (Echo turns it
+into a `500`), and a directly written ≥ 500 status is caught too. Unlike the Gin
+adapter there is no register-routes-after-instrumenting ordering rule. See the
+[Echo guide](guides/echo-adapter.md).
 
 ---
 

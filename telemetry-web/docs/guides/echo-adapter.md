@@ -1,12 +1,12 @@
-# Guide: integrating telemetry with Gin (via the adapter)
+# Guide: integrating telemetry with Echo (via the adapter)
 
-The `adapters/gin` module wires the whole library into a Gin service in **one
+The `adapters/echo` module wires the whole library into an Echo service in **one
 call**: framework-native panic recovery, automatic per-endpoint metrics keyed by
 the *matched route template*, and the core server spans + metrics. This is the
-recommended path for a Gin app.
+recommended path for an Echo app; [echo-raw.md](echo-raw.md) shows the same
+wiring done by hand.
 
-See also: [API reference](../reference.md) · [Echo adapter guide](echo-adapter.md) ·
-[Echo (raw) guide](echo-raw.md).
+See also: [API reference](../reference.md) · [Gin adapter guide](gin-adapter.md).
 
 ---
 
@@ -18,11 +18,11 @@ with `replace`. In your service's `go.mod`:
 ```gomod
 require (
     github.com/stakater/operator-utils/telemetry-web v0.0.0
-    github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0
+    github.com/stakater/operator-utils/telemetry-web/adapters/echo v0.0.0
 )
 
 replace github.com/stakater/operator-utils/telemetry-web => ../telemetry
-replace github.com/stakater/operator-utils/telemetry-web/adapters/gin => ../telemetry/adapters/gin
+replace github.com/stakater/operator-utils/telemetry-web/adapters/echo => ../telemetry/adapters/echo
 ```
 
 Adjust the paths to wherever `telemetry/` sits relative to your service, then
@@ -32,7 +32,7 @@ Adjust the paths to wherever `telemetry/` sits relative to your service, then
 
 ## 2. Wire `main`
 
-Two calls do it: `telemetry.Init` once, and `teleg.Instrument(engine)` to get the
+Two calls do it: `telemetry.Init` once, and `telee.Instrument(e)` to get the
 servable handler.
 
 ```go
@@ -46,10 +46,10 @@ import (
     "syscall"
     "time"
 
-    "github.com/gin-gonic/gin"
+    "github.com/labstack/echo/v4"
 
     "github.com/stakater/operator-utils/telemetry-web"
-    teleg "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // aliased: gin-gonic already owns "gin"
+    telee "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // aliased: labstack already owns "echo"
 )
 
 func main() {
@@ -58,7 +58,7 @@ func main() {
 
     // 1. Initialise telemetry once.
     shutdown, err := telemetry.Init(ctx, telemetry.Config{
-        ServiceName: "mto-gateway",
+        ServiceName: "my-echo-service",
         Environment: os.Getenv("ENVIRONMENT"),                 // optional
         Insecure:    os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true",
     })
@@ -66,13 +66,13 @@ func main() {
         panic(err)
     }
 
-    // 2. Build the engine and instrument it BEFORE registering routes.
-    engine := gin.New()
-    engine.Use(gin.Logger()) // optional; do NOT use gin.Default() (its recovery would pre-empt ours)
-    handler := teleg.Instrument(engine)
+    // 2. Build the engine and instrument it.
+    e := echo.New()
+    e.HideBanner = true
+    handler := telee.Instrument(e) // do NOT also add middleware.Recover() (it would pre-empt ours)
 
-    // ... register routes on `engine` here ...
-    engine.GET("/api/v1/tenants/:id", getTenant)
+    // ... register routes on `e` here (before or after Instrument — both work) ...
+    e.GET("/users/:id", getUser)
 
     // 3. Serve the wrapped handler + shut down cleanly.
     srv := &http.Server{Addr: ":8080", Handler: handler}
@@ -91,14 +91,13 @@ func main() {
 }
 ```
 
-**Ordering rule:** call `teleg.Instrument(engine)` right after `gin.New()`, before
-`engine.GET/POST/...`. Gin binds a route's middleware chain at registration time,
-so global middleware must be installed first. The returned `handler` wraps the
-engine *by reference*, so routes you register afterward are still served.
+**Serve the returned handler**, not `e.Start()` — the wrapper is what adds spans,
+server metrics, and the panic backstop. Unlike Gin there is no ordering rule:
+Echo applies `e.Use(...)` middleware to routes registered before or after the
+call, so `Instrument` can run at any point during setup.
 
-**Do not use `gin.Default()`** — it installs Gin's own recovery, which would catch
-panics before the telemetry recovery runs. Use `gin.New()` and add `gin.Logger()`
-yourself if you want request logging.
+**Do not add `middleware.Recover()`** — Echo's own recovery would swallow panics
+before the telemetry recovery sees them.
 
 ---
 
@@ -106,8 +105,12 @@ yourself if you want request logging.
 
 For every matched route, with **zero per-handler code**:
 
-- `http.endpoint.requests{endpoint="/api/v1/tenants/:id", outcome="success|failure"}`
-  — `failure` when the response status is `≥ 500` or the handler set `c.Error(...)`.
+- `http.endpoint.requests{endpoint="/users/:id", outcome="success|failure"}` —
+  `failure` when the request failed **server-side**: the handler returned a
+  non-HTTP error (Echo turns it into a `500`), returned an `*echo.HTTPError`
+  with code ≥ 500, or wrote a ≥ 500 status directly. A returned 4xx
+  (`echo.NewHTTPError(http.StatusNotFound, …)`) is a *client* error and counts
+  as `success`, consistent with the Gin adapter.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
 - Panics → `http.server.panics` + an exception/stack on the span + an error log,
@@ -132,16 +135,18 @@ If you maintain your own middleware chain, use the pieces directly instead of
 `Instrument`:
 
 ```go
-engine := gin.New()
-engine.Use(teleg.Recovery()) // panic -> RecordPanic + 500
-engine.Use(teleg.Metrics())  // per-endpoint metrics by route template
+e := echo.New()
+e.Use(telee.Recovery()) // panic -> RecordPanic + 500; keep it OUTSIDE Metrics
+e.Use(telee.Metrics())  // per-endpoint metrics by route template
 // ... your other middleware, then routes ...
 
-srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + server metrics
+srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(e)} // spans + server metrics
 ```
 
-`teleg.Recovery()` must sit inside `nethttp.Handler` (it does here, because it's a
-Gin middleware inside the engine, and `nethttp.Handler` wraps the engine).
+Keep `Recovery` before `Metrics` (outermost) so a panicking handler unwinds past
+the record call and surfaces only on the panic counter. Both must sit inside
+`nethttp.Handler` (they do here — they're engine middleware, and the engine is
+what `nethttp.Handler` wraps).
 
 ---
 
@@ -156,20 +161,19 @@ import (
     "github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
-func getTenant(c *gin.Context) {
-    ctx := c.Request.Context()
+func getUser(c echo.Context) (err error) {
+    ctx := c.Request().Context()
 
-    logging.Logger().InfoContext(ctx, "fetching tenant", "id", c.Param("id"))
+    logging.Logger().InfoContext(ctx, "fetching user", "id", c.Param("id"))
 
     // Outbound call that carries the trace to the next hop:
-    resp, err := nethttp.HTTPClient().Do(reqWithContext(ctx))
-    _ = resp; _ = err
+    resp, err2 := nethttp.HTTPClient().Do(reqWithContext(ctx))
+    _ = resp; _ = err2
 
     // Optional: instrument an internal operation by name (outcome from err):
-    var opErr error
-    finish := endpoint.Instrument(ctx, "tenant.load")
-    defer func() { finish(&opErr) }()
-    // ... opErr = ... ...
+    defer endpoint.Instrument(ctx, "user.get")(&err)
+    // ... return err ...
+    return err
 }
 ```
 
@@ -180,10 +184,13 @@ propagation, wrap it once at startup: `nethttp.WrapClient(sdkClient)`.
 
 ## Notes
 
-- Per-endpoint metric cardinality is bounded because `Metrics()` uses
-  `c.FullPath()` (the template `/api/v1/tenants/:id`), never the raw path.
-  Unmatched requests (404 scans) are skipped.
+- Per-endpoint metric cardinality is bounded because `Metrics()` uses `c.Path()`
+  (the template `/users/:id`), never the raw path. Unmatched requests (404
+  scans) have an empty `c.Path()` and are skipped.
 - Panicked requests appear on `http.server.panics`, not as a per-endpoint
   `failure` data point — consistent with the library's panic philosophy.
+- Echo runs its error handler *after* the middleware chain returns, so the
+  adapter classifies the outcome from the **returned error** (resolving
+  `*echo.HTTPError` codes), not from the not-yet-written response status.
 - Nothing is exported until a collector is reachable at the configured OTLP
   endpoint; for local dev run one and set `Insecure: true`.

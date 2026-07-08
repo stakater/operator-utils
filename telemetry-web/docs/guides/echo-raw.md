@@ -1,12 +1,18 @@
 # Guide: integrating telemetry with Echo (raw, no adapter)
 
-There is no Echo adapter module — but the core is framework-agnostic, so you wire
-Echo yourself with a few lines. This guide shows the full pattern and, at the end,
-a small reusable Echo middleware that reproduces what the Gin adapter does
-(automatic route-templated per-endpoint metrics). If you find yourself copying
-this into several Echo services, promote it to a `adapters/echo` module.
+> **There is now an [`adapters/echo` module](echo-adapter.md)** that packages
+> everything below into one call — prefer it for Echo services. This guide
+> remains as the reference for wiring the framework-agnostic core by hand
+> (useful for frameworks that have no adapter, or to understand what the
+> adapter does).
 
-See also: [API reference](../reference.md) · [Gin adapter guide](gin-adapter.md).
+The core is framework-agnostic, so you can wire Echo yourself with a few lines.
+This guide shows the full pattern and, at the end, a small reusable Echo
+middleware that reproduces what the adapters do (automatic route-templated
+per-endpoint metrics).
+
+See also: [API reference](../reference.md) · [Echo adapter guide](echo-adapter.md) ·
+[Gin adapter guide](gin-adapter.md).
 
 The building blocks, all from the core:
 
