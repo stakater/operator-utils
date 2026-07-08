@@ -25,8 +25,8 @@ Your `go.mod` then records something like:
 
 ```gomod
 require (
-    github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
-    github.com/stakater/operator-utils/telemetry-web/adapters/echo v0.0.0-20260707172313-d97fce7d0cfb
+    github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
+    github.com/stakater/operator-utils/telemetry-web/adapters/echo v0.0.0-20260708082012-8f1fdddd3dca
 )
 ```
 

@@ -65,7 +65,7 @@ go get github.com/stakater/operator-utils/telemetry-web@<commit-sha>
 which records something like:
 
 ```gomod
-require github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
+require github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
 ```
 
 The framework adapters are **separate** nested modules — add one the same way
