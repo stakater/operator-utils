@@ -64,8 +64,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
 github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7so1lCWt35ZSgc=
-github.com/stakater/operator-utils/telemetry-web v0.0.0-20260706130603-d145d167121d h1:Fl03a8Q67hhlXDE08x97X5mnVklJh3LVZx6150bfR5s=
-github.com/stakater/operator-utils/telemetry-web v0.0.0-20260706130603-d145d167121d/go.mod h1:jGro+cWrll4hAcJIsV15VKtPSFLBP4ZLi0yz+6wa/0o=
+github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb h1:j6buuy4DtqNmCyu5bvcNDnWoANFc2TVBEO3fi0J0+9Y=
+github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb/go.mod h1:jGro+cWrll4hAcJIsV15VKtPSFLBP4ZLi0yz+6wa/0o=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
 github.com/stretchr/objx v0.5.0/go.mod h1:Yh+to48EsGEfYuaHDzXPcE3xhTkx73EhmCGUpEOglKo=

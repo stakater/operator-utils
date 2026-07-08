@@ -24,8 +24,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/stakater/operator-utils/telemetry-web v0.0.0-20260706130603-d145d167121d h1:Fl03a8Q67hhlXDE08x97X5mnVklJh3LVZx6150bfR5s=
-github.com/stakater/operator-utils/telemetry-web v0.0.0-20260706130603-d145d167121d/go.mod h1:jGro+cWrll4hAcJIsV15VKtPSFLBP4ZLi0yz+6wa/0o=
+github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb h1:j6buuy4DtqNmCyu5bvcNDnWoANFc2TVBEO3fi0J0+9Y=
+github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb/go.mod h1:jGro+cWrll4hAcJIsV15VKtPSFLBP4ZLi0yz+6wa/0o=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/valyala/bytebufferpool v1.0.0 h1:GqA5TC/0021Y/b9FG4Oi9Mr3q7XYx6KllzawFIhcdPw=

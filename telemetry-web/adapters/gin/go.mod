@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gin-gonic/gin v1.10.0
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260706130603-d145d167121d
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260707172313-d97fce7d0cfb
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
 )
