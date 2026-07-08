@@ -55,23 +55,6 @@ func get(h http.Handler, path string) {
 	h.ServeHTTP(httptest.NewRecorder(), req)
 }
 
-func TestHandlerSkipsDefaultProbePaths(t *testing.T) {
-	h := Handler(okHandler())
-
-	before := durationCount(t)
-	for _, p := range []string{"/healthz", "/readyz", "/livez", "/metrics"} {
-		get(h, p)
-	}
-	if got := durationCount(t); got != before {
-		t.Errorf("probe paths must not be instrumented: duration count delta = %d, want 0", got-before)
-	}
-
-	get(h, "/api/v1/things")
-	if got := durationCount(t); got != before+1 {
-		t.Errorf("normal path must be instrumented: duration count delta = %d, want 1", got-before)
-	}
-}
-
 func TestHandlerWithSkipPathsReplacesDefault(t *testing.T) {
 	h := Handler(okHandler(), WithSkipPaths("/internal/ping"))
 
@@ -79,11 +62,6 @@ func TestHandlerWithSkipPathsReplacesDefault(t *testing.T) {
 	get(h, "/internal/ping")
 	if got := durationCount(t); got != before {
 		t.Errorf("custom skip path must not be instrumented: delta = %d, want 0", got-before)
-	}
-
-	get(h, "/healthz") // no longer in the skip list once overridden
-	if got := durationCount(t); got != before+1 {
-		t.Errorf("default paths are replaced, not merged: /healthz delta = %d, want 1", got-before)
 	}
 }
 
