@@ -1,0 +1,60 @@
+name: Validate telemetry
+description: Build, lint, and unit-test the telemetry-web module and its adapters
+
+inputs:
+  golangci-lint-version:
+    description: golangci-lint version to use
+    required: false
+    default: v2.8.0
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go (telemetry toolchain)
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: telemetry-web/go.mod
+        cache-dependency-path: |
+          telemetry-web/go.sum
+          telemetry-web/adapters/*/go.sum
+
+    - name: Build
+      shell: bash
+      working-directory: telemetry-web
+      run: |
+        for mod in . adapters/gin adapters/echo; do
+          echo "--- build $mod"
+          (cd "$mod" && go build ./...)
+        done
+
+    - name: Lint core
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: ${{ inputs.golangci-lint-version }}
+        working-directory: telemetry-web
+        args: --timeout 10m
+
+    - name: Lint gin adapter
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: ${{ inputs.golangci-lint-version }}
+        working-directory: telemetry-web/adapters/gin
+        args: --timeout 10m
+        skip-cache: true
+
+    - name: Lint echo adapter
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: ${{ inputs.golangci-lint-version }}
+        working-directory: telemetry-web/adapters/echo
+        args: --timeout 10m
+        skip-cache: true
+
+    - name: Unit tests
+      shell: bash
+      working-directory: telemetry-web
+      run: |
+        for mod in . adapters/gin adapters/echo; do
+          echo "--- test $mod"
+          (cd "$mod" && go test -race -count=1 ./...)
+        done

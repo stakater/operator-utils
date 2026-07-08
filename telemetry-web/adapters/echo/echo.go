@@ -71,8 +71,7 @@ func Metrics() echo.MiddlewareFunc {
 // not the not-yet-written status — is the reliable signal.
 func failed(c echo.Context, err error) bool {
 	if err != nil {
-		var he *echo.HTTPError
-		if errors.As(err, &he) {
+		if he, ok := errors.AsType[*echo.HTTPError](err); ok {
 			return he.Code >= 500
 		}
 		return true

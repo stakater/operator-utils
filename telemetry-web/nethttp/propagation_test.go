@@ -32,7 +32,7 @@ func TestTransportInjectsTraceContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("do: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if gotTraceparent == "" {
 		t.Error("traceparent header not injected on outbound request")
