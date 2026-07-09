@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/go-chi/chi/v5 v5.2.1
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260709091415-6d09ebbcb019
 )
 
 require (
@@ -22,7 +22,3 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 )
-
-// Temporary while the adaptertest WithTemplateRewrite API is unreleased —
-// drop after the next core pin bump.
-replace github.com/stakater/operator-utils/telemetry-web => ../../
