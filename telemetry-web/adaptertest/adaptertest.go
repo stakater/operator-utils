@@ -60,6 +60,22 @@ type Route struct {
 // of Instrument(engine)) with the given routes registered.
 type BuildFunc func(routes []Route) http.Handler
 
+// RunOption configures Run.
+type RunOption func(*runConfig)
+
+type runConfig struct {
+	rewrite func(string) string
+}
+
+// WithTemplateRewrite translates the suite's canonical ":param" route
+// templates into the framework's syntax (e.g. chi: "/x/:id" -> "/x/{id}").
+// The rewritten form is used both for the routes handed to build and for the
+// endpoint values the suite expects on metrics. Default is identity (gin,
+// echo).
+func WithTemplateRewrite(fn func(string) string) RunOption {
+	return func(c *runConfig) { c.rewrite = fn }
+}
+
 var (
 	reader *sdkmetric.ManualReader
 	spans  *tracetest.SpanRecorder
@@ -182,16 +198,22 @@ func get(h http.Handler, path string) *httptest.ResponseRecorder {
 //   - a panic responds 500, increments http.server.panics, and records NO
 //     per-endpoint data point
 //   - http.ErrAbortHandler is re-raised untouched and not counted
-func Run(t *testing.T, build BuildFunc) {
+func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 	if reader == nil {
 		t.Fatal("adaptertest.Setup was not called from TestMain")
 	}
+	cfg := runConfig{rewrite: func(s string) string { return s }}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	okT, failT := cfg.rewrite("/conf/ok/:id"), cfg.rewrite("/conf/fail/:id")
+	panicT, abortT := cfg.rewrite("/conf/panic/:id"), cfg.rewrite("/conf/abort")
 
 	h := build([]Route{
-		{Template: "/conf/ok/:id", Behavior: OK},
-		{Template: "/conf/fail/:id", Behavior: Fail500},
-		{Template: "/conf/panic/:id", Behavior: Panic},
-		{Template: "/conf/abort", Behavior: PanicAbort},
+		{Template: okT, Behavior: OK},
+		{Template: failT, Behavior: Fail500},
+		{Template: panicT, Behavior: Panic},
+		{Template: abortT, Behavior: PanicAbort},
 	})
 
 	t.Run("SuccessRecordedOnRouteTemplate", func(t *testing.T) {
@@ -199,7 +221,7 @@ func Run(t *testing.T, build BuildFunc) {
 			t.Fatalf("status = %d, want 200", rec.Code)
 		}
 		rm := Collect(t)
-		if got := EndpointOutcome(rm, "/conf/ok/:id", "success"); got != 1 {
+		if got := EndpointOutcome(rm, okT, "success"); got != 1 {
 			t.Errorf("success count for template = %d, want 1", got)
 		}
 		if got := EndpointOutcome(rm, "/conf/ok/42", "success"); got != 0 {
@@ -209,17 +231,17 @@ func Run(t *testing.T, build BuildFunc) {
 
 	t.Run("Status500RecordsFailure", func(t *testing.T) {
 		get(h, "/conf/fail/7")
-		if got := EndpointOutcome(Collect(t), "/conf/fail/:id", "failure"); got != 1 {
+		if got := EndpointOutcome(Collect(t), failT, "failure"); got != 1 {
 			t.Errorf("failure count = %d, want 1", got)
 		}
 	})
 
 	t.Run("HTTPRouteStampedOnMetricAndSpan", func(t *testing.T) {
 		rm := Collect(t)
-		if !RouteOnDuration(rm, "/conf/ok/:id") {
+		if !RouteOnDuration(rm, okT) {
 			t.Error("http.route not stamped on http.server.request.duration")
 		}
-		if !RouteOnSpan("/conf/ok/:id") {
+		if !RouteOnSpan(okT) {
 			t.Error("http.route not stamped on the server span")
 		}
 	})

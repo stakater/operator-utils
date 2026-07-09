@@ -7,7 +7,7 @@ It is *composition over OpenTelemetry*: it wires the OTel SDK, `otelhttp`, and
 web framework**; framework glue lives in separate adapter modules.
 
 - **Module:** `github.com/stakater/operator-utils/telemetry-web`
-- **Guides:** [Gin (via adapter)](guides/gin-adapter.md) · [Echo (via adapter)](guides/echo-adapter.md) · [Echo (raw)](guides/echo-raw.md)
+- **Guides:** [Gin (via adapter)](guides/gin-adapter.md) · [Echo (via adapter)](guides/echo-adapter.md) · [chi (via adapter)](guides/chi-adapter.md) · [Echo (raw)](guides/echo-raw.md)
 
 ---
 
@@ -24,6 +24,7 @@ web framework**; framework glue lives in separate adapter modules.
   - [`telemetry/nethttp`](#package-nethttp) — net/http server & client
   - [`adapters/gin`](#package-adaptersgin) — Gin adapter
   - [`adapters/echo`](#package-adaptersecho) — Echo adapter
+  - [`adapters/chi`](#package-adapterschi) — chi adapter
 - [Correlation model](#correlation-model)
 - [Shutdown](#shutdown)
 - [Gotchas](#gotchas)
@@ -49,7 +50,7 @@ value you must thread is `context.Context` — that is what carries the active s
 (for exemplars and log correlation).
 
 Dependency direction inside the module (no cycles):
-`adapters/{gin,echo} → nethttp → endpoint → logging → internal/scope → otel`.
+`adapters/{gin,echo,chi} → nethttp → endpoint → logging → internal/scope → otel`.
 
 ---
 
@@ -339,17 +340,58 @@ adapter there is no register-routes-after-instrumenting ordering rule. See the
 
 ---
 
+### package `adapters/chi`
+
+Separate module `github.com/stakater/operator-utils/telemetry-web/adapters/chi`,
+package name **`chitel`** — deliberately different from the directory so it
+never collides with go-chi's `chi` (no import alias needed):
+
+```go
+import "github.com/stakater/operator-utils/telemetry-web/adapters/chi" // package chitel
+```
+
+```go
+func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler // Recovery + RouteTag + Metrics + nethttp.Handler
+func Recovery() Middleware   // = nethttp.Recovery (chi middleware is plain net/http chaining)
+func RouteTag() Middleware   // http.route (RoutePattern()) -> server span + duration metric
+func Metrics() Middleware    // http.endpoint.requests{endpoint,outcome} by matched route pattern
+```
+
+Same split as the other adapters, with two chi-specific notes: chi assembles
+`RoutePattern()` *during* routing, so `RouteTag`/`Metrics` run after the
+handler — a panicked request's span carries no `http.route` (panic + `500` are
+still fully recorded). And chi handlers have no error channel, so `failure`
+means status ≥ 500 only. Mounted subrouters record chi's joined pattern
+(`/api/users/{id}`) as-is. Like Gin, call `Instrument` **before** registering
+routes (chi panics on late `Use`). See the [chi guide](guides/chi-adapter.md).
+
+---
+
 ### The adapter contract
 
 Every framework adapter exposes exactly `Instrument` / `Recovery` / `RouteTag`
-/ `Metrics` with the semantics above, and is held to them by a shared
-conformance suite —
+/ `Metrics` with the semantics above. The failure signal is the closest native
+notion of "server-side failure" each framework offers:
+
+| Adapter | `outcome=failure` when |
+| --- | --- |
+| `gintel` | status ≥ 500, or the handler called `c.Error(...)` |
+| `echotel` | returned non-HTTP error, returned `*echo.HTTPError` ≥ 500, or wrote status ≥ 500 |
+| `chitel` | status ≥ 500 |
+
+`http.route` is stamped on every *completed* request's span and duration
+metric; whether a *panicked* request's span carries it is per-framework
+(gin/echo: yes — the template is known before the handler; chi: no — the
+pattern only exists after routing completes).
+
+Adapters are held to the contract by a shared conformance suite —
 package `…/telemetry/adaptertest` — that each adapter module runs against its
 own engine (`adaptertest.Run`): route-templated metrics (never raw paths),
 `500 → failure`, `http.route` on span + duration metric, unmatched routes
 skipped, panic → `500` + panic counter + no per-endpoint data point,
-`http.ErrAbortHandler` re-raised untouched. A new adapter is done when it
-passes `adaptertest.Run`.
+`http.ErrAbortHandler` re-raised untouched. Frameworks with a different route
+parameter syntax pass `adaptertest.WithTemplateRewrite` (chi rewrites `:id` →
+`{id}`). A new adapter is done when it passes `adaptertest.Run`.
 
 ---
 

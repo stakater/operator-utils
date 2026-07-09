@@ -22,7 +22,7 @@ runs:
       shell: bash
       working-directory: telemetry-web
       run: |
-        for mod in . adapters/gin adapters/echo; do
+        for mod in . adapters/gin adapters/echo adapters/chi; do
           echo "--- build $mod"
           (cd "$mod" && go build ./...)
         done
@@ -50,11 +50,19 @@ runs:
         args: --timeout 10m
         skip-cache: true
 
+    - name: Lint chi adapter
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: ${{ inputs.golangci-lint-version }}
+        working-directory: telemetry-web/adapters/chi
+        args: --timeout 10m
+        skip-cache: true
+
     - name: Unit tests
       shell: bash
       working-directory: telemetry-web
       run: |
-        for mod in . adapters/gin adapters/echo; do
+        for mod in . adapters/gin adapters/echo adapters/chi; do
           echo "--- test $mod"
           (cd "$mod" && go test -race -count=1 ./...)
         done
