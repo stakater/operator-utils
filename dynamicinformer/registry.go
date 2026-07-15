@@ -14,11 +14,17 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// WatchKey uniquely identifies a watch by GVR and namespace.
+// WatchKey uniquely identifies a watch by GVR, namespace, and identity.
 // An empty namespace means cluster-scoped.
+//
+// Identity selects which client the informer is started with (see ClientProvider)
+// and is part of the key on purpose: watches under different identities are never
+// shared, since they may be authorized differently. The registry treats the value
+// as opaque; an empty identity means the registry's default client.
 type WatchKey struct {
 	GVR       schema.GroupVersionResource
 	Namespace string
+	Identity  string
 }
 
 // WatchRequest pairs a watch key with its callback. Passed as a slice to EnsureWatchSet.
@@ -55,6 +61,30 @@ type WatchRegistration struct {
 	HasSynced  cache.InformerSynced
 }
 
+// ClientProvider supplies the dynamic client for a given identity. The identity
+// string is opaque to the registry — which credentials or cluster it maps to is
+// entirely up to the implementation. An empty identity must return the default
+// client.
+//
+// Implementations must be safe for concurrent use and should cache clients per
+// identity, since ClientFor is called every time an informer starts.
+type ClientProvider interface {
+	ClientFor(identity string) (dynamic.Interface, error)
+}
+
+// singleClientProvider serves one fixed client for the empty identity only.
+// It backs NewWatchRegistry for callers that predate identities.
+type singleClientProvider struct {
+	client dynamic.Interface
+}
+
+func (p singleClientProvider) ClientFor(identity string) (dynamic.Interface, error) {
+	if identity != "" {
+		return nil, fmt.Errorf("registry was built without a ClientProvider; cannot serve identity %q", identity)
+	}
+	return p.client, nil
+}
+
 // WatchRegistry manages dynamic informers for arbitrary GroupVersionResource types
 // at runtime. Each consumer registers callbacks per watch key. The registry deduplicates
 // informers, manages handler lifecycle, and cleans up stale watches automatically.
@@ -64,18 +94,26 @@ type WatchRegistry struct {
 	mu           sync.Mutex
 	watches      map[WatchKey]*WatchEntry
 	consumerKeys map[string]map[WatchKey]struct{} // consumerID → set of WatchKeys
-	dynamic      dynamic.Interface
+	clients      ClientProvider
 	resyncPeriod time.Duration
 }
 
 // NewWatchRegistry creates a new registry backed by the given dynamic client.
+// All watch keys must use the empty identity. Use NewWatchRegistryWithProvider
+// to serve watches under multiple identities.
 // The resyncPeriod controls how often each informer relists from the API server.
 // A non-zero value is required to recover from dropped events (30s is typical).
 func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duration) *WatchRegistry {
+	return NewWatchRegistryWithProvider(singleClientProvider{client: dynamicClient}, resyncPeriod)
+}
+
+// NewWatchRegistryWithProvider creates a registry that resolves the client for
+// each watch from the provider, keyed by WatchKey.Identity.
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry {
 	return &WatchRegistry{
 		watches:      make(map[WatchKey]*WatchEntry),
 		consumerKeys: make(map[string]map[WatchKey]struct{}),
-		dynamic:      dynamicClient,
+		clients:      provider,
 		resyncPeriod: resyncPeriod,
 	}
 }
@@ -178,10 +216,23 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		entry, exists := r.watches[key]
 		if !exists {
+			cli, err := r.clients.ClientFor(key.Identity)
+			if err != nil {
+				// Same recovery contract as an AddEventHandler failure below:
+				// roll back handlers added in this call, keep the previous set.
+				rollbackErrs := []error{fmt.Errorf("failed to get client for %v: %w", key, err)}
+				for _, key := range newlyAdded {
+					if rErr := r.releaseWatchLocked(key, consumerID); rErr != nil {
+						rollbackErrs = append(rollbackErrs, rErr)
+					}
+				}
+				return nil, errors.Join(rollbackErrs...)
+			}
+
 			ctx, cancel := context.WithCancel(parentCtx)
 
 			factory := kubedynamicinformer.NewFilteredDynamicSharedInformerFactory(
-				r.dynamic,
+				cli,
 				r.resyncPeriod,
 				key.Namespace,
 				nil,
