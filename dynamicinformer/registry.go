@@ -64,7 +64,8 @@ type WatchRegistration struct {
 // ClientProvider supplies the dynamic client for a given identity. The identity
 // string is opaque to the registry — which credentials or cluster it maps to is
 // entirely up to the implementation. An empty identity must return the default
-// client.
+// client. Implementations must never return (nil, nil); the registry rejects a
+// nil client defensively.
 //
 // Implementations must be safe for concurrent use and should cache clients per
 // identity, since ClientFor is called every time an informer starts.
@@ -80,7 +81,10 @@ type singleClientProvider struct {
 
 func (p singleClientProvider) ClientFor(identity string) (dynamic.Interface, error) {
 	if identity != "" {
-		return nil, fmt.Errorf("registry was built without a ClientProvider; cannot serve identity %q", identity)
+		return nil, fmt.Errorf("identity %q is not supported: this registry serves only the default identity (use NewWatchRegistryWithProvider for per-identity clients)", identity)
+	}
+	if p.client == nil {
+		return nil, fmt.Errorf("registry was created with a nil dynamic client")
 	}
 	return p.client, nil
 }
@@ -217,16 +221,14 @@ func (r *WatchRegistry) EnsureWatchSet(
 		entry, exists := r.watches[key]
 		if !exists {
 			cli, err := r.clients.ClientFor(key.Identity)
+			if err == nil && cli == nil {
+				// The provider is caller-supplied; guard against (nil, nil) so
+				// the failure surfaces here instead of a panic inside the informer.
+				err = fmt.Errorf("ClientFor returned a nil client")
+			}
 			if err != nil {
-				// Same recovery contract as an AddEventHandler failure below:
-				// roll back handlers added in this call, keep the previous set.
-				rollbackErrs := []error{fmt.Errorf("failed to get client for %v: %w", key, err)}
-				for _, key := range newlyAdded {
-					if rErr := r.releaseWatchLocked(key, consumerID); rErr != nil {
-						rollbackErrs = append(rollbackErrs, rErr)
-					}
-				}
-				return nil, errors.Join(rollbackErrs...)
+				return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
+					fmt.Errorf("failed to get client for %v: %w", key, err))
 			}
 
 			ctx, cancel := context.WithCancel(parentCtx)
@@ -261,15 +263,8 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		reg, err := entry.informer.AddEventHandler(callbackToHandler(w.Callback))
 		if err != nil {
-			// Clean up only handlers added in this call; deduped (pre-existing)
-			// handlers are untouched so the consumer keeps its previous state.
-			rollbackErrs := []error{fmt.Errorf("failed to add event handler for %v: %w", key, err)}
-			for _, key := range newlyAdded {
-				if rErr := r.releaseWatchLocked(key, consumerID); rErr != nil {
-					rollbackErrs = append(rollbackErrs, rErr)
-				}
-			}
-			return nil, errors.Join(rollbackErrs...)
+			return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
+				fmt.Errorf("failed to add event handler for %v: %w", key, err))
 		}
 
 		entry.handlers[consumerID] = &handlerRegistration{
@@ -295,6 +290,20 @@ func (r *WatchRegistry) EnsureWatchSet(
 	r.consumerKeys[consumerID] = newCurrent
 
 	return regs, errors.Join(errs...)
+}
+
+// rollbackNewlyAddedLocked releases the watches added earlier in the same
+// EnsureWatchSet call and joins any release errors onto cause. Deduped
+// (pre-existing) handlers are untouched, so the consumer keeps its previous
+// watch set on failure. Caller must hold r.mu.
+func (r *WatchRegistry) rollbackNewlyAddedLocked(consumerID string, newlyAdded []WatchKey, cause error) error {
+	errs := []error{cause}
+	for _, key := range newlyAdded {
+		if rErr := r.releaseWatchLocked(key, consumerID); rErr != nil {
+			errs = append(errs, rErr)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ReleaseAll releases all registrations for a given consumer across all watch keys.

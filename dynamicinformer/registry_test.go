@@ -1068,6 +1068,44 @@ func TestEnsureWatchSet_ProviderErrorRollsBack(t *testing.T) {
 	}
 }
 
+// nilClientProvider returns (nil, nil) — an invalid implementation the
+// registry must reject instead of panicking inside the informer.
+type nilClientProvider struct{}
+
+func (nilClientProvider) ClientFor(string) (dynamic.Interface, error) { return nil, nil }
+
+func TestEnsureWatchSet_NilClientFromProviderIsRejected(t *testing.T) {
+	registry := NewWatchRegistryWithProvider(nilClientProvider{}, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: WatchKey{GVR: deploymentsGVR, Namespace: "default"}, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error for provider returning nil client")
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected no watches after nil-client rejection, got %d", len(registry.watches))
+	}
+}
+
+func TestNewWatchRegistry_NilClientIsRejected(t *testing.T) {
+	registry := NewWatchRegistry(nil, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: WatchKey{GVR: deploymentsGVR, Namespace: "default"}, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error for registry created with nil client")
+	}
+}
+
 func TestNewWatchRegistry_RejectsNonEmptyIdentity(t *testing.T) {
 	registry, ctx, cancel := newFakeRegistry(t) // legacy single-client constructor
 	defer cancel()
