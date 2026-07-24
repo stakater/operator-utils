@@ -97,12 +97,18 @@ func WrapClient(c *http.Client) *http.Client {
 }
 
 // StampRoute puts http.route on the active server span and on the otelhttp
-// metric attributes (via the request Labeler) for this request. The framework
-// adapters call it from their RouteTag middleware once the matched route
-// template is known; call it yourself when integrating a framework by hand.
-func StampRoute(ctx context.Context, route string) {
+// metric attributes (via the request Labeler) for this request, and renames
+// the span to the semconv form "{method} {route}" (method may be empty to
+// leave the span name alone). The framework adapters call it from their
+// RouteTag middleware once the matched route template is known; call it
+// yourself when integrating a framework by hand.
+func StampRoute(ctx context.Context, method, route string) {
 	attr := semconv.HTTPRoute(route)
 	labeler, _ := otelhttp.LabelerFromContext(ctx)
 	labeler.Add(attr)
-	trace.SpanFromContext(ctx).SetAttributes(attr)
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attr)
+	if method != "" {
+		span.SetName(method + " " + route)
+	}
 }

@@ -2,7 +2,7 @@ package telemetry
 
 import (
 	"context"
-	"os"
+	"strings"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -10,22 +10,27 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-const defaultOTLPEndpoint = "localhost:4317"
+// hasScheme reports whether the endpoint is URL-form (http://host:port) rather
+// than bare host:port. The two need different exporter options.
+func hasScheme(endpoint string) bool { return strings.Contains(endpoint, "://") }
 
-// resolveEndpoint prefers the config value, then the standard env var, then a
-// local-collector default.
-func resolveEndpoint(cfg Config) string {
-	if cfg.OTLPEndpoint != "" {
-		return cfg.OTLPEndpoint
-	}
-	if env := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); env != "" {
-		return env
-	}
-	return defaultOTLPEndpoint
-}
+// Endpoint resolution: only Config.OTLPEndpoint is applied here — as
+// WithEndpointURL for URL-form values, WithEndpoint for bare host:port. When
+// unset, NO endpoint option is passed, so the exporter SDK's own env handling
+// applies: OTEL_EXPORTER_OTLP_ENDPOINT (URL-form per spec), the per-signal
+// OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT overrides, and the
+// localhost:4317 default. Re-reading the env here and feeding it to
+// WithEndpoint would break spec-compliant URL values.
 
 func newTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanProcessor, error) {
-	opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(resolveEndpoint(cfg))}
+	var opts []otlptracegrpc.Option
+	if ep := cfg.OTLPEndpoint; ep != "" {
+		if hasScheme(ep) {
+			opts = append(opts, otlptracegrpc.WithEndpointURL(ep))
+		} else {
+			opts = append(opts, otlptracegrpc.WithEndpoint(ep))
+		}
+	}
 	if cfg.Insecure {
 		opts = append(opts, otlptracegrpc.WithInsecure())
 	}
@@ -37,7 +42,14 @@ func newTraceExporter(ctx context.Context, cfg Config) (sdktrace.SpanProcessor, 
 }
 
 func newMetricReader(ctx context.Context, cfg Config) (sdkmetric.Reader, error) {
-	opts := []otlpmetricgrpc.Option{otlpmetricgrpc.WithEndpoint(resolveEndpoint(cfg))}
+	var opts []otlpmetricgrpc.Option
+	if ep := cfg.OTLPEndpoint; ep != "" {
+		if hasScheme(ep) {
+			opts = append(opts, otlpmetricgrpc.WithEndpointURL(ep))
+		} else {
+			opts = append(opts, otlpmetricgrpc.WithEndpoint(ep))
+		}
+	}
 	if cfg.Insecure {
 		opts = append(opts, otlpmetricgrpc.WithInsecure())
 	}

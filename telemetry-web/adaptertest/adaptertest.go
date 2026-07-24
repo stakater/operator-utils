@@ -166,6 +166,16 @@ func RouteOnSpan(route string) bool {
 	return false
 }
 
+// SpanNamed reports whether any recorded span has the given name.
+func SpanNamed(name string) bool {
+	for _, s := range spans.Ended() {
+		if s.Name() == name {
+			return true
+		}
+	}
+	return false
+}
+
 func eachSum(rm metricdata.ResourceMetrics, name string, fn func(metricdata.DataPoint[int64])) {
 	for _, sm := range rm.ScopeMetrics {
 		for _, mtr := range sm.Metrics {
@@ -243,6 +253,9 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		}
 		if !RouteOnSpan(okT) {
 			t.Error("http.route not stamped on the server span")
+		}
+		if !SpanNamed("GET " + okT) {
+			t.Errorf("server span not renamed to semconv form %q", "GET "+okT)
 		}
 	})
 

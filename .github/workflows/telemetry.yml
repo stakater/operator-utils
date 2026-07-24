@@ -13,6 +13,9 @@ on:
       - "telemetry-web/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   GOLANG_CI_LINT_VERSION: v2.12.2
 
@@ -20,7 +23,9 @@ jobs:
   validate:
     name: Validate telemetry
     runs-on: ubuntu-latest
-    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]')"
+    # commits.*.message only exists on push payloads, so the PR title check is
+    # what gates pull_request events (the commits array is empty there).
+    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]') && ! contains(github.event.pull_request.title, '[skip-ci]')"
     steps:
       - name: Check out code
         uses: actions/checkout@v5

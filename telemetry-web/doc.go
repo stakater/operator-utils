@@ -5,7 +5,11 @@
 // Setup (net/http):
 //
 //	shutdown, err := telemetry.Init(ctx, telemetry.Config{ServiceName: "svc"})
-//	defer shutdown(context.Background())
+//	defer func() { // bounded flush — an unreachable collector must not hang exit
+//	    sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+//	    defer cancel()
+//	    _ = shutdown(sctx)
+//	}()
 //	http.ListenAndServe(":8080", nethttp.Handler(mux))
 //
 // The library is framework-agnostic. Capabilities live in sub-packages:
