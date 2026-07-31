@@ -174,7 +174,11 @@ context; the library does not impose a timeout). If a later setup step fails,
 ```go
 shutdown, err := telemetry.Init(ctx, telemetry.Config{ServiceName: "mto-gateway"})
 if err != nil { log.Fatal(err) }
-defer shutdown(context.Background())
+defer func() { // bounded flush — an unreachable collector must not hang exit
+    sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    _ = shutdown(sctx)
+}()
 ```
 
 ---
@@ -247,7 +251,7 @@ net/http integration. Import path `…/telemetry/nethttp`.
 func Handler(next http.Handler, opts ...Option) http.Handler // inbound: otelhttp spans+metrics -> recovery -> next
 func WithSkipPaths(paths ...string) Option            // opt out exact paths from instrumentation
 var DefaultSkipPaths = []string{...}                  // /healthz /readyz /livez /metrics — pass to WithSkipPaths
-func StampRoute(ctx context.Context, route string)    // put http.route on the active span + duration metric
+func StampRoute(ctx context.Context, method, route string) // http.route on span + duration metric; span renamed "{method} {route}"
 func Recovery(next http.Handler) http.Handler         // panic -> RecordPanic + 500 (ErrAbortHandler re-raised)
 func Transport(base http.RoundTripper) http.RoundTripper // outbound: inject trace context
 func HTTPClient() *http.Client                        // client whose Transport already propagates

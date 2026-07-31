@@ -172,9 +172,18 @@ func TelemetryMetrics() echo.MiddlewareFunc {
             route := c.Path()
             if route != "" {
                 // Echo runs its error handler AFTER the middleware chain returns,
-                // so a returned error is the reliable failure signal here; also
-                // catch handlers that set a 5xx status directly.
-                failed := err != nil || c.Response().Status >= 500
+                // so the returned error — not the not-yet-written status — is the
+                // reliable signal. Only server-side failures count: a returned
+                // 4xx *echo.HTTPError is a client error (success), matching the
+                // echotel adapter's classification.
+                failed := c.Response().Status >= 500
+                if err != nil {
+                    if he, ok := errors.AsType[*echo.HTTPError](err); ok {
+                        failed = he.Code >= 500
+                    } else {
+                        failed = true // non-HTTP error -> echo's default 500
+                    }
+                }
                 endpoint.Record(c.Request().Context(), route, failed)
             }
             return err
@@ -184,16 +193,18 @@ func TelemetryMetrics() echo.MiddlewareFunc {
 ```
 
 That emits `http.endpoint.requests{endpoint="/users/:id", outcome}` for every
-matched route — identical to the Gin adapter's output. Unmatched requests have an
-empty `c.Path()` and are skipped, keeping cardinality bounded.
+matched route, with the same outcome classification as the `echotel` adapter.
+Unmatched requests have an empty `c.Path()` and are skipped, keeping
+cardinality bounded.
 
 The adapters additionally stamp `http.route` on the server span and the
-`http.server.request.duration` metric (their `RouteTag` middleware). To match
-that here, call the core primitive where the route is known:
+`http.server.request.duration` metric, and rename the span to the semconv
+`{method} {route}` form (their `RouteTag` middleware). To match that here, call
+the core primitive where the route is known:
 
 ```go
 if route := c.Path(); route != "" {
-    nethttp.StampRoute(c.Request().Context(), route)
+    nethttp.StampRoute(c.Request().Context(), c.Request().Method, route)
 }
 ```
 

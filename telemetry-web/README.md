@@ -41,7 +41,11 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-    defer shutdown(context.Background()) // flushes the last batch on exit
+    defer func() { // bounded flush — an unreachable collector must not hang exit
+        sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
+        _ = shutdown(sctx)
+    }()
 
     mux := http.NewServeMux()
     // ... register routes ...
@@ -216,7 +220,7 @@ imported as `gin`, import the adapter under an alias such as `teleg`:
 ```go
 import (
     "github.com/gin-gonic/gin"
-    teleg "github.com/stakater/operator-utils/telemetry-web/adapters/gin"
+    "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // package gintel
 )
 
 func main() {
@@ -225,11 +229,14 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-    defer shutdown(context.Background())
+    defer func() {
+        sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
+        _ = shutdown(sctx)
+    }()
 
     engine := gin.New()
-    engine.Use(teleg.Recovery(), teleg.Metrics())
-    h := teleg.Instrument(engine)
+    h := gintel.Instrument(engine) // installs Recovery, RouteTag, and Metrics
     // ... register routes on engine ...
 
     http.ListenAndServe(":8080", h)
