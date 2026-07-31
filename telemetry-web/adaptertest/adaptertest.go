@@ -1,9 +1,9 @@
 // Package adaptertest is the conformance suite for framework adapters. Every
-// adapter (gin, echo, future ones) runs Run against its own engine, which
+// adapter (gin, echo, chi, future ones) runs Run against its own engine, which
 // guarantees the adapters stay behaviorally identical: same metrics, same
-// route templating, same panic semantics. It also exports the metric/span
-// inspection helpers so adapter modules can write framework-specific tests
-// against the same providers.
+// route templating, same outcome classification, same panic semantics. It also
+// exports the metric/span inspection helpers so adapter modules can write
+// framework-specific tests against the same providers.
 //
 // Usage in an adapter module:
 //
@@ -13,17 +13,21 @@
 //	}
 //
 //	func TestConformance(t *testing.T) {
-//	    adaptertest.Run(t, func(routes []adaptertest.Route) http.Handler {
+//	    adaptertest.Run(t, func(routes []adaptertest.Route, opts ...nethttp.Option) http.Handler {
 //	        engine := gin.New()
-//	        h := Instrument(engine)
+//	        h := Instrument(engine, opts...)
 //	        // register each route with the requested Behavior ...
 //	        return h
 //	    })
 //	}
+//
+// Every subtest issues its own requests and asserts on deltas, so subtests may
+// be run individually or in any order.
 package adaptertest
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,6 +38,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
 // Behavior a registered conformance route must implement.
@@ -44,11 +50,20 @@ const (
 	OK Behavior = iota
 	// Fail500 responds 500.
 	Fail500
+	// Fail400 responds 400 — a client error, which must count as a success.
+	Fail400
 	// Panic panics with a non-abort value.
 	Panic
 	// PanicAbort panics with http.ErrAbortHandler.
 	PanicAbort
+	// Stream flushes a chunked response, requiring the ResponseWriter handed to
+	// the handler to still implement http.Flusher.
+	Stream
 )
+
+// StreamBody is what a Stream route must write, one byte at a time with a flush
+// between each.
+const StreamBody = "abc"
 
 // Route is a GET route the adapter must register on its engine.
 type Route struct {
@@ -56,9 +71,16 @@ type Route struct {
 	Behavior Behavior
 }
 
-// BuildFunc returns the adapter's fully instrumented handler (the equivalent
-// of Instrument(engine)) with the given routes registered.
-type BuildFunc func(routes []Route) http.Handler
+// SkipPath is the exact path the suite excludes via nethttp.WithSkipPaths. The
+// adapter must register it like any other route; the suite asserts nothing is
+// recorded for it.
+const SkipPath = "/conf/skipped"
+
+// BuildFunc returns the adapter's fully instrumented handler (the equivalent of
+// Instrument(engine, opts...)) with the given routes registered. It MUST
+// forward opts to Instrument — the suite uses them to turn on endpoint metrics
+// and to configure the skip path.
+type BuildFunc func(routes []Route, opts ...nethttp.Option) http.Handler
 
 // RunOption configures Run.
 type RunOption func(*runConfig)
@@ -92,6 +114,15 @@ func Setup() {
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)))
 }
 
+// Reset drops recorded spans so a subtest sees only the spans it produced.
+// Metrics stay cumulative — the instruments are bound to the provider installed
+// by Setup and cannot be rebound — so assert on deltas instead.
+func Reset() {
+	if spans != nil {
+		spans.Reset()
+	}
+}
+
 // Collect returns the current cumulative metric state.
 func Collect(t *testing.T) metricdata.ResourceMetrics {
 	t.Helper()
@@ -105,11 +136,11 @@ func Collect(t *testing.T) metricdata.ResourceMetrics {
 	return rm
 }
 
-// EndpointOutcome returns the cumulative http.endpoint.requests count for
+// EndpointOutcome returns the cumulative endpoint.requests count for
 // {endpoint,outcome}.
 func EndpointOutcome(rm metricdata.ResourceMetrics, route, outcome string) int64 {
 	var total int64
-	eachSum(rm, "http.endpoint.requests", func(dp metricdata.DataPoint[int64]) {
+	eachSum(rm, "endpoint.requests", func(dp metricdata.DataPoint[int64]) {
 		ep, _ := dp.Attributes.Value(attribute.Key("endpoint"))
 		oc, _ := dp.Attributes.Value(attribute.Key("outcome"))
 		if ep.AsString() == route && oc.AsString() == outcome {
@@ -119,11 +150,11 @@ func EndpointOutcome(rm metricdata.ResourceMetrics, route, outcome string) int64
 	return total
 }
 
-// EndpointTotal returns the cumulative http.endpoint.requests count across all
+// EndpointTotal returns the cumulative endpoint.requests count across all
 // endpoints and outcomes.
 func EndpointTotal(rm metricdata.ResourceMetrics) int64 {
 	var total int64
-	eachSum(rm, "http.endpoint.requests", func(dp metricdata.DataPoint[int64]) { total += dp.Value })
+	eachSum(rm, "endpoint.requests", func(dp metricdata.DataPoint[int64]) { total += dp.Value })
 	return total
 }
 
@@ -134,9 +165,10 @@ func PanicCount(rm metricdata.ResourceMetrics) int64 {
 	return total
 }
 
-// RouteOnDuration reports whether the otelhttp duration histogram has a data
-// point carrying http.route=route.
-func RouteOnDuration(rm metricdata.ResourceMetrics, route string) bool {
+// DurationCount returns the cumulative http.server.request.duration observation
+// count carrying http.route=route.
+func DurationCount(rm metricdata.ResourceMetrics, route string) uint64 {
+	var total uint64
 	for _, sm := range rm.ScopeMetrics {
 		for _, mtr := range sm.Metrics {
 			if mtr.Name != "http.server.request.duration" {
@@ -145,16 +177,42 @@ func RouteOnDuration(rm metricdata.ResourceMetrics, route string) bool {
 			if h, ok := mtr.Data.(metricdata.Histogram[float64]); ok {
 				for _, dp := range h.DataPoints {
 					if v, ok := dp.Attributes.Value(attribute.Key("http.route")); ok && v.AsString() == route {
-						return true
+						total += dp.Count
 					}
 				}
 			}
 		}
 	}
-	return false
+	return total
 }
 
-// RouteOnSpan reports whether any recorded span carries http.route=route.
+// DurationTotal returns the cumulative http.server.request.duration observation
+// count across all attribute sets.
+func DurationTotal(rm metricdata.ResourceMetrics) uint64 {
+	var total uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, mtr := range sm.Metrics {
+			if mtr.Name != "http.server.request.duration" {
+				continue
+			}
+			if h, ok := mtr.Data.(metricdata.Histogram[float64]); ok {
+				for _, dp := range h.DataPoints {
+					total += dp.Count
+				}
+			}
+		}
+	}
+	return total
+}
+
+// RouteOnDuration reports whether the otelhttp duration histogram has a data
+// point carrying http.route=route.
+func RouteOnDuration(rm metricdata.ResourceMetrics, route string) bool {
+	return DurationCount(rm, route) > 0
+}
+
+// RouteOnSpan reports whether any span recorded since the last Reset carries
+// http.route=route.
 func RouteOnSpan(route string) bool {
 	for _, s := range spans.Ended() {
 		for _, kv := range s.Attributes() {
@@ -166,7 +224,8 @@ func RouteOnSpan(route string) bool {
 	return false
 }
 
-// SpanNamed reports whether any recorded span has the given name.
+// SpanNamed reports whether any span recorded since the last Reset has the
+// given name.
 func SpanNamed(name string) bool {
 	for _, s := range spans.Ended() {
 		if s.Name() == name {
@@ -175,6 +234,9 @@ func SpanNamed(name string) bool {
 	}
 	return false
 }
+
+// SpanCount returns the number of spans recorded since the last Reset.
+func SpanCount() int { return len(spans.Ended()) }
 
 func eachSum(rm metricdata.ResourceMetrics, name string, fn func(metricdata.DataPoint[int64])) {
 	for _, sm := range rm.ScopeMetrics {
@@ -203,11 +265,18 @@ func get(h http.Handler, path string) *httptest.ResponseRecorder {
 //   - success on a matched route is recorded on the route TEMPLATE, never the
 //     raw path, with outcome=success
 //   - a 500 response records outcome=failure
-//   - http.route is stamped on the server span and the otelhttp duration metric
+//   - a 4xx response records outcome=SUCCESS — only server-side faults count
+//   - http.route is stamped on the server span and the otelhttp duration metric,
+//     and the span is renamed to the semconv "{method} {route}" form
+//   - a panicked request still carries http.route on its span
 //   - unmatched requests record no per-endpoint data point
+//   - a path excluded by WithSkipPaths records nothing at all: no span, no
+//     duration observation, no per-endpoint data point
 //   - a panic responds 500, increments http.server.panics, and records NO
 //     per-endpoint data point
 //   - http.ErrAbortHandler is re-raised untouched and not counted
+//   - the ResponseWriter reaching the handler still implements http.Flusher, so
+//     SSE and other streaming responses work through the instrumented chain
 func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 	if reader == nil {
 		t.Fatal("adaptertest.Setup was not called from TestMain")
@@ -217,38 +286,69 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		opt(&cfg)
 	}
 	okT, failT := cfg.rewrite("/conf/ok/:id"), cfg.rewrite("/conf/fail/:id")
+	clientT := cfg.rewrite("/conf/client/:id")
 	panicT, abortT := cfg.rewrite("/conf/panic/:id"), cfg.rewrite("/conf/abort")
+	streamT := cfg.rewrite("/conf/stream")
 
 	h := build([]Route{
 		{Template: okT, Behavior: OK},
 		{Template: failT, Behavior: Fail500},
+		{Template: clientT, Behavior: Fail400},
 		{Template: panicT, Behavior: Panic},
 		{Template: abortT, Behavior: PanicAbort},
-	})
+		{Template: streamT, Behavior: Stream},
+		{Template: SkipPath, Behavior: OK},
+	},
+		nethttp.WithEndpointMetrics(),
+		nethttp.WithSkipPaths(SkipPath),
+	)
 
 	t.Run("SuccessRecordedOnRouteTemplate", func(t *testing.T) {
+		Reset()
+		before := Collect(t)
 		if rec := get(h, "/conf/ok/42"); rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200", rec.Code)
 		}
-		rm := Collect(t)
-		if got := EndpointOutcome(rm, okT, "success"); got != 1 {
+		after := Collect(t)
+		if got := EndpointOutcome(after, okT, "success") - EndpointOutcome(before, okT, "success"); got != 1 {
 			t.Errorf("success count for template = %d, want 1", got)
 		}
-		if got := EndpointOutcome(rm, "/conf/ok/42", "success"); got != 0 {
+		if got := EndpointOutcome(after, "/conf/ok/42", "success"); got != 0 {
 			t.Errorf("raw path must not be recorded, got %d", got)
 		}
 	})
 
 	t.Run("Status500RecordsFailure", func(t *testing.T) {
+		Reset()
+		before := Collect(t)
 		get(h, "/conf/fail/7")
-		if got := EndpointOutcome(Collect(t), failT, "failure"); got != 1 {
+		after := Collect(t)
+		if got := EndpointOutcome(after, failT, "failure") - EndpointOutcome(before, failT, "failure"); got != 1 {
 			t.Errorf("failure count = %d, want 1", got)
 		}
 	})
 
+	t.Run("ClientErrorRecordsSuccess", func(t *testing.T) {
+		Reset()
+		before := Collect(t)
+		if rec := get(h, "/conf/client/7"); rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		after := Collect(t)
+		if got := EndpointOutcome(after, clientT, "success") - EndpointOutcome(before, clientT, "success"); got != 1 {
+			t.Errorf("4xx must record outcome=success, got delta %d", got)
+		}
+		if got := EndpointOutcome(after, clientT, "failure") - EndpointOutcome(before, clientT, "failure"); got != 0 {
+			t.Errorf("4xx must not record outcome=failure, got delta %d", got)
+		}
+	})
+
 	t.Run("HTTPRouteStampedOnMetricAndSpan", func(t *testing.T) {
-		rm := Collect(t)
-		if !RouteOnDuration(rm, okT) {
+		Reset()
+		before := Collect(t)
+		get(h, "/conf/ok/42")
+		after := Collect(t)
+		if DurationCount(after, okT)-DurationCount(before, okT) != 1 {
 			t.Error("http.route not stamped on http.server.request.duration")
 		}
 		if !RouteOnSpan(okT) {
@@ -259,7 +359,16 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		}
 	})
 
+	t.Run("PanickedRequestStillCarriesRouteOnSpan", func(t *testing.T) {
+		Reset()
+		get(h, "/conf/panic/1")
+		if !RouteOnSpan(panicT) {
+			t.Error("panicked request lost http.route on its span")
+		}
+	})
+
 	t.Run("UnmatchedRouteNotRecorded", func(t *testing.T) {
+		Reset()
 		before := EndpointTotal(Collect(t))
 		get(h, "/conf/definitely/not/registered")
 		if delta := EndpointTotal(Collect(t)) - before; delta != 0 {
@@ -267,25 +376,66 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		}
 	})
 
+	t.Run("SkippedPathRecordsNothing", func(t *testing.T) {
+		Reset()
+		before := Collect(t)
+		if rec := get(h, SkipPath); rec.Code != http.StatusOK {
+			t.Fatalf("skipped path must still be served, status = %d", rec.Code)
+		}
+		after := Collect(t)
+		if delta := EndpointTotal(after) - EndpointTotal(before); delta != 0 {
+			t.Errorf("skipped path recorded %d endpoint.requests points, want 0", delta)
+		}
+		if delta := DurationTotal(after) - DurationTotal(before); delta != 0 {
+			t.Errorf("skipped path recorded %d duration observations, want 0", delta)
+		}
+		if n := SpanCount(); n != 0 {
+			t.Errorf("skipped path produced %d spans, want 0", n)
+		}
+	})
+
 	t.Run("PanicRecords500AndCounterNotEndpoint", func(t *testing.T) {
-		beforePanics := PanicCount(Collect(t))
-		beforeEndpoints := EndpointTotal(Collect(t))
+		Reset()
+		before := Collect(t)
 		if rec := get(h, "/conf/panic/1"); rec.Code != http.StatusInternalServerError {
 			t.Errorf("status = %d, want 500", rec.Code)
 		}
-		rm := Collect(t)
-		if delta := PanicCount(rm) - beforePanics; delta != 1 {
+		after := Collect(t)
+		if delta := PanicCount(after) - PanicCount(before); delta != 1 {
 			t.Errorf("panic counter delta = %d, want 1", delta)
 		}
-		if delta := EndpointTotal(rm) - beforeEndpoints; delta != 0 {
+		if delta := EndpointTotal(after) - EndpointTotal(before); delta != 0 {
 			t.Errorf("panicked request recorded %d per-endpoint data points, want 0", delta)
 		}
 	})
 
+	// Guards against any adapter (or the core Recovery) wrapping the
+	// ResponseWriter in a way that drops http.Flusher. gin's and echo's Flush
+	// type-assert, so losing it panics at runtime rather than degrading.
+	t.Run("StreamingResponseWorks", func(t *testing.T) {
+		Reset()
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+
+		resp, err := http.Get(srv.URL + streamT)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(body) != StreamBody {
+			t.Errorf("streamed body = %q, want %q — the handler's ResponseWriter likely lost http.Flusher", body, StreamBody)
+		}
+	})
+
 	t.Run("ErrAbortHandlerReRaisedNotCounted", func(t *testing.T) {
+		Reset()
 		before := PanicCount(Collect(t))
 		defer func() {
-			if rec := recover(); rec != http.ErrAbortHandler {
+			if rec := recover(); rec != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity
 				t.Errorf("expected ErrAbortHandler to propagate, got %v", rec)
 			}
 			if delta := PanicCount(Collect(t)) - before; delta != 0 {

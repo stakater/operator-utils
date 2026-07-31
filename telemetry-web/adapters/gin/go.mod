@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gin-gonic/gin v1.10.0
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260731103224-879b5e7aa8d7
 )
 
 require (

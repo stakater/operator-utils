@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
 )
 
 func TestLogHandlerStampsTraceIDs(t *testing.T) {
@@ -76,5 +78,95 @@ func TestLoggerIsCached(t *testing.T) {
 	first, second := Logger(), Logger()
 	if first != second {
 		t.Error("Logger() must return the same cached instance")
+	}
+}
+
+// service.name comes from the scope set by Init, not from the context, and is
+// stamped alongside the trace IDs.
+func TestLogHandlerStampsServiceName(t *testing.T) {
+	scope.Set("billing-api")
+
+	var buf bytes.Buffer
+	slog.New(NewLogHandler(slog.NewJSONHandler(&buf, nil))).
+		InfoContext(context.Background(), "hello")
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rec["service.name"] != "billing-api" {
+		t.Errorf("service.name = %v, want %q", rec["service.name"], "billing-api")
+	}
+}
+
+// Enabled must delegate so a level filter on the wrapped handler is honored.
+func TestEnabledDelegatesToBase(t *testing.T) {
+	base := slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelWarn})
+	h := NewLogHandler(base)
+
+	if h.Enabled(context.Background(), slog.LevelInfo) {
+		t.Error("Info must be disabled when the base handler is Warn-level")
+	}
+	if !h.Enabled(context.Background(), slog.LevelError) {
+		t.Error("Error must be enabled when the base handler is Warn-level")
+	}
+}
+
+// The no-op forms must not allocate a new handler.
+func TestWithAttrsNilAndWithGroupEmptyAreIdentity(t *testing.T) {
+	h := NewLogHandler(slog.NewJSONHandler(&bytes.Buffer{}, nil))
+	if got := h.WithAttrs(nil); got != h {
+		t.Error("WithAttrs(nil) must return the same handler")
+	}
+	if got := h.WithGroup(""); got != h {
+		t.Error(`WithGroup("") must return the same handler`)
+	}
+}
+
+// SetDefault redirects everything the library logs through, so a consuming
+// operator gets one stream in its own format instead of a second one on stdout.
+func TestSetDefaultRedirectsLibraryLogging(t *testing.T) {
+	t.Cleanup(func() { SetDefault(nil) })
+
+	var buf bytes.Buffer
+	custom := slog.New(NewLogHandler(slog.NewJSONHandler(&buf, nil)))
+	SetDefault(custom)
+
+	if Logger() != custom {
+		t.Fatal("Logger() must return the logger installed by SetDefault")
+	}
+	Logger().Info("through the injected logger")
+	if buf.Len() == 0 {
+		t.Error("the injected logger received nothing")
+	}
+
+	SetDefault(nil)
+	if Logger() == custom {
+		t.Error("SetDefault(nil) must restore the default logger")
+	}
+}
+
+// Without an open group the handler takes the fast path; the stamps must still
+// land, and user attrs must survive.
+func TestFastPathKeepsAttrsAndStamps(t *testing.T) {
+	scope.Set("fastpath-svc")
+
+	var buf bytes.Buffer
+	slog.New(NewLogHandler(slog.NewJSONHandler(&buf, nil))).
+		With("user", "attr").
+		InfoContext(context.Background(), "hello", "inline", 2)
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for k, want := range map[string]any{
+		"service.name": "fastpath-svc",
+		"user":         "attr",
+		"inline":       float64(2),
+	} {
+		if rec[k] != want {
+			t.Errorf("%s = %v, want %v (full: %s)", k, rec[k], want, buf.String())
+		}
 	}
 }

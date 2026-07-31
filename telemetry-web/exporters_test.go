@@ -19,3 +19,23 @@ func TestHasScheme(t *testing.T) {
 		}
 	}
 }
+
+// A bare host:port containing "://" later in the string is not URL-form;
+// url.Parse distinguishes them, strings.Contains would not.
+func TestHasSchemeRejectsEmbeddedSeparator(t *testing.T) {
+	cases := map[string]bool{
+		"host:4317/x://y":       false,
+		"grpc://collector:4317": true,
+		"//collector:4317":      false, // scheme-relative, no scheme
+		// Both have a scheme followed by "://", so both are URL-form. That hands
+		// them to WithEndpointURL, which reports a real error, instead of
+		// WithEndpoint silently accepting them as a host:port.
+		"http://":                 true,
+		"unix:///var/run/otel.sk": true,
+	}
+	for ep, want := range cases {
+		if got := hasScheme(ep); got != want {
+			t.Errorf("hasScheme(%q) = %v, want %v", ep, got, want)
+		}
+	}
+}

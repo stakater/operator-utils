@@ -19,7 +19,7 @@ require (
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260731103224-879b5e7aa8d7
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

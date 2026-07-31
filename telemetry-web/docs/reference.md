@@ -19,9 +19,9 @@ web framework**; framework glue lives in separate adapter modules.
 - [What gets emitted](#what-gets-emitted)
 - [Package reference](#package-reference)
   - [`telemetry`](#package-telemetry) — setup
-  - [`telemetry/logging`](#package-logging) — trace-correlated logs
-  - [`telemetry/endpoint`](#package-endpoint) — per-endpoint metrics & panics
-  - [`telemetry/nethttp`](#package-nethttp) — net/http server & client
+  - [`telemetry-web/logging`](#package-logging) — trace-correlated logs
+  - [`telemetry-web/endpoint`](#package-endpoint) — per-endpoint metrics & panics
+  - [`telemetry-web/nethttp`](#package-nethttp) — net/http server & client
   - [`adapters/gin`](#package-adaptersgin) — Gin adapter
   - [`adapters/echo`](#package-adaptersecho) — Echo adapter
   - [`adapters/chi`](#package-adapterschi) — chi adapter
@@ -108,6 +108,8 @@ type Config struct {
 | OTLP endpoint | `OTLPEndpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` |
 | Trace sample ratio | `SampleRatio` (`*float64`) | `OTEL_TRACES_SAMPLER_ARG` | `1.0` |
 | TLS | `Insecure` (set `true` to disable) | — | TLS on |
+| Resource attributes | `ServiceName`/`ServiceVersion`/`Environment` | `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` | process/host/SDK detectors |
+| OTLP protocol | — | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (only supported value; others warn, do not fail) |
 
 **Precedence:** `Config` field → env var → built-in default. For `SampleRatio`,
 `nil` means "unset" (fall through to env/default); to sample no new roots pass a
@@ -116,6 +118,12 @@ service always honors an upstream sampling decision and you never get half a
 trace.
 
 `ServiceName` is required — `Init` returns an error if it is empty.
+
+**OTLP/gRPC only.** `OTEL_EXPORTER_OTLP_PROTOCOL` (and the per-signal variants)
+should be `grpc` or unset. Any other value logs a warning naming the variable and
+`Init` still succeeds: the OpenTelemetry Operator injects this variable into pods,
+frequently as `http/protobuf`, and failing Init would let a pod-spec change
+crash-loop a previously healthy service. Telemetry degrades, the service serves.
 
 ---
 
@@ -131,20 +139,29 @@ high-value operations.
 | --- | --- | --- | --- |
 | `http.server.request.duration` | histogram (s) | method, route*, status, … | `otelhttp` (via `nethttp.Handler`) |
 | `http.server.active_requests` | up/down counter | method, scheme | `otelhttp` |
-| `http.endpoint.requests` | counter | `endpoint`, `outcome` (success\|failure) | `endpoint.Record` / `Instrument` |
+| `endpoint.requests` | counter | `endpoint`, `outcome` (success\|failure) | `endpoint.Record` / `Instrument`; adapters only under `WithEndpointMetrics` |
+| `endpoint.duration` | histogram (s) | `endpoint`, `outcome` | `endpoint.Instrument` |
 | `http.server.panics` | counter | — | `endpoint.RecordPanic` |
 | `runtime.*` (goroutines, GC, heap…) | various | — | `contrib/runtime` |
 
-\* `http.route` is populated on the duration metric (and the server span) by
-the framework adapters' `Metrics()` middleware; with raw `net/http` you'd have
-to stamp it yourself (see the Echo raw guide).
+\* `http.route` is populated on the duration metric (and the server span) by the
+framework adapters' `RouteTag()` middleware, which calls `nethttp.StampRoute`;
+with raw `net/http` you stamp it yourself (see the Echo raw guide).
 
 There is **no** separate `requests_total`: the duration histogram's `count`
-already gives request rate. `http.endpoint.requests` **deliberately overlaps**
-with the route-attributed duration histogram — it exists as a dead-simple
-success/failure signal (`outcome` label instead of status-code regexes in every
-query), and `endpoint.Record`/`Instrument` also serve non-HTTP operations that
-have no otelhttp metric.
+already gives request rate, and with `http.route` stamped it also gives the
+failure rate per route:
+
+```promql
+sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
+```
+
+That makes `endpoint.requests` a strict subset for HTTP, so the adapters
+leave it **off** unless you pass `nethttp.WithEndpointMetrics()`. Turn it on when
+you want the simpler `{endpoint, outcome}` label pair instead of status-code
+regexes. Where it is not redundant is **non-HTTP** work: `endpoint.Instrument`
+covers operations that have no otelhttp histogram at all, and pairs the counter
+with `endpoint.duration`.
 
 Health probes and scrape endpoints are instrumented like any other path unless
 you opt out — pass `nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...)` to keep
@@ -171,6 +188,12 @@ returned `shutdown` flushes all providers — `defer` it (with your own bounded
 context; the library does not impose a timeout). If a later setup step fails,
 `Init` shuts down anything it already started before returning the error.
 
+Calling `Init` twice without an intervening shutdown returns
+`ErrAlreadyInitialized`: a second call would orphan the first pair of providers
+(their batch processor goroutine and reader ticker become unreachable) and
+re-register the runtime instrumentation, which exposes no `Stop`. The returned
+shutdown is idempotent, and once it has run `Init` may be called again.
+
 ```go
 shutdown, err := telemetry.Init(ctx, telemetry.Config{ServiceName: "mto-gateway"})
 if err != nil { log.Fatal(err) }
@@ -185,17 +208,28 @@ defer func() { // bounded flush — an unreachable collector must not hang exit
 
 ### package `logging`
 
-Trace-correlated `slog`. Import path `…/telemetry/logging`.
+Trace-correlated `slog`. Import path `…/telemetry-web/logging`.
 
 ```go
 func Logger() *slog.Logger
+func SetDefault(l *slog.Logger)
 func NewLogHandler(base slog.Handler) slog.Handler
 ```
 
-- `Logger()` returns a `*slog.Logger` writing JSON to stdout with `trace_id`,
-  `span_id`, and `service.name` added from the context/scope.
+- `Logger()` returns the logger **this library writes through** — endpoint
+  instrument warnings, recovered panics, setup diagnostics. It defaults to JSON
+  on stdout with `trace_id`, `span_id`, and `service.name` added from the
+  context/scope, and is cached, not rebuilt per call.
+- `SetDefault(l)` replaces it. Call it before `Init`, otherwise a consuming
+  operator that already has a `logr`/zap/slog setup gets a second,
+  differently-shaped, unsilenceable stream on stdout. `nil` restores the default.
 - `NewLogHandler(base)` wraps any `slog.Handler` with the same stamping — use it
-  if you want your own base handler (different writer, level, format).
+  if you want your own base handler (different writer, level, format). The
+  stamps stay top-level even when the logger has open `WithGroup` groups.
+
+```go
+logging.SetDefault(slog.New(logging.NewLogHandler(myHandler)))
+```
 
 **Rule:** use the `…Context` methods so `ctx` reaches the handler:
 
@@ -207,7 +241,7 @@ logging.Logger().InfoContext(ctx, "created tenant", "id", id)
 
 ### package `endpoint`
 
-Per-endpoint metrics and panic recording. Import path `…/telemetry/endpoint`.
+Per-endpoint metrics and panic recording. Import path `…/telemetry-web/endpoint`.
 Instruments are created lazily from the global meter, so these are safe to call
 before `Init` (they no-op against the default provider until a real one is set).
 
@@ -217,8 +251,10 @@ func Record(ctx context.Context, name string, failed bool)
 func RecordPanic(ctx context.Context, recovered any)
 ```
 
-**`Instrument`** — the ergonomic hand-instrumentation helper. Returns a finisher
-that takes the *address* of the operation's error; outcome is `failure` iff
+**`Instrument`** — the ergonomic hand-instrumentation helper, and the intended
+entry point for **non-HTTP** operations. It records `endpoint.requests`
+*and* times the operation into `endpoint.duration`. Returns a finisher that takes
+the *address* of the operation's error; outcome is `failure` iff
 `err != nil && *err != nil`:
 
 ```go
@@ -229,7 +265,8 @@ func (c Controller) ListTenants(ctx context.Context) (err error) {
 ```
 
 **`Record`** — the low-level primitive when you already know the outcome (e.g.
-from an HTTP status). Framework middleware uses this:
+from an HTTP status). Counter only, no duration. Framework middleware reaches it
+through `nethttp.RecordRoute`, which applies the shared `status >= 500` rule:
 
 ```go
 endpoint.Record(ctx, "/api/v1/tenants/:id", resp.StatusCode >= 500)
@@ -245,14 +282,19 @@ template or a stable operation name), never a raw path or an id.
 
 ### package `nethttp`
 
-net/http integration. Import path `…/telemetry/nethttp`.
+net/http integration. Import path `…/telemetry-web/nethttp`.
 
 ```go
 func Handler(next http.Handler, opts ...Option) http.Handler // inbound: otelhttp spans+metrics -> recovery -> next
-func WithSkipPaths(paths ...string) Option            // opt out exact paths from instrumentation
+func WithSkipPaths(paths ...string) Option            // opt out exact paths from instrumentation; repeated calls accumulate
 var DefaultSkipPaths = []string{...}                  // /healthz /readyz /livez /metrics — pass to WithSkipPaths
+func WithEndpointMetrics() Option                     // opt IN to endpoint.requests in an adapter's Instrument
+func WithoutRecovery() Option                         // install NO recovery, not even the adapter's (an outer layer owns panics)
+func Resolve(opts ...Option) Settings                 // resolved option set, for adapters
+func Skipped(ctx context.Context) bool                // was this request excluded by WithSkipPaths?
 func StampRoute(ctx context.Context, method, route string) // http.route on span + duration metric; span renamed "{method} {route}"
-func Recovery(next http.Handler) http.Handler         // panic -> RecordPanic + 500 (ErrAbortHandler re-raised)
+func RecordRoute(ctx context.Context, route string, status int) // the shared outcome rule: failure iff status >= 500
+func Recovery(next http.Handler) http.Handler         // panic -> RecordPanic + 500 if unwritten (ErrAbortHandler re-raised); preserves Flusher/Hijacker
 func Transport(base http.RoundTripper) http.RoundTripper // outbound: inject trace context
 func HTTPClient() *http.Client                        // client whose Transport already propagates
 func WrapClient(c *http.Client) *http.Client          // add propagation to an existing client in place
@@ -264,13 +306,31 @@ func WrapClient(c *http.Client) *http.Client          // add propagation to an e
   backstop. Recovery sits inside `otelhttp` so the span exists in `ctx` and the
   resulting `500` is measured.
 - **Filtering is opt-in.** Every path is instrumented unless you exclude it:
-  `WithSkipPaths(paths...)` gives excluded paths no span and no `http.server.*`
-  data points (they are still served, and recovery still applies). Pass
-  `DefaultSkipPaths` to keep k8s probes and `/metrics` scrapes from flooding
-  traces and metrics: `Handler(mux, WithSkipPaths(nethttp.DefaultSkipPaths...))`
-  — or append your own paths to that list.
+  `WithSkipPaths(paths...)` gives excluded paths no span, no `http.server.*` data
+  points, and no `endpoint.requests` (they are still served, and recovery
+  still applies). Pass `DefaultSkipPaths` to keep k8s probes and `/metrics`
+  scrapes from flooding traces and metrics:
+  `Handler(mux, WithSkipPaths(nethttp.DefaultSkipPaths...))` — or append your own
+  paths to that list. Repeated calls accumulate rather than replacing.
+  Middleware running inside a router checks `Skipped(ctx)` to honor the same
+  decision, since otelhttp's own filter cannot reach it.
+- **A skipped path drops inbound trace context.** The filter runs before
+  `propagators.Extract`, so a skipped path will not continue a caller's trace.
+  Harmless for probes; do not skip paths that participate in traces.
 - **`StampRoute`** is the route-attribution primitive the adapters' `RouteTag`
-  middleware uses; call it directly when wiring a framework by hand.
+  middleware uses; call it directly when wiring a framework by hand. It requires
+  the request to be inside `Handler` — without the otelhttp labeler in `ctx` the
+  span attribute still lands but the metric attribute is dropped, and a warning
+  is logged once.
+- **`WithoutRecovery`** suppresses recovery everywhere, not just in `Handler`.
+  Every adapter's `Instrument` consults `Resolve(...).Recovery` before installing
+  its framework middleware, so the option leaves the chain with no recovery at
+  all: panics escape to net/http, which closes the connection without a response,
+  and `http.server.panics` is not incremented. Only pass it when an outer layer
+  recovers and calls `endpoint.RecordPanic` itself.
+- **`RecordRoute`** is the single definition of outcome shared by every adapter:
+  `failure` iff `status >= 500`, skipping unmatched routes and skipped paths. A
+  4xx is a client error and counts as a success.
 - **Outbound propagation is opt-in and non-negotiable:** only calls made through
   `Transport`/`HTTPClient`/`WrapClient` inject `traceparent`. A hop that uses a
   plain client dead-ends the trace even though every service has `Handler`.
@@ -299,19 +359,22 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // packag
 ```
 
 ```go
-func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler // Recovery + RouteTag + Metrics + nethttp.Handler
+func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler // Recovery + RouteTag (+ Metrics when opted in) + nethttp.Handler
 func Recovery() gin.HandlerFunc  // panic -> endpoint.RecordPanic + 500 (ErrAbortHandler re-raised)
 func RouteTag() gin.HandlerFunc  // http.route (c.FullPath()) -> server span + duration metric
-func Metrics() gin.HandlerFunc   // http.endpoint.requests{endpoint,outcome} by matched route template
+func Metrics() gin.HandlerFunc   // endpoint.requests{endpoint,outcome} by matched route template
 ```
 
 `RouteTag()` stamps `http.route` on the server span and the standard
 `http.server.request.duration` metric (via `nethttp.StampRoute`), so traces and
-semconv metrics are route-attributed; `Metrics()` records the per-endpoint
-counter. Use `RouteTag` without `Metrics` for a semconv-only setup. `Instrument`
+semconv metrics are route-attributed. `Metrics()` records the per-endpoint
+counter and is **opt-in**: pass `nethttp.WithEndpointMetrics()`. `Instrument`
 forwards `nethttp` options — e.g.
 `Instrument(engine, nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...))`.
-See the [Gin guide](guides/gin-adapter.md).
+
+Gin applies global middleware only to routes registered *after* `Use`, so
+`Instrument` **panics** if the engine already has routes rather than silently
+instrumenting nothing. See the [Gin guide](guides/gin-adapter.md).
 
 ---
 
@@ -326,20 +389,19 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // packa
 ```
 
 ```go
-func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler // Recovery + RouteTag + Metrics + nethttp.Handler
+func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler // Recovery + RouteTag (+ Metrics when opted in) + nethttp.Handler
 func Recovery() echo.MiddlewareFunc  // panic -> endpoint.RecordPanic + 500 (ErrAbortHandler re-raised)
 func RouteTag() echo.MiddlewareFunc  // http.route (c.Path()) -> server span + duration metric
-func Metrics() echo.MiddlewareFunc   // http.endpoint.requests{endpoint,outcome} by matched route template
+func Metrics() echo.MiddlewareFunc   // endpoint.requests{endpoint,outcome} by matched route template
 ```
 
-`RouteTag()` and `Metrics()` split the work exactly like the Gin adapter:
-route attribution on span + duration metric, and the per-endpoint counter,
-respectively. `Instrument` forwards `nethttp` options the same way. Outcome
-classification is Echo-aware: a returned `*echo.HTTPError` counts as `failure`
-only when its code is ≥ 500 (a returned 4xx is a client error, hence
-`success`), any other returned error is a `failure` (Echo turns it into a
-`500`), and a directly written ≥ 500 status is caught too. Unlike the Gin
-adapter there is no register-routes-after-instrumenting ordering rule. See the
+`RouteTag()` and `Metrics()` split the work exactly like the Gin adapter, and
+`Metrics()` is opt-in the same way. Echo runs its error handler *after* the
+middleware chain, so the adapter resolves the status the request will actually
+answer with — a returned `*echo.HTTPError` reports its own code, any other
+returned error becomes Echo's default `500` — and then applies the shared
+`status >= 500` rule. Unlike Gin there is no ordering rule: Echo applies `Use`
+middleware to routes registered before or after the call. See the
 [Echo guide](guides/echo-adapter.md).
 
 ---
@@ -355,47 +417,57 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/chi" // packag
 ```
 
 ```go
-func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler // Recovery + RouteTag + Metrics + nethttp.Handler
-func Recovery() Middleware   // = nethttp.Recovery (chi middleware is plain net/http chaining)
+func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler // RouteTag (+ Metrics when opted in) + nethttp.Handler
+func Recovery() Middleware   // = nethttp.Recovery; NOT installed by Instrument (see below)
 func RouteTag() Middleware   // http.route (RoutePattern()) -> server span + duration metric
-func Metrics() Middleware    // http.endpoint.requests{endpoint,outcome} by matched route pattern
+func Metrics() Middleware    // endpoint.requests{endpoint,outcome} by matched route pattern
 ```
 
-Same split as the other adapters, with two chi-specific notes: chi assembles
-`RoutePattern()` *during* routing, so `RouteTag`/`Metrics` run after the
-handler — a panicked request's span carries no `http.route` (panic + `500` are
-still fully recorded). And chi handlers have no error channel, so `failure`
-means status ≥ 500 only. Mounted subrouters record chi's joined pattern
-(`/api/users/{id}`) as-is. Like Gin, call `Instrument` **before** registering
-routes (chi panics on late `Use`). See the [chi guide](guides/chi-adapter.md).
+Same split as the other adapters, with two chi-specific notes. First, chi fills
+`RoutePattern()` in *before* invoking the handler, so `RouteTag` stamps from a
+`defer` — a panicked request's span still carries `http.route`, matching gin and
+echo. Second, `Instrument` deliberately does **not** install `Recovery()`:
+`nethttp.Handler` already recovers and `chitel.Recovery` *is* `nethttp.Recovery`,
+so installing both would count every panic twice. Use `Recovery()` only when
+building a chain by hand or alongside `nethttp.WithoutRecovery()`.
+
+Mounted subrouters record chi's joined pattern (`/api/users/{id}`) as-is. Like
+Gin, call `Instrument` **before** registering routes (chi panics on late `Use`).
+See the [chi guide](guides/chi-adapter.md).
 
 ---
 
 ### The adapter contract
 
 Every framework adapter exposes exactly `Instrument` / `Recovery` / `RouteTag`
-/ `Metrics` with the semantics above. The failure signal is the closest native
-notion of "server-side failure" each framework offers:
+/ `Metrics` with the semantics above.
 
-| Adapter | `outcome=failure` when |
+**There is one failure rule, not three.** All adapters route their outcome
+through `nethttp.RecordRoute`:
+
+| | `outcome=failure` when |
 | --- | --- |
-| `gintel` | status ≥ 500, or the handler called `c.Error(...)` |
-| `echotel` | returned non-HTTP error, returned `*echo.HTTPError` ≥ 500, or wrote status ≥ 500 |
-| `chitel` | status ≥ 500 |
+| every adapter | the status the request answers with is ≥ 500 |
 
-`http.route` is stamped on every *completed* request's span and duration
-metric; whether a *panicked* request's span carries it is per-framework
-(gin/echo: yes — the template is known before the handler; chi: no — the
-pattern only exists after routing completes).
+A 4xx is a client error and records `success`. Framework-native signals that
+disagree are deliberately *not* consulted — notably gin's `c.Error(...)`, which
+would otherwise make a 400 a failure in gin and a success everywhere else and
+break `sum by (outcome)` across services.
+
+`http.route` is stamped on every request's span and duration metric, including
+panicked ones, on all three adapters.
 
 Adapters are held to the contract by a shared conformance suite —
-package `…/telemetry/adaptertest` — that each adapter module runs against its
-own engine (`adaptertest.Run`): route-templated metrics (never raw paths),
-`500 → failure`, `http.route` on span + duration metric, unmatched routes
-skipped, panic → `500` + panic counter + no per-endpoint data point,
-`http.ErrAbortHandler` re-raised untouched. Frameworks with a different route
-parameter syntax pass `adaptertest.WithTemplateRewrite` (chi rewrites `:id` →
-`{id}`). A new adapter is done when it passes `adaptertest.Run`.
+package `…/telemetry-web/adaptertest` — that each adapter module runs against
+its own engine (`adaptertest.Run`): route-templated metrics (never raw paths),
+`500 → failure`, `4xx → success`, `http.route` on span + duration metric + the
+`"{method} {route}"` span rename, route retained on panicked requests, unmatched
+routes skipped, skipped paths recording nothing at all, panic → `500` + panic
+counter + no per-endpoint data point, `http.ErrAbortHandler` re-raised untouched.
+Frameworks with a different route parameter syntax pass
+`adaptertest.WithTemplateRewrite` (chi rewrites `:id` → `{id}`). Every subtest
+issues its own requests and asserts on deltas, so the suite is order-independent
+and `-shuffle=on` clean. A new adapter is done when it passes `adaptertest.Run`.
 
 ---
 
@@ -437,7 +509,7 @@ and generally safe to log-and-ignore.
 - **`name` must be low-cardinality.** Use route templates or fixed operation
   names for `endpoint.Record`/`Instrument`, never raw paths or ids.
 - **Panicked requests** show on `http.server.panics` (+ a `500` in the otelhttp
-  metrics), not as a per-endpoint `http.endpoint.requests` data point — by design.
+  metrics), not as a per-endpoint `endpoint.requests` data point — by design.
 - **`nethttp.Recovery` writes `500` unconditionally.** If a handler already wrote
   a status before panicking, that write is a no-op (Go logs "superfluous
   WriteHeader") — inherent to the simple recovery pattern.

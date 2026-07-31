@@ -23,16 +23,43 @@ jobs:
   validate:
     name: Validate telemetry
     runs-on: ubuntu-latest
-    # commits.*.message only exists on push payloads, so the PR title check is
-    # what gates pull_request events (the commits array is empty there).
-    if: "! contains(toJSON(github.event.commits.*.message), '[skip-ci]') && ! contains(github.event.pull_request.title, '[skip-ci]')"
+    # Gated on the PR title only. github.event.commits is empty on pull_request
+    # payloads, so a commit-message check could never skip a PR run; on push,
+    # this expression is simply false and the job always runs.
+    if: "! contains(github.event.pull_request.title, '[skip-ci]')"
     steps:
+      # Default checkout: the merge result on pull_request, the pushed commit
+      # on push. Pinning to head.sha would test the branch, not what merging
+      # would actually produce.
       - name: Check out code
         uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Validate telemetry
         uses: ./telemetry-web/.github/actions/validate
+
+  lint:
+    name: Lint ${{ matrix.module || 'core' }}
+    runs-on: ubuntu-latest
+    if: "! contains(github.event.pull_request.title, '[skip-ci]')"
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ["", adapters/gin, adapters/echo, adapters/chi]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          golangci-lint-version: ${{ env.GOLANG_CI_LINT_VERSION }}
+          go-version-file: telemetry-web/go.mod
+          cache-dependency-path: |
+            telemetry-web/go.sum
+            telemetry-web/adapters/*/go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANG_CI_LINT_VERSION }}
+          working-directory: telemetry-web/${{ matrix.module }}
+          args: --timeout 10m

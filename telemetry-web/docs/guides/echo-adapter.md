@@ -111,15 +111,18 @@ before the telemetry recovery sees them.
 
 For every matched route, with **zero per-handler code**:
 
-- `http.endpoint.requests{endpoint="/users/:id", outcome="success|failure"}` —
-  `failure` when the request failed **server-side**: the handler returned a
-  non-HTTP error (Echo turns it into a `500`), returned an `*echo.HTTPError`
-  with code ≥ 500, or wrote a ≥ 500 status directly. A returned 4xx
-  (`echo.NewHTTPError(http.StatusNotFound, …)`) is a *client* error and counts
-  as `success`, consistent with the Gin adapter.
 - `http.route` stamped on the server span **and** the standard
-  `http.server.request.duration` metric, so traces and semconv metrics are
-  route-attributed too.
+  `http.server.request.duration` metric, and the span renamed to the semconv
+  `"{method} {route}"` form, so traces and semconv metrics are route-attributed.
+- Optionally `endpoint.requests{endpoint="/users/:id", outcome="success|failure"}`
+  — `failure` when the status the request answers with is `≥ 500`, the same rule
+  every adapter uses; a 4xx is a client error and counts as `success`. **Off by
+  default**, since the duration histogram above already carries route, method and
+  status; turn it on with `Instrument(e, nethttp.WithEndpointMetrics())`.
+
+  Echo runs its error handler *after* the middleware chain, so the adapter
+  resolves the status the request will answer with: a returned `*echo.HTTPError`
+  reports its own code, any other returned error becomes Echo's default `500`.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
   To keep k8s probes and `/metrics` scrapes out of traces and metrics, opt in to
@@ -131,12 +134,16 @@ Example queries (PromQL, if exporting to Prometheus via the collector):
 
 ```promql
 # per-endpoint request rate
-sum by (endpoint) (rate(http_endpoint_requests_total[5m]))
+sum by (endpoint) (rate(endpoint_requests_total[5m]))
 
 # per-endpoint failure ratio
-sum by (endpoint) (rate(http_endpoint_requests_total{outcome="failure"}[5m]))
-  / sum by (endpoint) (rate(http_endpoint_requests_total[5m]))
+sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
+  / sum by (endpoint) (rate(endpoint_requests_total[5m]))
 ```
+
+> `nethttp.WithoutRecovery()` suppresses recovery here too, not just in
+> `nethttp.Handler` — `Instrument` skips `echotel.Recovery()`. The chain is then left with
+> no recovery at all: panics escape to net/http and are not counted.
 
 ---
 
@@ -149,7 +156,7 @@ If you maintain your own middleware chain, use the pieces directly instead of
 e := echo.New()
 e.Use(echotel.Recovery()) // panic -> RecordPanic + 500; keep it OUTSIDE Metrics
 e.Use(echotel.RouteTag()) // http.route -> span + duration metric
-e.Use(echotel.Metrics())  // per-endpoint metrics by route template (optional if semconv is enough)
+e.Use(echotel.Metrics())  // per-endpoint metrics by route template (optional)
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(e)} // spans + server metrics

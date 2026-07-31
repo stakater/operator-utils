@@ -1,0 +1,3 @@
+# Regenerated on demand; the member modules' go.sum files already cover every
+# dependency, so this adds churn without adding reproducibility.
+go.work.sum

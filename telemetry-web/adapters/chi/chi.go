@@ -1,7 +1,7 @@
-// Package chitel wires the telemetry library into a chi router: recovery,
-// automatic per-endpoint metrics keyed by the matched route pattern, and the
-// core net/http Handler (spans + server metrics). The package name differs from
-// the directory so it never collides with go-chi's "chi" — no alias needed:
+// Package chitel wires the telemetry library into a chi router: route-tagged
+// spans, optional per-endpoint metrics, and the core net/http Handler (spans +
+// server metrics + panic recovery). The package name differs from the directory
+// so it never collides with go-chi's "chi" — no alias needed:
 //
 //	import "github.com/stakater/operator-utils/telemetry-web/adapters/chi" // package chitel
 package chitel
@@ -12,62 +12,74 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/stakater/operator-utils/telemetry-web/endpoint"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
 // Middleware is chi's middleware shape — standard net/http chaining.
 type Middleware = func(http.Handler) http.Handler
 
-// Instrument installs Recovery, RouteTag, and Metrics on r and returns it
-// wrapped in nethttp.Handler, ready to serve. Extra nethttp options (e.g.
+// Instrument installs RouteTag on r — plus Metrics when
+// nethttp.WithEndpointMetrics() is passed — and returns it wrapped in
+// nethttp.Handler, ready to serve. Extra nethttp options (e.g.
 // nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...)) are forwarded to the
 // Handler. Call BEFORE registering routes — chi panics if Use is called after
 // the first route. The returned handler wraps the router by reference.
+//
+// Recovery is not installed here: chi middleware is plain net/http chaining, so
+// nethttp.Handler's own recovery already covers the router. Adding chitel
+// .Recovery() as well would count each panic twice.
 func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler {
-	r.Use(Recovery(), RouteTag(), Metrics())
+	s := nethttp.Resolve(opts...)
+	r.Use(RouteTag())
+	if s.EndpointMetrics {
+		r.Use(Metrics())
+	}
 	return nethttp.Handler(r, opts...)
 }
 
 // Recovery forwards panics to endpoint.RecordPanic and responds 500, with
 // http.ErrAbortHandler re-raised. chi middleware is plain net/http chaining,
 // so this is the core nethttp.Recovery.
+//
+// Instrument does not install it — nethttp.Handler already recovers. Use it
+// only when building a chain by hand without nethttp.Handler, or alongside
+// nethttp.WithoutRecovery().
 func Recovery() Middleware {
 	return nethttp.Recovery
 }
 
-// RouteTag stamps http.route (the matched route pattern) on the server span
-// and the otelhttp duration metric via nethttp.StampRoute. chi assembles
-// RoutePattern during routing, so — unlike Gin/Echo — the stamp happens AFTER
-// the handler returns; panicked requests therefore carry no http.route on
-// their span. Unmatched requests are skipped. Use it without Metrics for a
-// semconv-only setup.
+// RouteTag stamps http.route (the matched route pattern) on the server span and
+// the otelhttp duration metric, and renames the span to "{method} {route}".
+// chi fills in RoutePattern during routing, before the handler runs, so the
+// stamp is deferred: a panicking handler still gets its route recorded as the
+// stack unwinds. Unmatched requests are skipped.
 func RouteTag() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if route := routePattern(r); route != "" {
+					nethttp.StampRoute(r.Context(), r.Method, route)
+				}
+			}()
 			next.ServeHTTP(w, r)
-			if route := routePattern(r); route != "" {
-				nethttp.StampRoute(r.Context(), route)
-			}
 		})
 	}
 }
 
-// Metrics records one per-endpoint data point per request, keyed by the
-// matched route pattern, with outcome from the response status (chi handlers
-// have no error channel, so failure means status >= 500). Mounted subrouters
-// record chi's native joined pattern (e.g. /api/*/users/{id}) as-is. Unmatched
-// routes are skipped to avoid 404-scan cardinality. A panicking handler
-// unwinds past the record call, so panics surface on the panic counter, not
-// here.
+// Metrics records one endpoint.requests data point per request, keyed by
+// the matched route pattern. Outcome follows nethttp.RecordRoute's shared rule
+// (status >= 500 is a failure), so it matches the gin and echo adapters.
+// Mounted subrouters record chi's native joined pattern (e.g.
+// /api/*/users/{id}) as-is. A panicking handler unwinds past the record call,
+// so panics surface on the panic counter, not here.
+//
+// Opt in via Instrument(r, nethttp.WithEndpointMetrics()).
 func Metrics() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
-			if route := routePattern(r); route != "" {
-				endpoint.Record(r.Context(), route, ww.Status() >= 500)
-			}
+			nethttp.RecordRoute(r.Context(), routePattern(r), ww.Status())
 		})
 	}
 }

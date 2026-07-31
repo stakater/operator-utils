@@ -23,7 +23,14 @@ import (
 // or after the call, so ordering doesn't matter. The returned handler wraps
 // the engine by reference.
 func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler {
-	e.Use(Recovery(), RouteTag(), Metrics())
+	s := nethttp.Resolve(opts...)
+	if s.Recovery {
+		e.Use(Recovery())
+	}
+	e.Use(RouteTag())
+	if s.EndpointMetrics {
+		e.Use(Metrics())
+	}
 	return nethttp.Handler(e, opts...)
 }
 
@@ -35,7 +42,8 @@ func Recovery() echo.MiddlewareFunc {
 		return func(c echo.Context) error {
 			defer func() {
 				if rec := recover(); rec != nil {
-					if rec == http.ErrAbortHandler {
+					// Sentinel arrives by identity, never wrapped.
+					if rec == http.ErrAbortHandler { //nolint:errorlint
 						panic(rec)
 					}
 					endpoint.RecordPanic(c.Request().Context(), rec)
@@ -55,43 +63,43 @@ func RouteTag() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			if route := c.Path(); route != "" {
-				nethttp.StampRoute(c.Request().Context(), route)
+				nethttp.StampRoute(c.Request().Context(), c.Request().Method, route)
 			}
 			return next(c)
 		}
 	}
 }
 
-// Metrics records one per-endpoint data point per request, keyed by the matched
-// route template (c.Path()), with outcome from the handler's returned error and
-// response status. Unmatched routes are skipped to avoid 404-scan cardinality.
-// A panicking handler unwinds past the record call, so panics surface on the
-// panic counter, not here.
+// Metrics records one endpoint.requests data point per request, keyed by
+// the matched route template (c.Path()). Outcome follows nethttp.RecordRoute's
+// shared rule (status >= 500 is a failure), so it matches the gin and chi
+// adapters. A panicking handler unwinds past the record call, so panics surface
+// on the panic counter, not here.
+//
+// Opt in via Instrument(e, nethttp.WithEndpointMetrics()).
 func Metrics() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			route := c.Path()
 			err := next(c)
-			if route == "" {
-				return err
-			}
-			endpoint.Record(c.Request().Context(), route, failed(c, err))
+			nethttp.RecordRoute(c.Request().Context(), route, status(c, err))
 			return err
 		}
 	}
 }
 
-// failed classifies the outcome: only server-side failures (5xx) count, so a
-// returned 4xx *echo.HTTPError is a success, any other returned error maps to
-// Echo's default 500, and a directly written 5xx status is caught too. Echo runs
-// its error handler after the middleware chain returns, so the returned error —
-// not the not-yet-written status — is the reliable signal.
-func failed(c echo.Context, err error) bool {
+// status resolves the status code this request will actually answer with. Echo
+// runs its error handler AFTER the middleware chain returns, so for a returned
+// error the response status is not written yet and the error carries the
+// answer: an *echo.HTTPError reports its own Code, anything else becomes Echo's
+// default 500.
+func status(c echo.Context, err error) int {
 	if err != nil {
-		if he, ok := errors.AsType[*echo.HTTPError](err); ok {
-			return he.Code >= 500
+		var he *echo.HTTPError
+		if errors.As(err, &he) {
+			return he.Code
 		}
-		return true
+		return http.StatusInternalServerError
 	}
-	return c.Response().Status >= 500
+	return c.Response().Status
 }

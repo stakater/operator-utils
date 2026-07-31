@@ -112,11 +112,18 @@ yourself if you want request logging.
 
 For every matched route, with **zero per-handler code**:
 
-- `http.endpoint.requests{endpoint="/api/v1/tenants/:id", outcome="success|failure"}`
-  — `failure` when the response status is `≥ 500` or the handler set `c.Error(...)`.
 - `http.route` stamped on the server span **and** the standard
-  `http.server.request.duration` metric, so traces and semconv metrics are
-  route-attributed too.
+  `http.server.request.duration` metric, and the span renamed to the semconv
+  `"{method} {route}"` form, so traces and semconv metrics are route-attributed.
+- Optionally `endpoint.requests{endpoint="/api/v1/tenants/:id", outcome="success|failure"}`
+  — `failure` when the status the request answers with is `≥ 500`, the same rule
+  every adapter uses; a 4xx is a client error and counts as `success`. **Off by
+  default**, since the duration histogram above already carries route, method and
+  status; turn it on with `Instrument(engine, nethttp.WithEndpointMetrics())`.
+
+  Note that `c.Error(...)` does **not** override the status: a handler that
+  records an error but still answers 400 counts as a success, so `outcome` means
+  the same thing here as in the echo and chi adapters.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
   To keep k8s probes and `/metrics` scrapes out of traces and metrics, opt in to
@@ -128,12 +135,16 @@ Example queries (PromQL, if exporting to Prometheus via the collector):
 
 ```promql
 # per-endpoint request rate
-sum by (endpoint) (rate(http_endpoint_requests_total[5m]))
+sum by (endpoint) (rate(endpoint_requests_total[5m]))
 
 # per-endpoint failure ratio
-sum by (endpoint) (rate(http_endpoint_requests_total{outcome="failure"}[5m]))
-  / sum by (endpoint) (rate(http_endpoint_requests_total[5m]))
+sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
+  / sum by (endpoint) (rate(endpoint_requests_total[5m]))
 ```
+
+> `nethttp.WithoutRecovery()` suppresses recovery here too, not just in
+> `nethttp.Handler` — `Instrument` skips `gintel.Recovery()`. The chain is then left with
+> no recovery at all: panics escape to net/http and are not counted.
 
 ---
 
@@ -146,7 +157,7 @@ If you maintain your own middleware chain, use the pieces directly instead of
 engine := gin.New()
 engine.Use(gintel.Recovery()) // panic -> RecordPanic + 500
 engine.Use(gintel.RouteTag()) // http.route -> span + duration metric
-engine.Use(gintel.Metrics())  // per-endpoint metrics by route template (optional if semconv is enough)
+engine.Use(gintel.Metrics())  // per-endpoint metrics by route template (optional)
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + server metrics
@@ -154,6 +165,10 @@ srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + 
 
 `gintel.Recovery()` must sit inside `nethttp.Handler` (it does here, because it's a
 Gin middleware inside the engine, and `nethttp.Handler` wraps the engine).
+
+Register all of these **before** your routes — Gin applies global middleware only
+to routes added afterward. `Instrument` enforces this by panicking if the engine
+already has routes; a hand-rolled chain gets no such warning.
 
 ---
 

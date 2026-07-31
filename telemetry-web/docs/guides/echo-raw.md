@@ -95,7 +95,8 @@ func main() {
     e := echo.New()
     e.HideBanner = true
     e.Use(TelemetryRecovery()) // instead of middleware.Recover()
-    e.Use(TelemetryMetrics())  // automatic per-endpoint metrics (see §4)
+    e.Use(TelemetryRouteTag())  // http.route on span + duration metric (see §4)
+    e.Use(TelemetryMetrics())   // optional per-endpoint counter (see §4)
 
     // ... register routes ...
     e.GET("/users/:id", getUser)
@@ -158,53 +159,62 @@ After a recovered panic the handler returns `nil` (its zero return value) with a
 
 ---
 
-## 4. Automatic per-endpoint metrics middleware
+## 4. Route attribution and per-endpoint metrics
 
-This is the piece the Gin adapter gives you for free. Echo's `c.Path()` returns
-the matched route template (e.g. `/users/:id`), so key the metric on it.
+The first thing to wire is `http.route`, since it is what makes the standard
+`http.server.request.duration` metric break down per route and renames the span
+to the semconv `"{method} {route}"` form. Echo's `c.Path()` returns the matched
+template (e.g. `/users/:id`), so stamp from there:
+
+```go
+func TelemetryRouteTag() echo.MiddlewareFunc {
+    return func(next echo.HandlerFunc) echo.HandlerFunc {
+        return func(c echo.Context) error {
+            if route := c.Path(); route != "" {
+                nethttp.StampRoute(c.Request().Context(), c.Request().Method, route)
+            }
+            return next(c)
+        }
+    }
+}
+```
+
+With that in place the duration histogram already gives you request and failure
+rates per route, so the per-endpoint counter below is **optional** — the adapters
+leave it off unless you pass `nethttp.WithEndpointMetrics()`:
+
+```promql
+sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
+```
+
+If you do want the simpler `{endpoint, outcome}` label pair, use
+`nethttp.RecordRoute` — the same helper the adapters call, so your service
+classifies outcomes identically (`failure` iff status ≥ 500, unmatched routes and
+skipped paths ignored):
 
 ```go
 func TelemetryMetrics() echo.MiddlewareFunc {
     return func(next echo.HandlerFunc) echo.HandlerFunc {
         return func(c echo.Context) error {
             err := next(c)
-
-            route := c.Path()
-            if route != "" {
-                // Echo runs its error handler AFTER the middleware chain returns,
-                // so the returned error — not the not-yet-written status — is the
-                // reliable signal. Only server-side failures count: a returned
-                // 4xx *echo.HTTPError is a client error (success), matching the
-                // echotel adapter's classification.
-                failed := c.Response().Status >= 500
-                if err != nil {
-                    if he, ok := errors.AsType[*echo.HTTPError](err); ok {
-                        failed = he.Code >= 500
-                    } else {
-                        failed = true // non-HTTP error -> echo's default 500
-                    }
-                }
-                endpoint.Record(c.Request().Context(), route, failed)
-            }
+            nethttp.RecordRoute(c.Request().Context(), c.Path(), status(c, err))
             return err
         }
     }
 }
-```
 
-That emits `http.endpoint.requests{endpoint="/users/:id", outcome}` for every
-matched route, with the same outcome classification as the `echotel` adapter.
-Unmatched requests have an empty `c.Path()` and are skipped, keeping
-cardinality bounded.
-
-The adapters additionally stamp `http.route` on the server span and the
-`http.server.request.duration` metric, and rename the span to the semconv
-`{method} {route}` form (their `RouteTag` middleware). To match that here, call
-the core primitive where the route is known:
-
-```go
-if route := c.Path(); route != "" {
-    nethttp.StampRoute(c.Request().Context(), c.Request().Method, route)
+// Echo runs its error handler AFTER the middleware chain returns, so for a
+// returned error the response status is not written yet and the error carries
+// the answer.
+func status(c echo.Context, err error) int {
+    if err != nil {
+        var he *echo.HTTPError
+        if errors.As(err, &he) {
+            return he.Code
+        }
+        return http.StatusInternalServerError
+    }
+    return c.Response().Status
 }
 ```
 

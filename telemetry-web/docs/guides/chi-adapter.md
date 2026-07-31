@@ -96,22 +96,27 @@ before the telemetry recovery sees them.
 
 For every matched route, with **zero per-handler code**:
 
-- `http.endpoint.requests{endpoint="/users/{id}", outcome="success|failure"}` —
-  `failure` when the response status is `≥ 500`. chi handlers have no error
-  channel, so the status is the only signal (unlike Echo's error-aware
-  classification). Mounted subrouters record chi's joined pattern
-  (`/api/users/{id}`) as-is.
 - `http.route` stamped on the server span **and** the standard
-  `http.server.request.duration` metric. One chi-specific caveat: chi assembles
-  the route pattern *during* routing, so the stamp happens after the handler
-  returns — a panicked request's span carries no `http.route` (the panic and
-  `500` are still fully recorded).
+  `http.server.request.duration` metric, and the span renamed to the semconv
+  `"{method} {route}"` form. chi fills the route pattern in *before* invoking the
+  handler, so `RouteTag` stamps from a `defer` and a panicked request keeps its
+  route too — same as gin and echo. Mounted subrouters record chi's joined
+  pattern (`/api/users/{id}`) as-is.
+- Optionally `endpoint.requests{endpoint="/users/{id}", outcome="success|failure"}`
+  — `failure` when the response status is `≥ 500`, the same rule every adapter
+  uses. **Off by default**, since the duration histogram above already carries
+  route, method, and status; turn it on with
+  `Instrument(r, nethttp.WithEndpointMetrics())`.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span. To keep k8s probes and `/metrics` scrapes out of traces and metrics,
   opt in to filtering:
   `Instrument(r, nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...))`.
 - Panics → `http.server.panics` + an exception/stack on the span + an error
   log, and a `500` response. (`http.ErrAbortHandler` is re-raised untouched.)
+
+> `nethttp.WithoutRecovery()` suppresses recovery here too, not just in
+> `nethttp.Handler` — `Instrument` skips the core recovery (it installs none of its own). The chain is then left with
+> no recovery at all: panics escape to net/http and are not counted.
 
 ---
 
@@ -122,16 +127,22 @@ compose like any net/http chain:
 
 ```go
 r := chi.NewRouter()
-r.Use(chitel.Recovery()) // = nethttp.Recovery: panic -> RecordPanic + 500
-r.Use(chitel.RouteTag()) // http.route -> span + duration metric (post-handler)
-r.Use(chitel.Metrics())  // per-endpoint metrics by route pattern (optional if semconv is enough)
+r.Use(chitel.RouteTag()) // http.route -> span + duration metric, survives panics
+r.Use(chitel.Metrics())  // per-endpoint metrics by route pattern (optional)
 // ... your other middleware, then routes ...
 
-srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(r)} // spans + server metrics
+srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(r)} // spans + server metrics + recovery
 ```
 
-Keep `Recovery` first (outermost) so a panicking handler unwinds past the
-record call and surfaces only on the panic counter.
+Do **not** add `chitel.Recovery()` on top of `nethttp.Handler`: `chitel.Recovery`
+*is* `nethttp.Recovery`, and `nethttp.Handler` already installs it, so you would
+count every panic twice. Use it only when you are not going through
+`nethttp.Handler`, or alongside `nethttp.WithoutRecovery()`:
+
+```go
+r.Use(chitel.Recovery())
+srv := &http.Server{Handler: nethttp.Handler(r, nethttp.WithoutRecovery())}
+```
 
 ---
 
@@ -151,6 +162,12 @@ and `endpoint.Instrument(ctx, "op.name")(&err)` for named operations.
   `RoutePattern()` (the template `/users/{id}`), never the raw path. Unmatched
   requests (404 scans) have an empty pattern and are skipped.
 - `Metrics()` wraps the ResponseWriter with chi's `WrapResponseWriter` to read
-  the status — `Flusher`/`Hijacker` are preserved, so SSE and WebSockets work.
+  the status, and the core `Recovery` wraps it with `httpsnoop`. Both preserve
+  the optional interfaces, so `Flusher`/`Hijacker` reach your handler and SSE and
+  WebSocket upgrades work. The shared conformance suite asserts this on every
+  adapter — a wrapper that dropped them would make gin's and echo's `Flush()`
+  panic on a type assertion.
+- A path excluded via `nethttp.WithSkipPaths` records nothing at all: no span,
+  no duration observation, and no `endpoint.requests`.
 - Panicked requests appear on `http.server.panics`, not as a per-endpoint
   `failure` data point — consistent with the library's panic philosophy.

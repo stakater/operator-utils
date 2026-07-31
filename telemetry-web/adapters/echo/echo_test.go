@@ -18,26 +18,39 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func buildEcho(routes []adaptertest.Route) http.Handler {
+func buildEcho(routes []adaptertest.Route, opts ...nethttp.Option) http.Handler {
 	e := echo.New()
-	h := Instrument(e)
+	h := Instrument(e, opts...)
 	for _, r := range routes {
 		switch r.Behavior {
 		case adaptertest.OK:
 			e.GET(r.Template, func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
 		case adaptertest.Fail500:
 			e.GET(r.Template, func(c echo.Context) error { return c.String(http.StatusInternalServerError, "boom") })
+		case adaptertest.Fail400:
+			e.GET(r.Template, func(c echo.Context) error { return c.String(http.StatusBadRequest, "bad") })
 		case adaptertest.Panic:
 			e.GET(r.Template, func(c echo.Context) error { panic("kaboom") })
 		case adaptertest.PanicAbort:
 			e.GET(r.Template, func(c echo.Context) error { panic(http.ErrAbortHandler) })
+		case adaptertest.Stream:
+			e.GET(r.Template, func(c echo.Context) error {
+				for i := range len(adaptertest.StreamBody) {
+					if _, err := c.Response().Write([]byte(adaptertest.StreamBody[i : i+1])); err != nil {
+						return err
+					}
+					c.Response().Flush()
+				}
+				return nil
+			})
 		}
 	}
 	return h
 }
 
 // TestConformance runs the shared adapter contract: route-templated metrics,
-// 500→failure, http.route stamping, panic and ErrAbortHandler semantics.
+// 500→failure, 4xx→success, http.route stamping, skip paths, panic and
+// ErrAbortHandler semantics.
 func TestConformance(t *testing.T) {
 	adaptertest.Run(t, buildEcho)
 }
@@ -52,25 +65,29 @@ func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 
 // Echo-specific: a returned non-HTTP error becomes Echo's default 500 and must
 // record outcome=failure. Echo runs its error handler after the middleware
-// chain, so the returned error — not the status — is the signal here.
+// chain, so the returned error — not the not-yet-written status — is the signal.
 func TestMetricsRecordsFailureOnReturnedError(t *testing.T) {
 	e := echo.New()
-	h := Instrument(e)
+	h := Instrument(e, nethttp.WithEndpointMetrics())
 	e.GET("/echo/err", func(c echo.Context) error { return errors.New("boom") })
 
+	before := adaptertest.Collect(t)
 	if rec := get(t, h, "/echo/err"); rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (echo default error handler)", rec.Code)
 	}
-	if got := adaptertest.EndpointOutcome(adaptertest.Collect(t), "/echo/err", "failure"); got != 1 {
-		t.Errorf("failure count = %d, want 1", got)
+	after := adaptertest.Collect(t)
+
+	if delta := adaptertest.EndpointOutcome(after, "/echo/err", "failure") -
+		adaptertest.EndpointOutcome(before, "/echo/err", "failure"); delta != 1 {
+		t.Errorf("failure count delta = %d, want 1", delta)
 	}
 }
 
 // Echo-specific: a returned *echo.HTTPError follows its code — 5xx is a
-// failure, 4xx is a client error and counts as success.
+// failure, 4xx is a client error and counts as success, matching gin and chi.
 func TestMetricsClassifiesHTTPErrorsByCode(t *testing.T) {
 	e := echo.New()
-	h := Instrument(e)
+	h := Instrument(e, nethttp.WithEndpointMetrics())
 	e.GET("/echo/unavailable", func(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "down")
 	})
@@ -78,37 +95,90 @@ func TestMetricsClassifiesHTTPErrorsByCode(t *testing.T) {
 		return echo.NewHTTPError(http.StatusNotFound, "no such thing")
 	})
 
+	before := adaptertest.Collect(t)
 	get(t, h, "/echo/unavailable")
 	if rec := get(t, h, "/echo/missing/9"); rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
+	after := adaptertest.Collect(t)
 
-	rm := adaptertest.Collect(t)
-	if got := adaptertest.EndpointOutcome(rm, "/echo/unavailable", "failure"); got != 1 {
-		t.Errorf("5xx HTTPError failure count = %d, want 1", got)
+	if delta := adaptertest.EndpointOutcome(after, "/echo/unavailable", "failure") -
+		adaptertest.EndpointOutcome(before, "/echo/unavailable", "failure"); delta != 1 {
+		t.Errorf("5xx HTTPError failure delta = %d, want 1", delta)
 	}
-	if got := adaptertest.EndpointOutcome(rm, "/echo/missing/:id", "success"); got != 1 {
-		t.Errorf("4xx HTTPError success count = %d, want 1", got)
+	if delta := adaptertest.EndpointOutcome(after, "/echo/missing/:id", "success") -
+		adaptertest.EndpointOutcome(before, "/echo/missing/:id", "success"); delta != 1 {
+		t.Errorf("4xx HTTPError success delta = %d, want 1", delta)
 	}
-	if got := adaptertest.EndpointOutcome(rm, "/echo/missing/:id", "failure"); got != 0 {
-		t.Errorf("4xx HTTPError must not be a failure, got %d", got)
+	if delta := adaptertest.EndpointOutcome(after, "/echo/missing/:id", "failure") -
+		adaptertest.EndpointOutcome(before, "/echo/missing/:id", "failure"); delta != 0 {
+		t.Errorf("4xx HTTPError must not be a failure, got delta %d", delta)
+	}
+}
+
+// Endpoint metrics are opt-in: without WithEndpointMetrics no counter is
+// emitted, only the otelhttp duration histogram.
+func TestEndpointMetricsAreOptIn(t *testing.T) {
+	e := echo.New()
+	h := Instrument(e)
+	e.GET("/echo/optin", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
+
+	before := adaptertest.EndpointTotal(adaptertest.Collect(t))
+	get(t, h, "/echo/optin")
+	after := adaptertest.EndpointTotal(adaptertest.Collect(t))
+
+	if after != before {
+		t.Errorf("endpoint.requests must be off by default, got delta %d", after-before)
+	}
+	if !adaptertest.RouteOnDuration(adaptertest.Collect(t), "/echo/optin") {
+		t.Error("the duration histogram must still carry http.route")
 	}
 }
 
 // Instrument forwards nethttp options, so probe filtering is wireable through
-// the adapter's one-call path.
+// the adapter's one-call path — and the exclusion must cover the per-endpoint
+// counter, not just otelhttp's own metrics.
 func TestInstrumentForwardsSkipPaths(t *testing.T) {
+	adaptertest.Reset()
 	e := echo.New()
-	h := Instrument(e, nethttp.WithSkipPaths("/echo/skipme"))
+	h := Instrument(e, nethttp.WithEndpointMetrics(), nethttp.WithSkipPaths("/echo/skipme"))
 	e.GET("/echo/skipme", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
 
+	before := adaptertest.EndpointTotal(adaptertest.Collect(t))
 	if rec := get(t, h, "/echo/skipme"); rec.Code != http.StatusOK {
 		t.Fatalf("skipped path must still be served: status = %d", rec.Code)
+	}
+	after := adaptertest.EndpointTotal(adaptertest.Collect(t))
+
+	if after != before {
+		t.Errorf("skipped path must not record endpoint.requests, got delta %d", after-before)
 	}
 	if adaptertest.RouteOnDuration(adaptertest.Collect(t), "/echo/skipme") {
 		t.Error("skipped path must not appear on the duration metric")
 	}
 	if adaptertest.RouteOnSpan("/echo/skipme") {
 		t.Error("skipped path must not produce a span")
+	}
+}
+
+// WithoutRecovery must mean no recovery at all, not "the framework one instead".
+func TestWithoutRecoveryHonoredThroughInstrument(t *testing.T) {
+	e := echo.New()
+	h := Instrument(e, nethttp.WithoutRecovery())
+	e.GET("/echo/escape", func(c echo.Context) error { panic("mine to handle") })
+
+	before := adaptertest.PanicCount(adaptertest.Collect(t))
+	escaped := func() (escaped bool) {
+		defer func() { escaped = recover() != nil }()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/echo/escape", nil))
+		return false
+	}()
+	after := adaptertest.PanicCount(adaptertest.Collect(t))
+
+	if !escaped {
+		t.Error("WithoutRecovery must let the panic escape the adapter")
+	}
+	if delta := after - before; delta != 0 {
+		t.Errorf("WithoutRecovery must record no panic, got delta %d", delta)
 	}
 }

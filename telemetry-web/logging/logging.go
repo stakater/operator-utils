@@ -1,3 +1,5 @@
+// Package logging provides the trace-correlated slog handler the library logs
+// through, and the injection point for replacing it.
 package logging
 
 import (
@@ -5,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -20,35 +23,54 @@ type groupOrAttrs struct {
 }
 
 type logHandler struct {
-	base slog.Handler
-	goas []groupOrAttrs
+	base    slog.Handler   // as handed to NewLogHandler, no goas applied
+	applied slog.Handler   // base with every goas already applied
+	goas    []groupOrAttrs // replay list, only needed once a group is open
+	grouped bool           // true once any WithGroup has been called
 }
 
 // NewLogHandler wraps base so every record carries trace_id, span_id, and
 // service.name pulled from the context / scope (when present). The stamps stay
 // top-level regardless of WithGroup nesting.
-func NewLogHandler(base slog.Handler) slog.Handler { return &logHandler{base: base} }
-
-func (h *logHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	return h.base.Enabled(ctx, l)
+func NewLogHandler(base slog.Handler) slog.Handler {
+	return &logHandler{base: base, applied: base}
 }
 
-func (h *logHandler) Handle(ctx context.Context, rec slog.Record) error {
-	var stamps []slog.Attr
+func (h *logHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.applied.Enabled(ctx, l)
+}
+
+// stamps returns the correlation attrs for ctx, or nil when there is nothing
+// to add.
+func stamps(ctx context.Context) []slog.Attr {
+	var out []slog.Attr
 	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-		stamps = append(stamps,
+		out = append(out,
 			slog.String("trace_id", sc.TraceID().String()),
 			slog.String("span_id", sc.SpanID().String()),
 		)
 	}
 	if name := scope.ServiceName(); name != "" {
-		stamps = append(stamps, slog.String("service.name", name))
+		out = append(out, slog.String("service.name", name))
 	}
+	return out
+}
 
-	base := h.base
-	if len(stamps) > 0 {
-		base = base.WithAttrs(stamps)
+func (h *logHandler) Handle(ctx context.Context, rec slog.Record) error {
+	st := stamps(ctx)
+	if len(st) == 0 {
+		return h.applied.Handle(ctx, rec)
 	}
+	// Fast path: with no group open, record-level attrs already land
+	// top-level, so the pre-applied handler can be reused as-is. Only an open
+	// group would capture the stamps, and that is the rare case.
+	if !h.grouped {
+		rec = rec.Clone()
+		rec.AddAttrs(st...)
+		return h.applied.Handle(ctx, rec)
+	}
+	// Slow path: stamp the base handler first, then reopen the groups on top.
+	base := h.base.WithAttrs(st)
 	for _, ga := range h.goas {
 		if ga.group != "" {
 			base = base.WithGroup(ga.group)
@@ -76,13 +98,44 @@ func (h *logHandler) WithGroup(name string) slog.Handler {
 func (h *logHandler) with(ga groupOrAttrs) slog.Handler {
 	goas := make([]groupOrAttrs, len(h.goas), len(h.goas)+1)
 	copy(goas, h.goas)
-	return &logHandler{base: h.base, goas: append(goas, ga)}
+	goas = append(goas, ga)
+
+	applied := h.applied
+	if ga.group != "" {
+		applied = applied.WithGroup(ga.group)
+	} else {
+		applied = applied.WithAttrs(ga.attrs)
+	}
+	return &logHandler{
+		base:    h.base,
+		applied: applied,
+		goas:    goas,
+		grouped: h.grouped || ga.group != "",
+	}
 }
 
-var defaultLogger = sync.OnceValue(func() *slog.Logger {
+var fallback = sync.OnceValue(func() *slog.Logger {
 	return slog.New(NewLogHandler(slog.NewJSONHandler(os.Stdout, nil)))
 })
 
-// Logger returns the shared *slog.Logger writing trace-correlated JSON to
-// stdout. Use the *Context methods so ctx reaches the handler.
-func Logger() *slog.Logger { return defaultLogger() }
+var current atomic.Pointer[slog.Logger]
+
+// SetDefault replaces the logger this library writes through — endpoint
+// metrics warnings, recovered panics, and setup diagnostics. Call it before
+// telemetry.Init so a consuming operator gets one log stream in its own
+// format instead of a second one on stdout. Passing nil restores the default.
+//
+// Wrap your handler to keep trace correlation:
+//
+//	logging.SetDefault(slog.New(logging.NewLogHandler(myHandler)))
+func SetDefault(l *slog.Logger) { current.Store(l) }
+
+// Logger returns the logger the library writes through: whatever SetDefault
+// installed, else a shared trace-correlated JSON logger on stdout. Use the
+// *Context methods so ctx reaches the handler.
+func Logger() *slog.Logger {
+	if l := current.Load(); l != nil {
+		return l
+	}
+	return fallback()
+}

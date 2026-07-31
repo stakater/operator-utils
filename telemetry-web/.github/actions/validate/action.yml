@@ -1,11 +1,8 @@
 name: Validate telemetry
-description: Build, lint, and unit-test the telemetry-web module and its adapters
+description: Build, vet, format-check, and unit-test the telemetry-web module and its adapters
 
-inputs:
-  golangci-lint-version:
-    description: golangci-lint version to use
-    required: false
-    default: v2.8.0
+# Linting is a separate matrix job in the calling workflow, so this action takes
+# no golangci-lint input.
 
 runs:
   using: composite
@@ -18,45 +15,36 @@ runs:
           telemetry-web/go.sum
           telemetry-web/adapters/*/go.sum
 
-    - name: Build
+    - name: Check formatting
+      shell: bash
+      working-directory: telemetry-web
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+        fi
+
+    - name: Check go.mod tidiness
+      shell: bash
+      working-directory: telemetry-web
+      env:
+        GOWORK: "off"
+      run: |
+        for mod in . adapters/gin adapters/echo adapters/chi; do
+          echo "--- tidy check $mod"
+          (cd "$mod" && go mod tidy -diff)
+        done
+
+    # go.work makes these resolve the in-tree core, so a breaking core change
+    # fails here instead of after it is published.
+    - name: Build and vet
       shell: bash
       working-directory: telemetry-web
       run: |
         for mod in . adapters/gin adapters/echo adapters/chi; do
           echo "--- build $mod"
-          (cd "$mod" && go build ./...)
+          (cd "$mod" && go build ./... && go vet ./...)
         done
-
-    - name: Lint core
-      uses: golangci/golangci-lint-action@v9
-      with:
-        version: ${{ inputs.golangci-lint-version }}
-        working-directory: telemetry-web
-        args: --timeout 10m
-
-    - name: Lint gin adapter
-      uses: golangci/golangci-lint-action@v9
-      with:
-        version: ${{ inputs.golangci-lint-version }}
-        working-directory: telemetry-web/adapters/gin
-        args: --timeout 10m
-        skip-cache: true
-
-    - name: Lint echo adapter
-      uses: golangci/golangci-lint-action@v9
-      with:
-        version: ${{ inputs.golangci-lint-version }}
-        working-directory: telemetry-web/adapters/echo
-        args: --timeout 10m
-        skip-cache: true
-
-    - name: Lint chi adapter
-      uses: golangci/golangci-lint-action@v9
-      with:
-        version: ${{ inputs.golangci-lint-version }}
-        working-directory: telemetry-web/adapters/chi
-        args: --timeout 10m
-        skip-cache: true
 
     - name: Unit tests
       shell: bash
@@ -64,5 +52,21 @@ runs:
       run: |
         for mod in . adapters/gin adapters/echo adapters/chi; do
           echo "--- test $mod"
-          (cd "$mod" && go test -race -count=1 ./...)
+          (cd "$mod" && go test -race -count=1 -shuffle=on ./...)
+        done
+
+    # The pins in each adapter's go.mod are what consumers resolve, so they get
+    # built too. Expected to fail until the first coordinated release: the
+    # adapters here call core API that this PR adds and has not published yet.
+    # Flip to a hard failure once the pins point at a release tag.
+    - name: Build adapters against published core pin
+      shell: bash
+      working-directory: telemetry-web
+      continue-on-error: true
+      env:
+        GOWORK: "off"
+      run: |
+        for mod in adapters/gin adapters/echo adapters/chi; do
+          echo "--- build $mod (GOWORK=off)"
+          (cd "$mod" && go build ./...)
         done
