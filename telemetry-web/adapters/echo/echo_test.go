@@ -10,7 +10,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"github.com/stakater/operator-utils/telemetry-web/adaptertest"
+	"github.com/stakater/operator-utils/telemetry-web/internal/adaptertest"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 

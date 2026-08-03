@@ -11,7 +11,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 )
 
 // groupOrAttrs records one WithGroup or WithAttrs call so Handle can replay
@@ -56,7 +56,7 @@ func stamps(ctx context.Context) []slog.Attr {
 			slog.String("span_id", sc.SpanID().String()),
 		)
 	}
-	if name := scope.ServiceName(); name != "" {
+	if name := ident.ServiceName(); name != "" {
 		out = append(out, slog.String("service.name", name))
 	}
 	return out

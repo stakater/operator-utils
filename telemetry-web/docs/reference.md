@@ -53,10 +53,10 @@ value you must thread is `context.Context` — that is what carries the active s
 Dependency direction inside the module (no cycles):
 
 ```
-adapters/{gin,echo,chi} ─▶ nethttp ─▶ endpoint ─▶ logging ─▶ internal/scope
+adapters/{gin,echo,chi} ─▶ nethttp ─▶ endpoint ─▶ logging ─▶ internal/ident
 nethttp ─────────────────▶ logging
-telemetry (root) ────────▶ logging, internal/scope
-endpoint ────────────────▶ internal/version
+telemetry (root) ────────▶ logging, internal/ident
+endpoint ────────────────▶ internal/ident
 ```
 
 ---
@@ -543,8 +543,10 @@ it those escape to net/http: connection torn down, no response, no
 `http.server.panics`, no exception on the span.
 
 Adapters are held to the contract by a shared conformance suite —
-package `…/telemetry-web/adaptertest` — that each adapter module runs against
-its own engine (`adaptertest.Run`): route-templated metrics (never raw paths),
+package `…/telemetry-web/internal/adaptertest`, internal because it is test
+scaffolding rather than consumer API, and importable from the adapter modules
+anyway since Go's internal rule is lexical on import path — that each adapter
+module runs against its own engine (`adaptertest.Run`): route-templated metrics (never raw paths),
 `500 → failure`, `4xx → success`, `http.route` on span + duration metric + the
 `"{method} {route}"` span rename, route retained on panicked requests, unmatched
 routes skipped, skipped paths recording nothing at all, panic → `500` + panic

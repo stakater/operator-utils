@@ -1,7 +1,8 @@
-package version
+package ident
 
 import (
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -10,6 +11,43 @@ func TestModulePathIsTheImportPath(t *testing.T) {
 	if ModulePath != want {
 		t.Errorf("ModulePath = %q, want %q", ModulePath, want)
 	}
+}
+
+func TestSetThenRead(t *testing.T) {
+	SetServiceName("svc-a")
+	if got := ServiceName(); got != "svc-a" {
+		t.Errorf("ServiceName() = %q, want %q", got, "svc-a")
+	}
+	SetServiceName("svc-b")
+	if got := ServiceName(); got != "svc-b" {
+		t.Errorf("ServiceName() = %q, want %q", got, "svc-b")
+	}
+}
+
+// Clearing is a real path, not a curiosity: telemetry.retire sets "" so
+// post-shutdown log records stop carrying a stale service.name.
+//
+// This replaces a test that asserted the never-set case and t.Skipf'd when
+// another test had already set a name — under -shuffle that skipped about half
+// the time, asserting nothing.
+func TestClearedServiceNameReadsEmpty(t *testing.T) {
+	SetServiceName("svc")
+	SetServiceName("")
+	if got := ServiceName(); got != "" {
+		t.Errorf("ServiceName() = %q after clearing, want %q", got, "")
+	}
+}
+
+// SetServiceName runs at Init and on shutdown, but ServiceName is read on every
+// log record, so the two must be safe together under -race.
+func TestConcurrentSetAndRead(t *testing.T) {
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(2)
+		go func() { defer wg.Done(); SetServiceName("concurrent") }()
+		go func() { defer wg.Done(); _ = ServiceName() }()
+	}
+	wg.Wait()
 }
 
 // Version reads the consuming binary's build info. Under `go test` this module IS

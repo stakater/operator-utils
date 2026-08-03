@@ -5,6 +5,15 @@
 // exports the metric/span inspection helpers so adapter modules can write
 // framework-specific tests against the same providers.
 //
+// Under internal/ deliberately. It is test scaffolding, not consumer API, and
+// keeping it out of the public surface stops it appearing on pkg.go.dev and stops
+// its imports (testing, sdk/metric, sdk/trace/tracetest) reading as part of the
+// library's contract. The adapter modules can still import it: Go's internal rule
+// is lexical on import path, not on module boundary, so anything under
+// github.com/stakater/operator-utils/telemetry-web/ has access — including
+// .../telemetry-web/adapters/gin, which is its own module. An out-of-tree adapter
+// could not, which is accepted: a new adapter belongs in this repo.
+//
 // Usage in an adapter module:
 //
 //	func TestMain(m *testing.M) {

@@ -21,7 +21,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
@@ -100,7 +100,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		logging.Logger().Error("telemetry: sdk error", "err", err)
 	}))
 
-	scope.Set(cfg.ServiceName)
+	ident.SetServiceName(cfg.ServiceName)
 
 	attrs := []attribute.KeyValue{semconv.ServiceName(cfg.ServiceName)}
 	if cfg.ServiceVersion != "" {
@@ -214,7 +214,7 @@ func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
 func retire() {
 	otel.SetTracerProvider(tracenoop.NewTracerProvider())
 	otel.SetMeterProvider(metricnoop.NewMeterProvider())
-	scope.Set("")
+	ident.SetServiceName("")
 }
 
 // resolveRatio: config value if set, else OTEL_TRACES_SAMPLER_ARG, else 1.0.

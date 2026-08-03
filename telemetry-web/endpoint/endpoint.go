@@ -14,7 +14,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/version"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
@@ -89,8 +89,8 @@ func get() *instruments {
 // compared against, with no window for a swap in between.
 func build(mp metric.MeterProvider) *instruments {
 	m := mp.Meter(
-		version.ModulePath,
-		metric.WithInstrumentationVersion(version.Version()),
+		ident.ModulePath,
+		metric.WithInstrumentationVersion(ident.Version()),
 	)
 	var i instruments
 	var errs []error

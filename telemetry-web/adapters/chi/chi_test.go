@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/stakater/operator-utils/telemetry-web/adaptertest"
+	"github.com/stakater/operator-utils/telemetry-web/internal/adaptertest"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 

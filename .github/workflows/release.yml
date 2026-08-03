@@ -42,12 +42,15 @@ jobs:
       # This is the check that cannot live in the PR job, because satisfying it
       # needs a core tag that only exists after merge. See
       # telemetry-web/docs/releasing.md.
-      - name: Assert adapters pin a released core
+      - name: Verify adapter against its pinned core
         if: startsWith(github.ref_name, 'telemetry-web/adapters/')
+        env:
+          GOWORK: "off"
         run: |
           mod="${GITHUB_REF_NAME%/v*}"        # telemetry-web/adapters/gin
-          req=$(cd "$mod" && go list -m -f '{{.Version}}' \
-            github.com/stakater/operator-utils/telemetry-web)
+          cd "$mod"
+
+          req=$(go list -m -f '{{.Version}}' github.com/stakater/operator-utils/telemetry-web)
           echo "$mod requires core $req"
           case "$req" in
             v0.0.0-*)
@@ -55,6 +58,12 @@ jobs:
               exit 1
               ;;
           esac
+
+          # Now that the pin names a real tag these can finally resolve, which is
+          # why they live here and not in the PR job.
+          go mod tidy -diff
+          go build ./...
+          go test -count=1 ./...
 
       - name: Changelog
         uses: scottbrenner/generate-changelog-action@master

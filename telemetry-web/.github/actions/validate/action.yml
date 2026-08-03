@@ -24,16 +24,20 @@ runs:
           echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
         fi
 
-    - name: Check go.mod tidiness
+    # The core resolves nothing from this repo, so GOWORK=off is both meaningful
+    # and satisfiable here: it is exactly what a consumer sees.
+    - name: Check go.mod tidiness (core)
       shell: bash
       working-directory: telemetry-web
       env:
         GOWORK: "off"
-      run: |
-        for mod in . adapters/gin adapters/echo adapters/chi; do
-          echo "--- tidy check $mod"
-          (cd "$mod" && go mod tidy -diff)
-        done
+      run: go mod tidy -diff
+
+    # No tidy check for the adapters here. go mod tidy ignores go.work by design, so
+    # it always resolves their imports against the PINNED core — and a PR that adds
+    # or moves a core package cannot satisfy a pin that predates it. Unsatisfiable
+    # pre-merge, exactly like the GOWORK=off build; both run at release time
+    # instead. See docs/releasing.md.
 
     # go.work makes these resolve the in-tree core, so a breaking core change
     # fails here instead of after it is published.

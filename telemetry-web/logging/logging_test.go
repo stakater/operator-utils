@@ -9,7 +9,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 )
 
 func TestLogHandlerStampsTraceIDs(t *testing.T) {
@@ -84,7 +84,7 @@ func TestLoggerIsCached(t *testing.T) {
 // service.name comes from the scope set by Init, not from the context, and is
 // stamped alongside the trace IDs.
 func TestLogHandlerStampsServiceName(t *testing.T) {
-	scope.Set("billing-api")
+	ident.SetServiceName("billing-api")
 
 	var buf bytes.Buffer
 	slog.New(NewLogHandler(slog.NewJSONHandler(&buf, nil))).
@@ -149,7 +149,7 @@ func TestSetDefaultRedirectsLibraryLogging(t *testing.T) {
 // Without an open group the handler takes the fast path; the stamps must still
 // land, and user attrs must survive.
 func TestFastPathKeepsAttrsAndStamps(t *testing.T) {
-	scope.Set("fastpath-svc")
+	ident.SetServiceName("fastpath-svc")
 
 	var buf bytes.Buffer
 	slog.New(NewLogHandler(slog.NewJSONHandler(&buf, nil))).

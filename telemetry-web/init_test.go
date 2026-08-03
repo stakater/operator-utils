@@ -19,7 +19,7 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/stakater/operator-utils/telemetry-web/endpoint"
-	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
@@ -250,7 +250,7 @@ func TestInitFailureRestoresNoopProviders(t *testing.T) {
 	if got := otel.GetMeterProvider(); !isNoopMeterProvider(got) {
 		t.Errorf("global MeterProvider is %T after a failed Init, want the noop", got)
 	}
-	if name := scope.ServiceName(); name != "" {
+	if name := ident.ServiceName(); name != "" {
 		t.Errorf("log scope = %q after a failed Init, want it cleared", name)
 	}
 

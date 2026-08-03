@@ -365,7 +365,7 @@ message, chi via `chi.Mux.Use`. **Echo** applies
 
 All three classify outcome identically (`status >= 500` is a failure) via
 `nethttp.RecordRoute`, and a panic is counted exactly once on each. The shared
-conformance suite in `adaptertest` fails the build if one of them drifts. See
+conformance suite in `internal/adaptertest` fails the build if one of them drifts. See
 [the adapter contract](docs/reference.md#the-adapter-contract) for the failure
 rule and how the recovery layers fit together.
 

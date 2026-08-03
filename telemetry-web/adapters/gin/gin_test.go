@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/stakater/operator-utils/telemetry-web/adaptertest"
+	"github.com/stakater/operator-utils/telemetry-web/internal/adaptertest"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
