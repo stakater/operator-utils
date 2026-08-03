@@ -12,6 +12,13 @@ func TestHasScheme(t *testing.T) {
 		"localhost:4317":            false,
 		"collector.ns.svc:4317":     false,
 		"":                          false,
+		// url.Parse lowercases u.Scheme while the input keeps its case, so a
+		// case-sensitive prefix test classes these as bare host:port and hands them
+		// to WithEndpoint, where the HTTP exporter fails to parse them and takes
+		// Init down with an opaque net/url error.
+		"HTTP://collector:4318":  true,
+		"HTTPS://collector:4318": true,
+		"Http://collector:4318":  true,
 	}
 	for ep, want := range cases {
 		if got := hasScheme(ep); got != want {

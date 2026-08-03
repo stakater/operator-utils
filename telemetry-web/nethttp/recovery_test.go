@@ -117,15 +117,15 @@ func TestStampRouteWithoutLabelerStillSetsSpanAttribute(t *testing.T) {
 	}
 }
 
-// Skipped reports the WithSkipPaths decision to middleware running inside the
-// router, which otelhttp's own filter cannot reach.
+// The skip decision must reach middleware running inside the router, which
+// otelhttp's own filter cannot.
 func TestSkippedReflectsSkipPaths(t *testing.T) {
 	var skippedSeen, normalSeen bool
 	probe := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
-			skippedSeen = Skipped(r.Context())
+			skippedSeen = skipped(r.Context())
 		} else {
-			normalSeen = Skipped(r.Context())
+			normalSeen = skipped(r.Context())
 		}
 	})
 	h := Handler(probe, WithSkipPaths("/healthz"))
@@ -134,18 +134,32 @@ func TestSkippedReflectsSkipPaths(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api", nil))
 
 	if !skippedSeen {
-		t.Error("Skipped must be true for an excluded path")
+		t.Error("skipped must be true for an excluded path")
 	}
 	if normalSeen {
-		t.Error("Skipped must be false for a normal path")
+		t.Error("skipped must be false for a normal path")
 	}
 }
 
 // Repeated WithSkipPaths calls accumulate rather than the last one winning.
+// Asserted through Handler, since Settings does not carry the paths.
 func TestWithSkipPathsAccumulates(t *testing.T) {
-	s := Resolve(WithSkipPaths("/a"), WithSkipPaths("/b", "/c"))
-	if len(s.SkipPaths) != 3 {
-		t.Fatalf("SkipPaths = %v, want all three accumulated", s.SkipPaths)
+	seen := map[string]bool{}
+	probe := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen[r.URL.Path] = skipped(r.Context())
+	})
+	h := Handler(probe, WithSkipPaths("/a"), WithSkipPaths("/b", "/c"))
+
+	for _, p := range []string{"/a", "/b", "/c", "/kept"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, p, nil))
+	}
+	for _, p := range []string{"/a", "/b", "/c"} {
+		if !seen[p] {
+			t.Errorf("%s not skipped: a later WithSkipPaths overwrote an earlier one", p)
+		}
+	}
+	if seen["/kept"] {
+		t.Error("/kept must not be skipped")
 	}
 }
 
@@ -156,9 +170,6 @@ func TestResolveDefaults(t *testing.T) {
 	}
 	if s.EndpointMetrics {
 		t.Error("endpoint metrics must be off by default")
-	}
-	if len(s.SkipPaths) != 0 {
-		t.Error("nothing must be skipped by default")
 	}
 }
 
@@ -312,5 +323,56 @@ func TestRecoveryDoesNotWriteAfterHijack(t *testing.T) {
 	}
 	if strings.Contains(got, "500") {
 		t.Errorf("Recovery wrote a 500 into the hijacked connection: %q", got)
+	}
+}
+
+// Flush and ReadFrom commit an implicit 200 in net/http, and httpsnoop passes
+// unhooked methods straight through, so trackWrites has to hook them too. Without
+// that, a panic after io.Copy or after flushing headers makes Recovery write a
+// pointless 500 over a response the client already received in full.
+func TestTrackWritesSeesFlushAndReadFrom(t *testing.T) {
+	body := strings.Repeat("x", 4096)
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		wantLen int
+	}{
+		{"io.Copy selects ReadFrom", func(w http.ResponseWriter, _ *http.Request) {
+			if _, err := io.Copy(w, strings.NewReader(body)); err != nil {
+				t.Error(err)
+			}
+			panic("late boom")
+		}, len(body)},
+		{"Flush commits the header", func(w http.ResponseWriter, _ *http.Request) {
+			w.(http.Flusher).Flush()
+			panic("sse boom")
+		}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var responded func() bool
+			probe := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var tracked http.ResponseWriter
+				tracked, responded = trackWrites(w)
+				defer func() { _ = recover() }()
+				tc.handler(tracked, r)
+			})
+			srv := httptest.NewServer(probe)
+			defer srv.Close()
+
+			resp, err := http.Get(srv.URL)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK || len(got) != tc.wantLen {
+				t.Fatalf("client saw %d with %d bytes, want 200 with %d", resp.StatusCode, len(got), tc.wantLen)
+			}
+			if !responded() {
+				t.Error("responded() = false after the response was committed, so Recovery would write a spurious 500")
+			}
+		})
 	}
 }

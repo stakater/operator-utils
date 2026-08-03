@@ -7,7 +7,6 @@
 package echotel
 
 import (
-	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -100,17 +99,32 @@ func Metrics() echo.MiddlewareFunc {
 	}
 }
 
-// status resolves the code the request will answer with. Echo runs its error
-// handler after the middleware chain, so on a returned error nothing is written
-// yet and the error carries the answer: an *echo.HTTPError reports its own
-// Code, anything else becomes Echo's default 500.
+// status resolves the code the request actually answers with, mirroring Echo's
+// DefaultHTTPErrorHandler rather than approximating it. Each step matters:
+//
+//   - Committed first. Once a handler has written, Echo's error handler returns
+//     without touching the response, so the status already sent is the answer even
+//     though a non-nil error came back.
+//   - A plain type assertion, not errors.As. Echo does not unwrap, so
+//     fmt.Errorf("...: %w", echo.NewHTTPError(404)) answers 500; errors.As would
+//     find the 404 and record a server fault as a client one.
+//   - he.Internal unwrapped one level, because Echo does that and answers with the
+//     inner code. The idiomatic NewHTTPError(500).SetInternal(NewHTTPError(404))
+//     answers 404.
+//
+// This tracks Echo's DEFAULT handler. A consumer that sets its own
+// HTTPErrorHandler can answer with anything, and the outcome recorded here will
+// follow the default's rules instead.
 func status(c echo.Context, err error) int {
-	if err != nil {
-		var he *echo.HTTPError
-		if errors.As(err, &he) {
-			return he.Code
-		}
+	if err == nil || c.Response().Committed {
+		return c.Response().Status
+	}
+	he, ok := err.(*echo.HTTPError) //nolint:errorlint // mirrors Echo, which does not unwrap
+	if !ok {
 		return http.StatusInternalServerError
 	}
-	return c.Response().Status
+	if inner, ok := he.Internal.(*echo.HTTPError); ok { //nolint:errorlint // one level, as Echo does
+		return inner.Code
+	}
+	return he.Code
 }

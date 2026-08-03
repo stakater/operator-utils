@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,15 +18,21 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
-// resetInstruments rebinds the instruments to the current global MeterProvider
-// so each test's ManualReader sees its own data. This is the same path
-// telemetry.Init drives via rebind.Notify.
+// resetInstruments drops the cached instrument set so the next use rebuilds it
+// against whatever MeterProvider the test just installed.
+//
+// Only needed because a test may reuse a provider value; in production the
+// endpoint package notices a provider swap on its own, by comparison.
 func resetInstruments() {
-	rebind.Notify()
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	current.Store(nil)
+	// Re-armed too: two failingProvider{} values compare equal (empty struct), so
+	// without this a later failure test would find the warning already spent.
+	warnOnce = new(sync.Once)
 }
 
 func TestRecordOutcomes(t *testing.T) {
@@ -262,12 +269,14 @@ func TestRecordDoesNotEmitDuration(t *testing.T) {
 	}
 }
 
-// M1: otel's global meter delegates to the FIRST real MeterProvider and never
+// otel's global meter delegates to the FIRST real MeterProvider and never
 // re-delegates, so instruments cached here would stay bound to it forever —
 // silently writing into a retired pipeline after a shutdown, and recording
-// nothing into the provider a second Init installs. rebind.Notify (which
-// telemetry.Init calls) must move them to the current provider.
-func TestRebindMovesInstrumentsToTheCurrentProvider(t *testing.T) {
+// nothing into the provider a second Init installs.
+//
+// No resetInstruments after the swap: noticing it is the cache's whole job, and
+// it must work for any installer, not only telemetry.Init.
+func TestInstrumentsFollowTheCurrentProvider(t *testing.T) {
 	first := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(first)))
 	resetInstruments()
@@ -277,18 +286,17 @@ func TestRebindMovesInstrumentsToTheCurrentProvider(t *testing.T) {
 		t.Fatalf("first provider count = %d, want 1", got)
 	}
 
-	// Stand in for a second Init: new provider, then the rebind Init performs.
+	// Stand in for a second Init: a new provider and nothing else.
 	second := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(second)))
-	rebind.Notify()
 
 	Record(context.Background(), "probe", false)
 
 	if got := counterValue(t, second, "probe", "success"); got != 1 {
-		t.Errorf("second provider count = %d, want 1 — instruments did not rebind", got)
+		t.Errorf("second provider count = %d, want 1 — instruments did not follow the swap", got)
 	}
 	if got := counterValue(t, first, "probe", "success"); got != 1 {
-		t.Errorf("first provider count = %d, want it frozen at 1 — still receiving after rebind", got)
+		t.Errorf("first provider count = %d, want it frozen at 1 — still receiving after the swap", got)
 	}
 }
 
@@ -359,7 +367,7 @@ func TestInstrumentCreationFailureDegradesGracefully(t *testing.T) {
 	// And recovery is automatic: a working provider plus a rebind restores them.
 	reader := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-	rebind.Notify()
+	resetInstruments()
 
 	Record(ctx, "recovered", false)
 	if got := counterValue(t, reader, "recovered", "success"); got != 1 {
@@ -375,12 +383,13 @@ func TestInstrumentFailureWarningNamesTheErrors(t *testing.T) {
 	logging.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	t.Cleanup(func() { logging.SetDefault(nil) })
 
-	// No manual reset: rebuild re-arms warnOnce per provider generation, so this
-	// warns even though an earlier test in the run already triggered one. That is
-	// the point — a failure against this provider must not be hidden by a warning
-	// that fired against a previous one.
+	// The instruments build lazily, so the warning lands on first use, not on the
+	// provider swap. resetInstruments also re-arms warnOnce, so this warns even
+	// though an earlier test in the run already triggered one: a failure against
+	// this provider must not be hidden by a warning that fired against another.
 	otel.SetMeterProvider(failingProvider{})
-	rebind.Notify()
+	resetInstruments()
+	Record(context.Background(), "probe", false)
 
 	out := buf.String()
 	if out == "" {

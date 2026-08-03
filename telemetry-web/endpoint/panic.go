@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/stakater/operator-utils/telemetry-web/logging"
@@ -53,9 +54,21 @@ func Recovered(ctx context.Context, recovered any, attrs ...attribute.KeyValue) 
 // traced to an endpoint. Anything unbounded (a raw path, a raw method) would
 // blow up the time series count, so nothing is derived from the request here.
 func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue) {
-	err := fmt.Errorf("panic: %v", recovered)
+	// Captured once and shared. The exception event is built by hand rather than
+	// via span.RecordError for two reasons: RecordError takes exception.type from
+	// reflect.TypeOf, so wrapping the value in fmt.Errorf would report
+	// errors.errorString for every panic in the fleet and make "which class of
+	// panic is spiking" unanswerable; and its own stack capture uses a fixed 2 KB
+	// buffer with no growth loop, which cuts a deep middleware stack mid-line.
+	stack := string(debug.Stack())
+	message := fmt.Sprint(recovered)
+
 	span := trace.SpanFromContext(ctx)
-	span.RecordError(err, trace.WithStackTrace(true))
+	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
+		semconv.ExceptionType(fmt.Sprintf("%T", recovered)),
+		semconv.ExceptionMessage(message),
+		semconv.ExceptionStacktrace(stack),
+	))
 	span.SetStatus(codes.Error, "panic")
 
 	// The stack goes on the log as well as the span. On the span alone it is lost
@@ -63,8 +76,8 @@ func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue
 	// unreachable, and a panic is the one event where the stack is the whole
 	// point.
 	logging.Logger().ErrorContext(ctx, "recovered panic",
-		"panic", fmt.Sprint(recovered),
-		"stack", string(debug.Stack()))
+		"panic", message,
+		"stack", stack)
 
 	if c := get().panics; c != nil {
 		c.Add(ctx, 1, metric.WithAttributes(attrs...))

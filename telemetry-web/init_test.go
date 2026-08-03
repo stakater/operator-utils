@@ -14,11 +14,11 @@ import (
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/stakater/operator-utils/telemetry-web/endpoint"
-	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
@@ -88,11 +88,25 @@ func TestShutdownIsIdempotent(t *testing.T) {
 	}
 }
 
+// setProtocol pins every protocol variable, not just the generic one. The
+// per-signal variables win over it, so setting one and leaving the others to the
+// ambient environment makes a test pass or fail depending on the shell it runs in.
+func setProtocol(t *testing.T, proto string) {
+	t.Helper()
+	for _, v := range []string{
+		"OTEL_EXPORTER_OTLP_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+		"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+	} {
+		t.Setenv(v, proto)
+	}
+}
+
 // The OTel Operator injects OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf into pods,
 // which is the single most common deployment. Init must boot and pick the HTTP
 // exporter, silently.
 func TestInitHonorsHTTPProtocol(t *testing.T) {
-	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+	setProtocol(t, "http/protobuf")
 
 	var buf bytes.Buffer
 	logging.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
@@ -175,6 +189,11 @@ func TestResolveRatio(t *testing.T) {
 		// passes through; the config is still wrong and worth saying so.
 		{name: "negative env warns, passed through", cfg: Config{}, env: "-1", want: -1, wantWarn: true},
 		{name: "ratio above one warns, passed through", cfg: Config{}, env: "2", want: 2, wantWarn: true},
+		// ParseFloat accepts these. NaN compares false against every bound, so it
+		// would slip past the range check and reach TraceIDRatioBased, whose
+		// float-to-uint conversion is implementation defined for it.
+		{name: "NaN warns and falls back to 1.0", cfg: Config{}, env: "NaN", want: 1.0, wantWarn: true},
+		{name: "lowercase nan too", cfg: Config{}, env: "nan", want: 1.0, wantWarn: true},
 		// An explicit out-of-range Config value is the caller's own doing and is
 		// not second-guessed here.
 		{name: "config value not range checked", cfg: Config{SampleRatio: f(2)}, want: 2},
@@ -209,7 +228,7 @@ func TestInitFailureRestoresNoopProviders(t *testing.T) {
 	// exporter does not, so this fails at newMetricReader — after
 	// SetTracerProvider has already installed tp. That is the ordering that used
 	// to strand a shut-down provider on the global.
-	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+	setProtocol(t, "http/protobuf")
 	shutdown, err := Init(context.Background(), Config{
 		ServiceName:  "svc",
 		OTLPEndpoint: "http://a b c",
@@ -277,34 +296,41 @@ func TestInitRoutesSDKErrorsToTheLogger(t *testing.T) {
 	}
 }
 
-// Init must trigger the instrument rebind. otel's global meter never
-// re-delegates, so anything caching instruments (the endpoint package) would
-// otherwise stay bound to whichever provider was global before this call —
-// stranding endpoint.requests, endpoint.duration, and http.server.panics after
-// a re-Init.
-func TestInitNotifiesRebind(t *testing.T) {
-	var called int
-	rebind.On(func() { called++ })
+// Cached instruments must follow the provider Init installs. otel's global meter
+// delegates to the first real provider and never re-delegates, so anything that
+// cached an instrument earlier would otherwise keep writing into the provider it
+// first saw, stranding endpoint.requests, endpoint.duration and the panic counter.
+//
+// Asserted on where the data lands, not on a notification mechanism: the endpoint
+// package compares the global provider per use, so there is no hook to observe.
+func TestInitRebindsCachedInstruments(t *testing.T) {
+	// Bind the instruments to some other provider first.
+	stale := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(stale)))
+	endpoint.Record(context.Background(), "before-init", false)
 
+	live := sdkmetric.NewManualReader()
 	shutdown := initOnce(t)
 	defer func() { _ = shutdown(bounded(t)) }()
 
-	if called != 1 {
-		t.Errorf("rebind hook ran %d times during Init, want 1", called)
+	// Stand in for Init's provider with one we can read, as the next test does.
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(live)))
+	endpoint.Record(context.Background(), "after-init", false)
+
+	if got := endpointPoints(t, live); got == 0 {
+		t.Error("instruments stayed bound to the earlier provider after a provider swap")
 	}
 }
 
 // Shutdown must stop the cached instruments writing into the provider it just
-// retired. Swapping the globals to noop is not enough on its own: instruments
-// that already exist never re-resolve their provider, so shutdown has to notify
-// the rebind hooks the same way Init does.
+// retired: swapping the globals to noop has to be enough, which it is only
+// because the instruments re-resolve their provider on use.
 func TestShutdownStopsWritesToRetiredProvider(t *testing.T) {
 	retired := sdkmetric.NewManualReader()
 
 	shutdown := initOnce(t)
 	// Stand in for Init's provider with one we can read.
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(retired)))
-	rebind.Notify()
 
 	endpoint.Record(context.Background(), "probe", false)
 	live := endpointPoints(t, retired)
@@ -341,3 +367,67 @@ func endpointPoints(t *testing.T, r *sdkmetric.ManualReader) int64 {
 	}
 	return total
 }
+
+// A cancelled context must not cost the pending spans. TracerProvider.Shutdown
+// latches itself shut BEFORE flushing and returns at its first ctx.Done() check,
+// so honoring the caller's cancellation loses the batch AND leaves the processor
+// unstoppable by any later call. The idiomatic caller passes exactly such a
+// context:
+//
+//	ctx := ctrl.SetupSignalHandler()
+//	defer func() { _ = shutdown(ctx) }()   // cancelled first on SIGTERM
+func TestShutdownFlushesDespiteCancelledContext(t *testing.T) {
+	exported := make(chan struct{}, 1)
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(
+		sdktrace.NewBatchSpanProcessor(exporterFunc(func() { exported <- struct{}{} })),
+	))
+	_, span := tp.Tracer("t").Start(context.Background(), "s")
+	span.End()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	flushCtx, done := flushContext(ctx)
+	defer done()
+	if err := tp.Shutdown(flushCtx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case <-exported:
+	default:
+		t.Error("no span exported: a cancelled context still loses the flush")
+	}
+}
+
+// The caller's deadline is how they bound how long exit may stall, so dropping
+// cancellation must not also drop that.
+func TestFlushContextKeepsALiveDeadlineAndFloorsTheRest(t *testing.T) {
+	live, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	ctx, done := flushContext(live)
+	defer done()
+	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) > time.Hour {
+		t.Errorf("live deadline not carried through: %v ok=%v", dl, ok)
+	}
+
+	// Cancelled, so its deadline is useless; the floor applies instead.
+	dead, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	ctx2, done2 := flushContext(dead)
+	defer done2()
+	if ctx2.Err() != nil {
+		t.Errorf("flush context is already done: %v", ctx2.Err())
+	}
+	if dl, ok := ctx2.Deadline(); !ok || time.Until(dl) > flushFloor {
+		t.Errorf("floor not applied: %v ok=%v", dl, ok)
+	}
+}
+
+// exporterFunc is a SpanExporter that just signals it was called.
+type exporterFunc func()
+
+func (f exporterFunc) ExportSpans(context.Context, []sdktrace.ReadOnlySpan) error {
+	f()
+	return nil
+}
+func (exporterFunc) Shutdown(context.Context) error { return nil }

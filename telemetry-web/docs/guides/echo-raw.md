@@ -58,7 +58,7 @@ Key differences from a naive Echo setup:
 - **Serve through `nethttp.Handler(e)`**, not `e.Start()` — that is what adds
   spans and server metrics and the panic backstop around the whole engine.
 - **Replace `middleware.Recover()`** with a recovery middleware that calls
-  `endpoint.RecordPanic` (Echo's default recover would swallow the panic before
+  `endpoint.Recovered` (Echo's default recover would swallow the panic before
   telemetry sees it).
 
 ```go
@@ -73,6 +73,8 @@ import (
     "time"
 
     "github.com/labstack/echo/v4"
+
+    semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 
     "github.com/stakater/operator-utils/telemetry-web"
     "github.com/stakater/operator-utils/telemetry-web/endpoint"
@@ -115,8 +117,6 @@ func main() {
     defer cancel()
     _ = srv.Shutdown(sctx)
     _ = shutdown(sctx)
-
-    _ = endpoint.Record // keep imports tidy if you trim the example
 }
 ```
 
@@ -186,7 +186,7 @@ rates per route, so the per-endpoint counter below is **optional** — the adapt
 leave it off unless you pass `nethttp.WithEndpointMetrics()`:
 
 ```promql
-sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
+sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
 ```
 
 If you do want the simpler `{endpoint, outcome}` label pair, use
@@ -205,18 +205,31 @@ func TelemetryMetrics() echo.MiddlewareFunc {
     }
 }
 
-// Echo runs its error handler AFTER the middleware chain returns, so for a
-// returned error the response status is not written yet and the error carries
-// the answer.
+// status must mirror Echo's DefaultHTTPErrorHandler, not approximate it, or the
+// recorded outcome disagrees with the status the client received. Three details,
+// each of which the obvious implementation gets wrong:
+//
+//   - Committed first: once the handler has written, Echo's error handler returns
+//     without touching the response, so a non-nil error does NOT mean 500.
+//   - a plain type assertion, not errors.As: Echo does not unwrap, so
+//     fmt.Errorf("...: %w", echo.NewHTTPError(404)) answers 500.
+//   - he.Internal unwrapped one level, because Echo does that: the idiomatic
+//     NewHTTPError(500).SetInternal(NewHTTPError(404)) answers 404.
+//
+// This tracks Echo's DEFAULT handler; a custom HTTPErrorHandler can answer with
+// anything and the outcome recorded here will not follow it.
 func status(c echo.Context, err error) int {
-    if err != nil {
-        var he *echo.HTTPError
-        if errors.As(err, &he) {
-            return he.Code
-        }
+    if err == nil || c.Response().Committed {
+        return c.Response().Status
+    }
+    he, ok := err.(*echo.HTTPError)
+    if !ok {
         return http.StatusInternalServerError
     }
-    return c.Response().Status
+    if inner, ok := he.Internal.(*echo.HTTPError); ok {
+        return inner.Code
+    }
+    return he.Code
 }
 ```
 

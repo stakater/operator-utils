@@ -3,27 +3,58 @@ name: Release Go project
 on:
   push:
     tags:
-      - "v*"
+      # Nested modules are tagged with their path prefix, which is what `go get`
+      # resolves. Listed explicitly rather than as "telemetry-web/**" so the set
+      # of releasable modules is visible here: in these patterns `*` does not
+      # match `/`, so "telemetry-web/*" alone would miss the adapters.
+      - "v*" # root module
+      - "telemetry-web/v*" # telemetry core
+      - "telemetry-web/adapters/*/v*" # gin, echo, chi
 
 env:
   GOLANG_VERSION: 1.25
 
+# The release itself is cut by actions/create-release with PUBLISH_TOKEN, and the
+# Slack step uses its own token, so the default token only needs to read.
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: GoReleaser build
+    name: Create release
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out code
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # See: https://goreleaser.com/ci/actions/
+          fetch-depth: 0 # the changelog step walks the full history
 
       - name: Set up Go 1.x
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GOLANG_VERSION }}
         id: go
+
+      # An adapter tag must not ship while its core requirement is a v0.0.0-
+      # pseudo-version: that resolves only while the branch commit stays
+      # reachable, so a squash merge or a branch deletion breaks every consumer.
+      # This is the check that cannot live in the PR job, because satisfying it
+      # needs a core tag that only exists after merge. See
+      # telemetry-web/docs/releasing.md.
+      - name: Assert adapters pin a released core
+        if: startsWith(github.ref_name, 'telemetry-web/adapters/')
+        run: |
+          mod="${GITHUB_REF_NAME%/v*}"        # telemetry-web/adapters/gin
+          req=$(cd "$mod" && go list -m -f '{{.Version}}' \
+            github.com/stakater/operator-utils/telemetry-web)
+          echo "$mod requires core $req"
+          case "$req" in
+            v0.0.0-*)
+              echo "::error::$mod still pins a pseudo-version ($req). Repoint it at a released telemetry-web/vX.Y.Z tag before tagging the adapter."
+              exit 1
+              ;;
+          esac
 
       - name: Changelog
         uses: scottbrenner/generate-changelog-action@master
@@ -36,8 +67,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PUBLISH_TOKEN }} 
         with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
+          # ref_name, not ref: already stripped of "refs/tags/", so a nested
+          # module tag reads as "telemetry-web/adapters/gin/v0.1.0" without
+          # relying on the action to trim the prefix.
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
           body: |
             ${{ steps.Changelog.outputs.changelog }}
           draft: false

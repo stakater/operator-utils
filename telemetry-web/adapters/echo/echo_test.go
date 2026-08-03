@@ -2,6 +2,7 @@ package echotel
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -212,5 +213,69 @@ func TestPrePanicIsRecoveredAndCounted(t *testing.T) {
 	}
 	if delta := after - before; delta != 1 {
 		t.Errorf("panic counter delta = %d, want 1", delta)
+	}
+}
+
+// status must mirror Echo's DefaultHTTPErrorHandler, not approximate it: the
+// outcome on endpoint.requests is only meaningful if it matches the status the
+// client actually received.
+func TestStatusMirrorsEchoErrorHandler(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		// Echo does not unwrap, so this answers 500. errors.As would find the 404
+		// and record a server fault as a client error.
+		{"wrapped HTTPError", fmt.Errorf("load user: %w", echo.NewHTTPError(http.StatusNotFound)), http.StatusInternalServerError},
+		// Echo unwraps Internal one level and answers with the inner code.
+		{"SetInternal", echo.NewHTTPError(500).SetInternal(echo.NewHTTPError(http.StatusNotFound)), http.StatusNotFound},
+		{"plain HTTPError", echo.NewHTTPError(http.StatusNotFound), http.StatusNotFound},
+		{"opaque error", errors.New("boom"), http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := echo.New()
+			h := Instrument(e, nethttp.WithEndpointMetrics())
+			e.GET("/echo/status", func(c echo.Context) error { return tc.err })
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/echo/status", nil))
+			if rec.Code != tc.want {
+				t.Fatalf("Echo answered %d, want %d — the test's premise is wrong", rec.Code, tc.want)
+			}
+			// And the recorded outcome must follow that same status.
+			wantOutcome := "success"
+			if tc.want >= 500 {
+				wantOutcome = "failure"
+			}
+			before := adaptertest.EndpointOutcome(adaptertest.Collect(t), "/echo/status", wantOutcome)
+			rec2 := httptest.NewRecorder()
+			h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/echo/status", nil))
+			if delta := adaptertest.EndpointOutcome(adaptertest.Collect(t), "/echo/status", wantOutcome) - before; delta != 1 {
+				t.Errorf("outcome=%s delta = %d, want 1 for a %d response", wantOutcome, delta, tc.want)
+			}
+		})
+	}
+}
+
+// A handler that already wrote 200 and then returns an error must not be recorded
+// as a failure: Echo's error handler bails out on Committed, so the client got 200.
+func TestCommittedResponseKeepsItsStatus(t *testing.T) {
+	e := echo.New()
+	h := Instrument(e, nethttp.WithEndpointMetrics())
+	e.GET("/echo/committed", func(c echo.Context) error {
+		_ = c.JSON(http.StatusOK, map[string]string{"ok": "yes"})
+		return errors.New("too late to matter")
+	})
+
+	before := adaptertest.EndpointOutcome(adaptertest.Collect(t), "/echo/committed", "failure")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/echo/committed", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("client saw %d, want 200", rec.Code)
+	}
+	if delta := adaptertest.EndpointOutcome(adaptertest.Collect(t), "/echo/committed", "failure") - before; delta != 0 {
+		t.Errorf("committed 200 recorded %d failures, want 0", delta)
 	}
 }

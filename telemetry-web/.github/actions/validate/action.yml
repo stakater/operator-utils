@@ -55,21 +55,12 @@ runs:
           (cd "$mod" && go test -race -count=1 -shuffle=on ./...)
         done
 
-    # go.work above builds the adapters against the in-tree core; this runs them
-    # against the core pseudo-version their go.mod actually pins, which is what
-    # consumers resolve. A stale pin cannot hide behind the workspace.
+    # Deliberately NOT a GOWORK=off build of the adapters against their pinned
+    # core. That check cannot pass on a PR that changes the core API, because the
+    # pin has to name a commit that only exists once the PR is merged. A gate that
+    # is red on every such PR teaches people to ignore gates, so it lives in the
+    # release workflow instead, where it can be satisfied. See
+    # docs/releasing.md.
     #
-    # Tests, not just a build: a pin stale enough to change behaviour rather than
-    # break compilation would pass a build-only check. The conformance suite comes
-    # from the pinned core too, so this is where a core/adapter contract drift
-    # shows up.
-    - name: Test adapters against published core pin
-      shell: bash
-      working-directory: telemetry-web
-      env:
-        GOWORK: "off"
-      run: |
-        for mod in adapters/gin adapters/echo adapters/chi; do
-          echo "--- test $mod (GOWORK=off)"
-          (cd "$mod" && go build ./... && go test -count=1 ./...)
-        done
+    # On a PR the workspace build above is the real signal: it compiles the
+    # adapters against the in-tree core, so a breaking core change fails here.

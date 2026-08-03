@@ -28,9 +28,15 @@ const (
 // than bare host:port; the two need different exporter options. A non-empty
 // scheme is not enough — "localhost:4317" parses with Scheme="localhost" — so
 // the test is that the scheme is followed by "://".
+//
+// The comparison is case-insensitive because url.Parse lowercases u.Scheme while
+// the input keeps its case, so "HTTP://host" would otherwise be classed as a bare
+// host and handed to WithEndpoint, which fails to parse and takes Init down with
+// an opaque net/url error.
 func hasScheme(endpoint string) bool {
 	u, err := url.Parse(endpoint)
-	return err == nil && u.Scheme != "" && strings.HasPrefix(endpoint, u.Scheme+"://")
+	return err == nil && u.Scheme != "" &&
+		strings.HasPrefix(strings.ToLower(endpoint), u.Scheme+"://")
 }
 
 // resolveProtocol reports which transport to export one signal over. The

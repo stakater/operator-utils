@@ -102,9 +102,21 @@ func main() {
 so global middleware must be installed first. The returned `handler` wraps the
 engine *by reference*, so routes you register afterward are still served.
 
-**Do not use `gin.Default()`** — it installs Gin's own recovery, which would catch
-panics before the telemetry recovery runs. Use `gin.New()` and add `gin.Logger()`
-yourself if you want request logging.
+**Do not use `gin.Default()`** — but not for the reason you might expect. Its
+`Use(Logger(), Recovery())` runs at construction, so `gin.Recovery` ends up
+*outside* `gintel.Recovery` and the telemetry recovery still sees handler panics
+first; the count stays at exactly 1.
+
+The real problem is that `gin.Recovery` has **no `http.ErrAbortHandler`
+exemption**. That sentinel means "drop this connection without a response", and
+`gintel.Recovery` re-raises it deliberately; `gin.Recovery` swallows it and turns it
+into a 500, so the connection is not dropped and you get a duplicate stack log.
+Use `gin.New()` and add `gin.Logger()` yourself if you want request logging.
+
+The configuration that genuinely breaks the panic metric is installing a framework
+recovery **after** `Instrument` — `engine.Use(gin.Recovery())` at that point is
+inner to `gintel.Recovery`, consumes the panic first, and leaves
+`http.server.panics` at zero. Neither adapter can detect this; do not do it.
 
 ---
 

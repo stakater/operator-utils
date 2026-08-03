@@ -7,6 +7,7 @@ It is *composition over OpenTelemetry*: it wires the OTel SDK, `otelhttp`, and
 web framework**; framework glue lives in separate adapter modules.
 
 - **Module:** `github.com/stakater/operator-utils/telemetry-web`
+- **Releasing:** [tag ordering and the pin invariant](releasing.md)
 - **Guides:** [Gin (via adapter)](guides/gin-adapter.md) · [Echo (via adapter)](guides/echo-adapter.md) · [chi (via adapter)](guides/chi-adapter.md) · [Echo (raw)](guides/echo-raw.md)
 
 ---
@@ -53,8 +54,9 @@ Dependency direction inside the module (no cycles):
 
 ```
 adapters/{gin,echo,chi} ─▶ nethttp ─▶ endpoint ─▶ logging ─▶ internal/scope
-telemetry (root) ────────▶ internal/rebind ─▶ logging
-endpoint ────────────────▶ internal/rebind, internal/version
+nethttp ─────────────────▶ logging
+telemetry (root) ────────▶ logging, internal/scope
+endpoint ────────────────▶ internal/version
 ```
 
 ---
@@ -156,7 +158,7 @@ move every existing deployment from 4317 to 4318.
 | `OTEL_TRACES_SAMPLER` | The sampler is fixed | `ParentBased(TraceIDRatioBased(ratio))`. `always_on`/`always_off` are ratios of 1 and 0; the `parentbased_*` variants are already the behaviour. |
 | `OTEL_PROPAGATORS` | The propagator is fixed | W3C `tracecontext` + `baggage`. b3/jaeger interop is not wireable. |
 | `OTEL_LOGS_EXPORTER` | No log export | Structured JSON on stdout, `trace_id` stamped. See `logging.SetDefault`. |
-| `OTEL_METRIC_EXPORT_INTERVAL` | Not plumbed | The SDK periodic reader default. |
+| `OTEL_SDK_DISABLED` | Not honored | Nothing is disabled; the spec kill switch is inert here. |
 
 Note `OTEL_TRACES_SAMPLER_ARG` **is** read even though `OTEL_TRACES_SAMPLER` is
 not, because the ratio is the one part of the sampler that is configurable.
@@ -178,7 +180,7 @@ high-value operations.
 | `endpoint.requests` | counter | `endpoint`, `outcome` (success\|failure) | `endpoint.Record` / `Instrument`; adapters only under `WithEndpointMetrics` |
 | `endpoint.duration` | histogram (s) | `endpoint`, `outcome` | `endpoint.Instrument` |
 | `http.server.panics` | counter | `http.route` (when known) | `endpoint.Recovered` / `endpoint.RecordPanic` |
-| `runtime.*` (goroutines, GC, heap…) | various | — | `contrib/runtime` |
+| `go.goroutine.count`, `go.memory.used`, `go.memory.allocated`, `go.memory.gc.goal`, `go.processor.limit`, `go.config.gogc` | various | — | `contrib/runtime` |
 
 \* `http.route` is populated on the duration metric (and the server span) by the
 framework adapters' `RouteTag()` middleware, which calls `nethttp.StampRoute`;
@@ -189,7 +191,7 @@ already gives request rate, and with `http.route` stamped it also gives the
 failure rate per route:
 
 ```promql
-sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
+sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
 ```
 
 That makes `endpoint.requests` a strict subset for HTTP, so the adapters
@@ -431,7 +433,7 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // packag
 
 ```go
 func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler // Recovery + RouteTag (+ Metrics when opted in) + nethttp.Handler
-func Recovery() gin.HandlerFunc  // panic -> endpoint.RecordPanic + 500 (ErrAbortHandler re-raised)
+func Recovery() gin.HandlerFunc  // panic -> endpoint.Recovered + 500 (ErrAbortHandler re-raised)
 func RouteTag() gin.HandlerFunc  // http.route (c.FullPath()) -> server span + duration metric
 func Metrics() gin.HandlerFunc   // endpoint.requests{endpoint,outcome} by matched route template
 ```
@@ -461,7 +463,7 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // packa
 
 ```go
 func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler // Recovery + RouteTag (+ Metrics when opted in) + nethttp.Handler
-func Recovery() echo.MiddlewareFunc  // panic -> endpoint.RecordPanic + 500 (ErrAbortHandler re-raised)
+func Recovery() echo.MiddlewareFunc  // panic -> endpoint.Recovered + 500 (ErrAbortHandler re-raised)
 func RouteTag() echo.MiddlewareFunc  // http.route (c.Path()) -> server span + duration metric
 func Metrics() echo.MiddlewareFunc   // endpoint.requests{endpoint,outcome} by matched route template
 ```
@@ -596,7 +598,8 @@ on it: an `http.Handler` built by `nethttp.Handler` **before** the re-`Init`
 - stops producing **`http.server.*` metrics**, because it resolves its meter once
   at construction and this library cannot reach inside it to rebind.
 
-`endpoint.*` metrics survive either way — that is what `internal/rebind` is for.
+`endpoint.*` metrics survive either way, because the `endpoint` package compares the
+global `MeterProvider` on each use and rebuilds its instruments when it changes.
 Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
 
 ---

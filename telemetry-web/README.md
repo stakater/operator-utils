@@ -150,7 +150,7 @@ handler type, ratio/endpoint resolution) — consumers never touch it.
   `nethttp.Handler(ginEngine)`.
 - **`Recovery(next http.Handler) http.Handler`**
   Exported separately for teams composing their own chain — it must sit **inside**
-  the `otelhttp` handler. `Handler` already includes it. It calls `endpoint.RecordPanic`
+  the `otelhttp` handler. `Handler` already includes it. It calls `endpoint.Recovered`
   then writes `500` **if nothing has been written yet**; it re-raises
   `http.ErrAbortHandler` for net/http to handle. The `ResponseWriter` it passes
   down keeps whatever optional interfaces the original had (`Flusher`,
@@ -181,7 +181,9 @@ handler type, ratio/endpoint resolution) — consumers never touch it.
   not the adapter's framework middleware either. Panics then escape to net/http
   (which closes the connection) and are not counted. Use it only when an outer
   layer recovers and calls `endpoint.RecordPanic` itself.
-- **`Skipped(ctx) bool`** / **`Resolve(opts ...Option) Settings`** — for adapters
+- **`Resolve(opts ...Option) Settings`** — adapter plumbing: lets an adapter's
+  `Instrument` learn which middleware to install from the same options it forwards
+  to `Handler`. Not needed when wiring by hand.
   and hand-rolled middleware that need the same decisions `Handler` made.
 
 ### Outbound HTTP (trace propagation) — `nethttp`
@@ -216,7 +218,7 @@ observation per call, both with the same two low-cardinality attributes:
 
 - **RPS per endpoint:** `sum by (endpoint) (rate(endpoint_requests_total[5m]))`
 - **Success/failure split:** add `outcome` to the `by(...)` clause.
-- **Latency:** `histogram_quantile(0.95, sum by (le, endpoint) (rate(endpoint_duration_bucket[5m])))`
+- **Latency:** `histogram_quantile(0.95, sum by (le, endpoint) (rate(endpoint_duration_seconds_bucket[5m])))`
 
 `endpoint.duration` is in **seconds**, with the same explicit bucket boundaries
 otelhttp uses for `http.server.request.duration` (5ms to 10s), so the two
@@ -348,7 +350,7 @@ Every adapter exposes the same four things:
 - **`Instrument(engine, opts ...nethttp.Option) http.Handler`** — installs the
   middleware below, wraps the engine in `nethttp.Handler`, and returns a plain
   `http.Handler` to serve. `nethttp` options are forwarded.
-- **`Recovery()`** — panic → `endpoint.RecordPanic` + `500`. Installed by
+- **`Recovery()`** — panic → `endpoint.Recovered` + `500`. Installed by
   `Instrument` on gin and echo; on chi it *is* `nethttp.Recovery`, which
   `Handler` already applies.
 - **`RouteTag()`** — stamps `http.route` on the span and the duration metric and
@@ -357,7 +359,8 @@ Every adapter exposes the same four things:
   template. Opt-in via `nethttp.WithEndpointMetrics()`.
 
 Ordering: **gin** and **chi** need `Instrument` *before* any route is registered
-and panic if you call it late, rather than instrumenting nothing. **Echo** applies
+and panic if you call it late, rather than instrumenting nothing — gin with its own
+message, chi via `chi.Mux.Use`. **Echo** applies
 `Use` middleware to routes registered either side of the call, so it doesn't care.
 
 All three classify outcome identically (`status >= 500` is a failure) via
@@ -375,7 +378,7 @@ rule and how the recovery layers fit together.
 | `http.server.request.duration` & other `http.server.*` | histogram/… | `otelhttp` (via `nethttp.Handler`); carries `http.route` once `RouteTag`/`StampRoute` runs |
 | `endpoint.requests`   | counter   | `endpoint.Instrument` / `endpoint.Record`, and adapters under `WithEndpointMetrics` (`endpoint`, `outcome`) |
 | `endpoint.duration`        | histogram | `endpoint.Instrument` (`endpoint`, `outcome`) |
-| `http.server.panics`       | counter   | `endpoint.RecordPanic` / `nethttp.Recovery` |
+| `http.server.panics`       | counter   | `endpoint.Recovered` / `nethttp.Recovery` |
 | runtime (goroutines/GC/heap) | gauges/counters | `contrib/runtime` (via `Init`)      |
 
 Metrics ↔ traces are correlated via **exemplars** (on by default when a sampled
@@ -389,7 +392,7 @@ route, method, and status code, and its `_count` gives you request and failure
 rates — a strict superset:
 
 ```promql
-sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
+sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
 ```
 
 The counter buys one simpler label pair (`endpoint`, `outcome`) at the cost of a
@@ -407,9 +410,12 @@ operations via `endpoint.Instrument`, where no `otelhttp` histogram exists.
 - **A skipped path loses inbound trace context.** `WithSkipPaths` filters before
   extraction, so a skipped path will not continue a caller's trace. Correct for
   probes, wrong for real paths.
-- **`Init` is once per process.** A second call without an intervening shutdown
-  returns `ErrAlreadyInitialized`; the runtime instrumentation has no `Stop`, so
-  re-registering it is not recoverable.
+- **`Init` is once per process, until you shut it down.** A second call without an
+  intervening shutdown returns `ErrAlreadyInitialized`, because the first pair of
+  providers would be orphaned with no path to `Shutdown`. After the returned
+  shutdown runs, `Init` may be called again. One caveat: a handler built before a
+  re-`Init` keeps producing spans but stops producing `http.server.*` metrics, since
+  `otelhttp` resolves its meter once at construction. Rebuild the handler.
 - Async boundaries (queues) and background goroutines don't carry `ctx` — pass it
   through, or inject/extract trace context in message metadata, to keep the trace
   alive.
@@ -438,20 +444,22 @@ against the in-tree core, otherwise a breaking core change stays invisible until
 after it is published.
 
 That means a core API change must be applied to the adapters in the same commit.
-CI builds both ways — once through the workspace and once with `GOWORK=off` —
-and **both are blocking**, so neither a broken adapter nor a stale pin can slip
-through:
+The **PR gate is the workspace build**, which compiles the adapters against the
+in-tree core, so a breaking core change fails there:
 
 ```sh
 cd telemetry-web/adapters/gin
-go build ./...              # against the in-tree core
+go build ./...              # against the in-tree core — the PR gate
 GOWORK=off go build ./...   # against the pinned core, as a consumer sees it
 ```
 
-There is a bootstrap consequence worth knowing: a core change that the adapters
-need cannot be pinned in the same commit, because the pseudo-version only exists
-once the core commit is pushed. Land the core change first, then repin in a
-follow-up commit — the `GOWORK=off` build is red in between, which is correct.
+The `GOWORK=off` form is deliberately **not** a PR gate. A core API change cannot be
+pinned in the same commit, because the pin has to name a commit that only exists
+once the PR is merged, so that check would be red on every such PR — and a gate
+expected to be red is one people learn to ignore. It runs at release time instead,
+where the invariant it enforces can actually be met: an adapter may not be tagged
+while its core requirement is a `v0.0.0-` pseudo-version. See
+[docs/releasing.md](docs/releasing.md) for the tag ordering.
 
 Repin with:
 

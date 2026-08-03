@@ -3,10 +3,12 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
@@ -19,7 +21,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
@@ -84,6 +85,12 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		}
 	}()
 
+	// Cleaning up after a failure must not itself depend on ctx still being live.
+	// A provider whose Shutdown is refused for a cancelled or expired context
+	// latches itself shut without stopping its goroutines, and nothing can stop
+	// them afterwards.
+	cleanupCtx := context.WithoutCancel(ctx)
+
 	// Routes SDK-internal failures (export refused, queue full, spans dropped)
 	// into the consumer's logger. Without this they go to otel's default handler,
 	// which prints to stderr and so produces exactly the second, differently
@@ -140,7 +147,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 
 	reader, err := newMetricReader(ctx, cfg)
 	if err != nil {
-		_ = tp.Shutdown(ctx)
+		_ = tp.Shutdown(cleanupCtx)
 		return nil, err
 	}
 	mp := sdkmetric.NewMeterProvider(
@@ -149,15 +156,11 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	)
 	otel.SetMeterProvider(mp)
 
-	// Cached instruments must be rebuilt now, or they stay bound to whatever was
-	// global before this point. See the rebind package.
-	rebind.Notify()
-
 	// Bound to mp rather than the global provider: contrib registers its
 	// callbacks through mp's meter, so mp.Shutdown retires them along with it.
 	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
-		_ = mp.Shutdown(ctx)
-		_ = tp.Shutdown(ctx)
+		_ = mp.Shutdown(cleanupCtx)
+		_ = tp.Shutdown(cleanupCtx)
 		return nil, err
 	}
 
@@ -167,7 +170,9 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	var shutdownErr error
 	return func(shutdownCtx context.Context) error {
 		once.Do(func() {
-			shutdownErr = errors.Join(tp.Shutdown(shutdownCtx), mp.Shutdown(shutdownCtx))
+			flushCtx, cancel := flushContext(shutdownCtx)
+			defer cancel()
+			shutdownErr = errors.Join(tp.Shutdown(flushCtx), mp.Shutdown(flushCtx))
 			retire()
 
 			initMu.Lock()
@@ -178,16 +183,38 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	}, nil
 }
 
-// retire puts the process back in its pre-Init state: noop providers, no log
-// scope, and cached instruments rebuilt against the noops. Used both by shutdown
-// and by a failed Init, so a lingering goroutine writes into a noop rather than
-// into a dead pipeline. Notify is required because existing instruments never
-// re-resolve their provider on their own; see the rebind package.
+// flushFloor bounds a flush whose caller left it unbounded, or handed over a
+// context that was already cancelled or expired. Long enough for one OTLP attempt,
+// short enough not to stall a pod past its termination grace period.
+const flushFloor = 5 * time.Second
+
+// flushContext derives the context a provider Shutdown runs under: the caller's
+// deadline if it is still in the future, and never the caller's cancellation.
+//
+// Cancellation has to be dropped because TracerProvider.Shutdown marks itself shut
+// down BEFORE flushing and then returns at its first ctx.Done() check, leaving the
+// batch processor unflushed AND unstoppable by any later call. The idiomatic caller
+// passes the signal context SIGTERM just cancelled, so honoring it would lose every
+// pending span on every graceful shutdown.
+//
+// The deadline is kept, because that is how a caller bounds how long exit may
+// stall; only when there is none, or it has already passed, does the floor apply.
+func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	uncancellable := context.WithoutCancel(ctx)
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) > 0 {
+		return context.WithDeadline(uncancellable, dl)
+	}
+	return context.WithTimeout(uncancellable, flushFloor)
+}
+
+// retire puts the process back in its pre-Init state: noop providers and no log
+// scope. Used both by shutdown and by a failed Init, so a lingering goroutine
+// writes into a noop rather than into a dead pipeline. Cached instruments follow
+// on their own, because they compare the global provider on each use.
 func retire() {
 	otel.SetTracerProvider(tracenoop.NewTracerProvider())
 	otel.SetMeterProvider(metricnoop.NewMeterProvider())
 	scope.Set("")
-	rebind.Notify()
 }
 
 // resolveRatio: config value if set, else OTEL_TRACES_SAMPLER_ARG, else 1.0.
@@ -215,6 +242,14 @@ func resolveRatio(cfg Config) float64 {
 	case err != nil:
 		logging.Logger().Warn("telemetry: ignoring unparseable sampler argument; sampling every trace",
 			"var", v, "value", arg, "err", err)
+		return 1.0
+	case math.IsNaN(r):
+		// ParseFloat accepts "NaN", and NaN compares false against every bound, so
+		// it would slip past the range check below and reach TraceIDRatioBased,
+		// whose float-to-uint conversion is implementation defined for it. An unset
+		// Helm value is a plausible source.
+		logging.Logger().Warn("telemetry: ignoring NaN sampler argument; sampling every trace",
+			"var", v, "value", arg)
 		return 1.0
 	case r < 0 || r > 1:
 		// TraceIDRatioBased clamps, so behaviour is fine; the config is not.

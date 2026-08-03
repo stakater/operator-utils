@@ -6,6 +6,7 @@ package nethttp
 import (
 	"bufio"
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -32,8 +33,6 @@ type config struct {
 // Settings is the resolved option set. Adapters call Resolve to learn which
 // middleware their Instrument should install.
 type Settings struct {
-	// SkipPaths are the exact paths excluded from instrumentation.
-	SkipPaths []string
 	// Recovery reports whether the built-in recovery middleware is installed.
 	Recovery bool
 	// EndpointMetrics reports whether WithEndpointMetrics was requested.
@@ -48,9 +47,6 @@ func Resolve(opts ...Option) Settings {
 		opt(&cfg)
 	}
 	return Settings{
-		// Copied: the caller must not be able to reach back into the config a
-		// Handler built from the same options is using.
-		SkipPaths:       append([]string(nil), cfg.skipPaths...),
 		Recovery:        !cfg.noRecover,
 		EndpointMetrics: cfg.endpointMetrics,
 	}
@@ -86,9 +82,15 @@ func WithSkipPaths(paths ...string) Option {
 
 // WithoutRecovery installs no recovery at all — not Handler's, and not the
 // framework middleware an adapter's Instrument would add, since that consults
-// Resolve too. Panics then escape to net/http, which closes the connection
-// without a response, and http.server.panics is not incremented. Only pass it
-// when an outer layer recovers and calls endpoint.RecordPanic itself.
+// Resolve too. Only pass it when an outer layer recovers and calls
+// endpoint.RecordPanic itself.
+//
+// A panic then escapes otelhttp, which costs more than the panic counter: its only
+// deferred work is span.End(), so the status, the response attributes, the span
+// rename and the metric record are all skipped. The span ends Unset with no
+// response attributes and the request contributes NO http.server.* metrics at all,
+// which makes a service panicking on every request look like it is serving zero
+// traffic. The same applies on the ErrAbortHandler re-raise path.
 func WithoutRecovery() Option {
 	return func(c *config) { c.noRecover = true }
 }
@@ -97,10 +99,10 @@ func WithoutRecovery() Option {
 // inside the router (which otelhttp's own filter cannot reach) can bail out too.
 type skipKey struct{}
 
-// Skipped reports whether this request's path was excluded via WithSkipPaths.
-// Adapter metrics middleware consults it; otelhttp's filter handles the span
-// and http.server.* metrics on its own.
-func Skipped(ctx context.Context) bool {
+// skipped reports whether this request's path was excluded via WithSkipPaths.
+// Unexported: RecordRoute and StampRoute consult it for their callers, so nothing
+// outside this package ever needs to ask.
+func skipped(ctx context.Context) bool {
 	v, _ := ctx.Value(skipKey{}).(bool)
 	return v
 }
@@ -110,24 +112,29 @@ func Skipped(ctx context.Context) bool {
 // call endpoint.RecordPanic and endpoint.Record from their own middleware.
 // Every path is instrumented unless excluded via WithSkipPaths.
 func Handler(next http.Handler, opts ...Option) http.Handler {
-	s := Resolve(opts...)
+	// The config directly, not via Resolve: Handler is the one caller that needs
+	// the skip paths themselves, and Settings deliberately does not carry them.
+	cfg := config{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 
 	inner := next
-	if s.Recovery {
+	if !cfg.noRecover {
 		inner = Recovery(next)
 	}
 
 	// otelhttp reads the globals in its own defaults, so passing them here
 	// would only restate them.
 	instrumented := otelhttp.NewHandler(inner, "server",
-		otelhttp.WithFilter(func(r *http.Request) bool { return !Skipped(r.Context()) }),
+		otelhttp.WithFilter(func(r *http.Request) bool { return !skipped(r.Context()) }),
 	)
 
-	if len(s.SkipPaths) == 0 {
+	if len(cfg.skipPaths) == 0 {
 		return instrumented
 	}
-	skip := make(map[string]bool, len(s.SkipPaths))
-	for _, p := range s.SkipPaths {
+	skip := make(map[string]bool, len(cfg.skipPaths))
+	for _, p := range cfg.skipPaths {
 		skip[p] = true
 	}
 	// Marking outside otelhttp is what lets both its filter and the adapters'
@@ -159,6 +166,19 @@ func trackWrites(w http.ResponseWriter) (wrapped http.ResponseWriter, responded 
 		// A hijacked connection is no longer ours to write a status to.
 		Hijack: func(next httpsnoop.HijackFunc) httpsnoop.HijackFunc {
 			return func() (net.Conn, *bufio.ReadWriter, error) { wrote = true; return next() }
+		},
+		// Flush and ReadFrom also commit an implicit 200 in net/http, and
+		// httpsnoop.Wrap passes unhooked methods straight through — so without
+		// these, io.Copy(w, src) or an SSE handler that flushes its headers leaves
+		// wrote false and a later panic makes Recovery call WriteHeader(500)
+		// pointlessly. otelhttp tracks the real status either way, so the only
+		// symptom is a "superfluous response.WriteHeader" line from net/http, but
+		// there is no reason to emit it.
+		Flush: func(next httpsnoop.FlushFunc) httpsnoop.FlushFunc {
+			return func() { wrote = true; next() }
+		},
+		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+			return func(src io.Reader) (int64, error) { wrote = true; return next(src) }
 		},
 	})
 	return wrapped, func() bool { return wrote }
@@ -237,7 +257,7 @@ func routeAttrs(ctx context.Context) []attribute.KeyValue {
 // Adapters call this from their Metrics middleware; call it directly when
 // wiring a framework by hand.
 func RecordRoute(ctx context.Context, route string, status int) {
-	if route == "" || Skipped(ctx) {
+	if route == "" || skipped(ctx) {
 		return
 	}
 	endpoint.Record(ctx, route, status >= 500)
@@ -268,7 +288,7 @@ var warnNoLabeler sync.Once
 // WithSkipPaths(DefaultSkipPaths...) setup would warn about a wiring mistake on
 // the first health probe.
 func StampRoute(ctx context.Context, method, route string) {
-	if Skipped(ctx) {
+	if skipped(ctx) {
 		return
 	}
 	attr := semconv.HTTPRoute(route)

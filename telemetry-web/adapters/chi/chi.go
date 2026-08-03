@@ -25,6 +25,14 @@ type Middleware = func(http.Handler) http.Handler
 //
 // No Recovery is installed here: chitel.Recovery IS nethttp.Recovery, which
 // Handler already applies, so adding it would count every panic twice.
+//
+// Do NOT add chi's middleware.Recoverer either, idiomatic as it is. Registered on
+// the mux it is always inner to nethttp.Recovery, which sits outside, so it
+// consumes the panic first and the recorded telemetry inverts relative to gin and
+// echo: http.server.panics stays at 0, the span carries no error, and because
+// Metrics returns normally the request lands on
+// endpoint.requests{outcome=failure} instead. Leave the recovering to
+// nethttp.Handler, or own it with nethttp.WithoutRecovery().
 func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler {
 	s := nethttp.Resolve(opts...)
 	r.Use(RouteTag())
@@ -34,7 +42,7 @@ func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler {
 	return nethttp.Handler(r, opts...)
 }
 
-// Recovery forwards panics to endpoint.RecordPanic and responds 500, with
+// Recovery forwards panics to endpoint.Recovered and responds 500, with
 // http.ErrAbortHandler re-raised. chi middleware is plain net/http chaining, so
 // this is literally nethttp.Recovery. Instrument does not install it; use it
 // only when building a chain without nethttp.Handler, or alongside

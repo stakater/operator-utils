@@ -1,6 +1,6 @@
 // Package endpoint records per-endpoint request metrics and panics against the
 // global OpenTelemetry meter. Instruments are created lazily on first use and
-// rebuilt whenever telemetry.Init installs new global providers.
+// rebuilt whenever the global MeterProvider changes.
 package endpoint
 
 import (
@@ -14,7 +14,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/internal/version"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
@@ -36,8 +35,15 @@ type instruments struct {
 // histograms are directly comparable.
 var durationBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10}
 
+// bound pairs an instrument set with the MeterProvider it was created from, so a
+// provider swap is noticed by comparison rather than by notification.
+type bound struct {
+	mp metric.MeterProvider
+	i  *instruments
+}
+
 var (
-	current atomic.Pointer[instruments]
+	current atomic.Pointer[bound]
 	buildMu sync.Mutex
 	// warnOnce is replaced on every rebuild, so the warning is once per provider
 	// generation rather than once per process: a failure against the second
@@ -47,41 +53,42 @@ var (
 	warnOnce = new(sync.Once)
 )
 
-func init() {
-	// Without this the instruments would stay bound to whichever provider was
-	// global on first use; see the rebind package for why.
-	rebind.On(rebuild)
-}
-
-// get returns the current instruments, building them on first use.
+// get returns instruments bound to the MeterProvider that is global right now,
+// rebuilding them when it has changed.
+//
+// The provider has to be re-checked rather than cached once: otel's global meter
+// delegates to the first real provider installed and never re-delegates, so an
+// instrument set kept across a provider swap would go on writing into the retired
+// one. Comparing the provider per call keeps them current, and it does so for any
+// installer, not only telemetry.Init.
+//
+// The comparison assumes a comparable MeterProvider. Every implementation in the
+// SDK is a pointer or an empty struct; a provider declared as a struct containing
+// a map or slice would panic here.
 func get() *instruments {
-	if i := current.Load(); i != nil {
-		return i
+	mp := otel.GetMeterProvider()
+	if b := current.Load(); b != nil && b.mp == mp {
+		return b.i
 	}
 	buildMu.Lock()
 	defer buildMu.Unlock()
-	if i := current.Load(); i != nil {
-		return i
+	if b := current.Load(); b != nil && b.mp == mp {
+		return b.i
 	}
-	i := build()
-	current.Store(i)
-	return i
-}
-
-// rebuild recreates the instruments against the current global MeterProvider,
-// unbinding them from any earlier one.
-func rebuild() {
-	buildMu.Lock()
-	defer buildMu.Unlock()
 	warnOnce = new(sync.Once)
-	current.Store(build())
+	b := &bound{mp: mp, i: build(mp)}
+	current.Store(b)
+	return b.i
 }
 
 // build creates the instrument set from whatever MeterProvider is global now.
-// A creation failure is warned about once per process and leaves that
+// A creation failure is warned about once per provider generation and leaves that
 // instrument nil, so the corresponding metric is skipped rather than panicking.
-func build() *instruments {
-	m := otel.GetMeterProvider().Meter(
+//
+// mp is passed in rather than read from the global so it is the same provider get
+// compared against, with no window for a swap in between.
+func build(mp metric.MeterProvider) *instruments {
+	m := mp.Meter(
 		version.ModulePath,
 		metric.WithInstrumentationVersion(version.Version()),
 	)
