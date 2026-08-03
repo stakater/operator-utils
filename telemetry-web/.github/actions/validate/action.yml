@@ -55,14 +55,12 @@ runs:
           (cd "$mod" && go test -race -count=1 -shuffle=on ./...)
         done
 
-    # The pins in each adapter's go.mod are what consumers resolve, so they get
-    # built too. Expected to fail until the first coordinated release: the
-    # adapters here call core API that this PR adds and has not published yet.
-    # Flip to a hard failure once the pins point at a release tag.
+    # go.work above builds the adapters against the in-tree core; this builds
+    # them against the core pseudo-version their go.mod actually pins, which is
+    # what consumers resolve. A stale pin cannot hide behind the workspace.
     - name: Build adapters against published core pin
       shell: bash
       working-directory: telemetry-web
-      continue-on-error: true
       env:
         GOWORK: "off"
       run: |

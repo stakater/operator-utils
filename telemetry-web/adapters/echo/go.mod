@@ -1,6 +1,6 @@
 module github.com/stakater/operator-utils/telemetry-web/adapters/echo
 
-go 1.26.4
+go 1.25.0
 
 require github.com/labstack/echo/v4 v4.13.3
 
@@ -19,7 +19,7 @@ require (
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260731103224-879b5e7aa8d7
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260803074602-1a8b64b4d44a
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

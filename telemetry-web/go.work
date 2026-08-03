@@ -4,7 +4,7 @@
 //
 // The pins in each adapter's go.mod are what consumers actually get, so CI also
 // builds with GOWORK=off to keep verifying them.
-go 1.26.4
+go 1.25.0
 
 use (
 	.

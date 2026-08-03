@@ -1,10 +1,10 @@
 module github.com/stakater/operator-utils/telemetry-web/adapters/gin
 
-go 1.26.4
+go 1.25.0
 
 require (
 	github.com/gin-gonic/gin v1.10.0
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260731103224-879b5e7aa8d7
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260803074602-1a8b64b4d44a
 )
 
 require (

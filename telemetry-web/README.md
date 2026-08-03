@@ -423,8 +423,9 @@ against the in-tree core, otherwise a breaking core change stays invisible until
 after it is published.
 
 That means a core API change must be applied to the adapters in the same commit.
-CI builds both ways, once through the workspace and once with `GOWORK=off`, so
-neither a broken adapter nor a stale pin can slip through:
+CI builds both ways — once through the workspace and once with `GOWORK=off` —
+and **both are blocking**, so neither a broken adapter nor a stale pin can slip
+through:
 
 ```sh
 cd telemetry-web/adapters/gin
@@ -432,4 +433,17 @@ go build ./...              # against the in-tree core
 GOWORK=off go build ./...   # against the pinned core, as a consumer sees it
 ```
 
-The pins are bumped to a release tag once the core is tagged.
+There is a bootstrap consequence worth knowing: a core change that the adapters
+need cannot be pinned in the same commit, because the pseudo-version only exists
+once the core commit is pushed. Land the core change first, then repin in a
+follow-up commit — the `GOWORK=off` build is red in between, which is correct.
+
+Repin with:
+
+```sh
+cd telemetry-web/adapters/gin
+GOWORK=off go get github.com/stakater/operator-utils/telemetry-web@<sha>
+GOWORK=off go mod tidy
+```
+
+Once the core carries a release tag, pin to the tag instead of a pseudo-version.
