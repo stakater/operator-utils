@@ -23,6 +23,11 @@
 //
 // Every subtest issues its own requests and asserts on deltas, so subtests may
 // be run individually or in any order.
+//
+// Not parallel-safe. The reader and span recorder are process-wide globals shared
+// by every helper, and Reset clears spans for whoever calls it next, so an adapter
+// author must not add t.Parallel() to a test that uses these helpers. The metric
+// deltas would interleave and the span assertions would see another test's spans.
 package adaptertest
 
 import (
@@ -65,10 +70,22 @@ const (
 // between each.
 const StreamBody = "abc"
 
-// Route is a GET route the adapter must register on its engine.
+// Route is a route the adapter must register on its engine.
 type Route struct {
 	Template string
 	Behavior Behavior
+	// Method defaults to GET when empty. The same Template may appear more than
+	// once with different methods.
+	Method string
+}
+
+// MethodOf returns the HTTP method a Route must be registered for. Adapters call
+// it instead of reading Method directly, so an empty value keeps meaning GET.
+func MethodOf(r Route) string {
+	if r.Method == "" {
+		return http.MethodGet
+	}
+	return r.Method
 }
 
 // SkipPath is the exact path the suite excludes via nethttp.WithSkipPaths. The
@@ -165,24 +182,27 @@ func PanicCount(rm metricdata.ResourceMetrics) int64 {
 	return total
 }
 
+// PanicCountForRoute returns the cumulative http.server.panics count carrying
+// http.route=route.
+func PanicCountForRoute(rm metricdata.ResourceMetrics, route string) int64 {
+	var total int64
+	eachSum(rm, "http.server.panics", func(dp metricdata.DataPoint[int64]) {
+		if v, ok := dp.Attributes.Value(attribute.Key("http.route")); ok && v.AsString() == route {
+			total += dp.Value
+		}
+	})
+	return total
+}
+
 // DurationCount returns the cumulative http.server.request.duration observation
 // count carrying http.route=route.
 func DurationCount(rm metricdata.ResourceMetrics, route string) uint64 {
 	var total uint64
-	for _, sm := range rm.ScopeMetrics {
-		for _, mtr := range sm.Metrics {
-			if mtr.Name != "http.server.request.duration" {
-				continue
-			}
-			if h, ok := mtr.Data.(metricdata.Histogram[float64]); ok {
-				for _, dp := range h.DataPoints {
-					if v, ok := dp.Attributes.Value(attribute.Key("http.route")); ok && v.AsString() == route {
-						total += dp.Count
-					}
-				}
-			}
+	eachHist(rm, "http.server.request.duration", func(dp metricdata.HistogramDataPoint[float64]) {
+		if v, ok := dp.Attributes.Value(attribute.Key("http.route")); ok && v.AsString() == route {
+			total += dp.Count
 		}
-	}
+	})
 	return total
 }
 
@@ -190,18 +210,9 @@ func DurationCount(rm metricdata.ResourceMetrics, route string) uint64 {
 // count across all attribute sets.
 func DurationTotal(rm metricdata.ResourceMetrics) uint64 {
 	var total uint64
-	for _, sm := range rm.ScopeMetrics {
-		for _, mtr := range sm.Metrics {
-			if mtr.Name != "http.server.request.duration" {
-				continue
-			}
-			if h, ok := mtr.Data.(metricdata.Histogram[float64]); ok {
-				for _, dp := range h.DataPoints {
-					total += dp.Count
-				}
-			}
-		}
-	}
+	eachHist(rm, "http.server.request.duration", func(dp metricdata.HistogramDataPoint[float64]) {
+		total += dp.Count
+	})
 	return total
 }
 
@@ -211,10 +222,20 @@ func RouteOnDuration(rm metricdata.ResourceMetrics, route string) bool {
 	return DurationCount(rm, route) > 0
 }
 
+// ended returns the spans recorded since the last Reset. Setup installs the
+// recorder, so forgetting it in TestMain would otherwise nil-panic here instead of
+// producing the same clear message Collect gives.
+func ended() []sdktrace.ReadOnlySpan {
+	if spans == nil {
+		panic("adaptertest.Setup was not called from TestMain")
+	}
+	return spans.Ended()
+}
+
 // RouteOnSpan reports whether any span recorded since the last Reset carries
 // http.route=route.
 func RouteOnSpan(route string) bool {
-	for _, s := range spans.Ended() {
+	for _, s := range ended() {
 		for _, kv := range s.Attributes() {
 			if kv.Key == "http.route" && kv.Value.AsString() == route {
 				return true
@@ -227,7 +248,7 @@ func RouteOnSpan(route string) bool {
 // SpanNamed reports whether any span recorded since the last Reset has the
 // given name.
 func SpanNamed(name string) bool {
-	for _, s := range spans.Ended() {
+	for _, s := range ended() {
 		if s.Name() == name {
 			return true
 		}
@@ -236,7 +257,7 @@ func SpanNamed(name string) bool {
 }
 
 // SpanCount returns the number of spans recorded since the last Reset.
-func SpanCount() int { return len(spans.Ended()) }
+func SpanCount() int { return len(ended()) }
 
 func eachSum(rm metricdata.ResourceMetrics, name string, fn func(metricdata.DataPoint[int64])) {
 	for _, sm := range rm.ScopeMetrics {
@@ -253,8 +274,27 @@ func eachSum(rm metricdata.ResourceMetrics, name string, fn func(metricdata.Data
 	}
 }
 
+func eachHist(rm metricdata.ResourceMetrics, name string, fn func(metricdata.HistogramDataPoint[float64])) {
+	for _, sm := range rm.ScopeMetrics {
+		for _, mtr := range sm.Metrics {
+			if mtr.Name != name {
+				continue
+			}
+			if h, ok := mtr.Data.(metricdata.Histogram[float64]); ok {
+				for _, dp := range h.DataPoints {
+					fn(dp)
+				}
+			}
+		}
+	}
+}
+
 func get(h http.Handler, path string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodGet, path, nil)
+	return do(h, http.MethodGet, path)
+}
+
+func do(h http.Handler, method, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -277,6 +317,8 @@ func get(h http.Handler, path string) *httptest.ResponseRecorder {
 //   - http.ErrAbortHandler is re-raised untouched and not counted
 //   - the ResponseWriter reaching the handler still implements http.Flusher, so
 //     SSE and other streaming responses work through the instrumented chain
+//   - the panic counter carries http.route, so a spike names an endpoint
+//   - POST, HEAD, and OPTIONS are instrumented the same as GET, span name included
 func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 	if reader == nil {
 		t.Fatal("adaptertest.Setup was not called from TestMain")
@@ -289,6 +331,7 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 	clientT := cfg.rewrite("/conf/client/:id")
 	panicT, abortT := cfg.rewrite("/conf/panic/:id"), cfg.rewrite("/conf/abort")
 	streamT := cfg.rewrite("/conf/stream")
+	methodT := cfg.rewrite("/conf/method")
 
 	h := build([]Route{
 		{Template: okT, Behavior: OK},
@@ -298,6 +341,11 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		{Template: abortT, Behavior: PanicAbort},
 		{Template: streamT, Behavior: Stream},
 		{Template: SkipPath, Behavior: OK},
+		// Same template, three methods: everything else in the suite is a GET, so
+		// nothing would notice a chain that only works for one method.
+		{Template: methodT, Behavior: OK, Method: http.MethodPost},
+		{Template: methodT, Behavior: OK, Method: http.MethodHead},
+		{Template: methodT, Behavior: OK, Method: http.MethodOptions},
 	},
 		nethttp.WithEndpointMetrics(),
 		nethttp.WithSkipPaths(SkipPath),
@@ -364,6 +412,43 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		get(h, "/conf/panic/1")
 		if !RouteOnSpan(panicT) {
 			t.Error("panicked request lost http.route on its span")
+		}
+	})
+
+	// A panic spike is only actionable if the counter says which endpoint spiked.
+	t.Run("PanicCounterCarriesRoute", func(t *testing.T) {
+		Reset()
+		before := PanicCountForRoute(Collect(t), panicT)
+		get(h, "/conf/panic/1")
+		if delta := PanicCountForRoute(Collect(t), panicT) - before; delta != 1 {
+			t.Errorf("http.server.panics{http.route=%q} delta = %d, want 1", panicT, delta)
+		}
+	})
+
+	// Every other case here is a GET, so a chain that mishandled another method
+	// would go unnoticed. HEAD in particular is where response-writer wrapping
+	// tends to break.
+	t.Run("NonGETMethodsInstrumented", func(t *testing.T) {
+		for _, method := range []string{http.MethodPost, http.MethodHead, http.MethodOptions} {
+			t.Run(method, func(t *testing.T) {
+				Reset()
+				before := Collect(t)
+				if rec := do(h, method, "/conf/method"); rec.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200", rec.Code)
+				}
+				after := Collect(t)
+				if got := EndpointOutcome(after, methodT, "success") - EndpointOutcome(before, methodT, "success"); got != 1 {
+					t.Errorf("success delta = %d, want 1", got)
+				}
+				if DurationCount(after, methodT)-DurationCount(before, methodT) != 1 {
+					t.Error("http.route not stamped on http.server.request.duration")
+				}
+				// The span name is "{method} {route}", so the method has to reach
+				// StampRoute rather than being hardcoded to GET.
+				if want := method + " " + methodT; !SpanNamed(want) {
+					t.Errorf("server span not named %q", want)
+				}
+			})
 		}
 	})
 

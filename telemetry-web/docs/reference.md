@@ -36,11 +36,11 @@ web framework**; framework glue lives in separate adapter modules.
 ```
                           ┌──────────────────────────────────────────┐
   main() ── Init(cfg) ───▶│ global TracerProvider / MeterProvider /   │
-                          │ propagator / resource / sampler / runtime │──▶ OTLP/gRPC ──▶ Collector
+                          │ propagator / resource / sampler / runtime │──▶ OTLP ──▶ Collector
                           └──────────────────────────────────────────┘
   inbound   nethttp.Handler(engine) ─ otelhttp span+metrics ─ recovery ─▶ your routes
   outbound  nethttp.HTTPClient().Do(req) ─ injects traceparent ─▶ next hop
-  in-handler endpoint.Instrument / endpoint.Record / endpoint.RecordPanic
+  in-handler endpoint.Instrument / endpoint.Record / endpoint.Recovered
   logs      logging.Logger().InfoContext(ctx, …)  (trace_id/span_id stamped)
 ```
 
@@ -104,7 +104,7 @@ type Config struct {
     Environment    string   // optional — deployment.environment.name (e.g. "prod")
     OTLPEndpoint   string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317
     SampleRatio    *float64 // optional — nil = use env/default; a set pointer (incl. &0.0) is used verbatim
-    Insecure       bool     // gRPC without TLS (dev/local collector)
+    Insecure       bool     // export without TLS (dev/local collector)
 }
 ```
 
@@ -114,21 +114,52 @@ type Config struct {
 | Trace sample ratio | `SampleRatio` (`*float64`) | `OTEL_TRACES_SAMPLER_ARG` | `1.0` |
 | TLS | `Insecure` (set `true` to disable) | — | TLS on |
 | Resource attributes | `ServiceName`/`ServiceVersion`/`Environment` | `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` | process/host/SDK detectors |
-| OTLP protocol | — | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (only supported value; others warn, do not fail) |
+| OTLP protocol | — | `OTEL_EXPORTER_OTLP_PROTOCOL` (+ per-signal) | `grpc` |
 
 **Precedence:** `Config` field → env var → built-in default. For `SampleRatio`,
 `nil` means "unset" (fall through to env/default); to sample no new roots pass a
 pointer to `0.0`. Sampling is `ParentBased(TraceIDRatioBased(ratio))`, so a
 service always honors an upstream sampling decision and you never get half a
-trace.
+trace. An unparseable `OTEL_TRACES_SAMPLER_ARG` is warned about and ignored rather
+than silently becoming `1.0`, since failing open to full-volume export on a typo
+costs money.
 
 `ServiceName` is required — `Init` returns an error if it is empty.
 
-**OTLP/gRPC only.** `OTEL_EXPORTER_OTLP_PROTOCOL` (and the per-signal variants)
-should be `grpc` or unset. Any other value logs a warning naming the variable and
-`Init` still succeeds: the OpenTelemetry Operator injects this variable into pods,
-frequently as `http/protobuf`, and failing Init would let a pod-spec change
-crash-loop a previously healthy service. Telemetry degrades, the service serves.
+### OTLP transport
+
+`OTEL_EXPORTER_OTLP_PROTOCOL`, and the per-signal
+`OTEL_EXPORTER_OTLP_{TRACES,METRICS}_PROTOCOL` which take precedence over it:
+
+| Value | Exporter | Default port |
+| --- | --- | --- |
+| unset | gRPC | 4317 |
+| `grpc` | gRPC | 4317 |
+| `http/protobuf` | HTTP | 4318 |
+| `http/json` | HTTP, with a warning | 4318 |
+| anything else | gRPC, with a warning | 4317 |
+
+The OpenTelemetry Operator's auto-instrumentation injects this variable into pods,
+usually as `http/protobuf`, which is why both transports are built. `http/json` is
+served over `http/protobuf`: the Go SDK ships no JSON encoder, and a collector's
+OTLP/HTTP receiver takes protobuf on the same port, so this reaches the intended
+endpoint instead of falling back to a different one.
+
+**Unset means `grpc`, not the spec's `http/protobuf`.** A deliberate deviation:
+gRPC was this library's only transport, and following the spec here would silently
+move every existing deployment from 4317 to 4318.
+
+### Env vars this library does not read
+
+| Variable | Why | What you get instead |
+| --- | --- | --- |
+| `OTEL_TRACES_SAMPLER` | The sampler is fixed | `ParentBased(TraceIDRatioBased(ratio))`. `always_on`/`always_off` are ratios of 1 and 0; the `parentbased_*` variants are already the behaviour. |
+| `OTEL_PROPAGATORS` | The propagator is fixed | W3C `tracecontext` + `baggage`. b3/jaeger interop is not wireable. |
+| `OTEL_LOGS_EXPORTER` | No log export | Structured JSON on stdout, `trace_id` stamped. See `logging.SetDefault`. |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Not plumbed | The SDK periodic reader default. |
+
+Note `OTEL_TRACES_SAMPLER_ARG` **is** read even though `OTEL_TRACES_SAMPLER` is
+not, because the ratio is the one part of the sampler that is configurable.
 
 ---
 
@@ -146,7 +177,7 @@ high-value operations.
 | `http.server.active_requests` | up/down counter | method, scheme | `otelhttp` |
 | `endpoint.requests` | counter | `endpoint`, `outcome` (success\|failure) | `endpoint.Record` / `Instrument`; adapters only under `WithEndpointMetrics` |
 | `endpoint.duration` | histogram (s) | `endpoint`, `outcome` | `endpoint.Instrument` |
-| `http.server.panics` | counter | — | `endpoint.RecordPanic` |
+| `http.server.panics` | counter | `http.route` (when known) | `endpoint.Recovered` / `endpoint.RecordPanic` |
 | `runtime.*` (goroutines, GC, heap…) | various | — | `contrib/runtime` |
 
 \* `http.route` is populated on the duration metric (and the server span) by the
@@ -257,7 +288,8 @@ re-delegates, so an instrument created earlier would stay bound to it forever.)
 ```go
 func Instrument(ctx context.Context, name string) func(err *error)
 func Record(ctx context.Context, name string, failed bool)
-func RecordPanic(ctx context.Context, recovered any)
+func Recovered(ctx context.Context, recovered any, attrs ...attribute.KeyValue) bool
+func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue)
 ```
 
 **`Instrument`** — the ergonomic hand-instrumentation helper, and the intended
@@ -281,11 +313,41 @@ through `nethttp.RecordRoute`, which applies the shared `status >= 500` rule:
 endpoint.Record(ctx, "/api/v1/tenants/:id", resp.StatusCode >= 500)
 ```
 
-**`RecordPanic`** — records an exception + stack on the active span, logs at
-error with `trace_id`, and increments `http.server.panics`. It does **not**
-re-raise or write a response — your recovery middleware decides how to respond.
+**`Recovered`** — the whole recovery decision for a framework that has its own
+middleware. `false` means the value is `http.ErrAbortHandler` and the caller must
+re-panic it; `true` means it was recorded. Every adapter's recovery is this one
+call plus a framework-specific 500, so a new framework gets identical semantics for
+free:
+
+```go
+defer func() {
+    if rec := recover(); rec != nil {
+        if !endpoint.Recovered(ctx, rec, semconv.HTTPRoute(matchedTemplate)) {
+            panic(rec)
+        }
+        // ... respond 500 the framework's way ...
+    }
+}()
+```
+
+**`RecordPanic`** — records an exception + stack on the active span, logs at error
+with `trace_id` **and a `stack` field**, and increments `http.server.panics` with
+`attrs`. The stack is on the log as well as the span because a span carries nothing
+when tracing is off, the trace was not sampled, or the collector is unreachable,
+and a panic is the one event where the stack is the point. It does **not** re-raise
+or write a response, and does not filter `ErrAbortHandler`; prefer `Recovered`.
+
+Pass the matched route template in `attrs` so a panic spike names an endpoint.
+Nothing is derived from the request automatically: a raw path or method would be
+unbounded and blow up the series count.
+
 `name` on `Record`/`Instrument` must be a **low-cardinality constant** (a route
 template or a stable operation name), never a raw path or an id.
+
+`endpoint.duration` uses explicit second-scale buckets (5ms to 10s), matching
+otelhttp's `http.server.request.duration` so the two are comparable. The SDK
+default boundaries are millisecond-scale and would put every operation under five
+seconds in one bucket.
 
 ---
 
@@ -518,6 +580,24 @@ _ = shutdown(sctx)
 Note: shutting down flushes a final metric export; against an unreachable
 collector `shutdown` may return a non-nil error — that is expected on teardown
 and generally safe to log-and-ignore.
+
+`shutdown` is idempotent, and after it runs the globals are back on noop providers
+with the log scope cleared, so a goroutine that outlives it writes into a noop
+rather than into a dead pipeline. A failed `Init` restores the same state, so a
+caller that logs the error and keeps serving gets a service that records nothing
+rather than one wired to a provider it already shut down.
+
+### Re-`Init` after shutdown
+
+Supported, but with one caveat worth knowing before you build a config-reload path
+on it: an `http.Handler` built by `nethttp.Handler` **before** the re-`Init`
+
+- keeps producing **spans**, because otelhttp resolves its tracer per request, and
+- stops producing **`http.server.*` metrics**, because it resolves its meter once
+  at construction and this library cannot reach inside it to rebind.
+
+`endpoint.*` metrics survive either way — that is what `internal/rebind` is for.
+Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
 
 ---
 

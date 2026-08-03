@@ -182,6 +182,27 @@ func TestWrapClientAndTransportFallback(t *testing.T) {
 	}
 }
 
+// Wrapping twice would nest one otelhttp transport in another and inject the
+// propagation headers twice. Easy to reach: a helper that wraps defensively plus a
+// caller that already used HTTPClient().
+func TestWrapClientIsIdempotent(t *testing.T) {
+	c := &http.Client{}
+	WrapClient(c)
+	first := c.Transport
+
+	WrapClient(c)
+	if c.Transport != first {
+		t.Error("a second WrapClient re-wrapped the transport, double-injecting trace headers")
+	}
+
+	// An already-instrumented client from HTTPClient must be left alone too.
+	hc := HTTPClient()
+	before := hc.Transport
+	if WrapClient(hc).Transport != before {
+		t.Error("WrapClient re-wrapped an HTTPClient transport")
+	}
+}
+
 // optionalIfaces reports which optional ResponseWriter interfaces reach the
 // handler. Uses a real server: httptest.ResponseRecorder is a Flusher but never
 // a Hijacker, which would hide exactly the regression this guards.

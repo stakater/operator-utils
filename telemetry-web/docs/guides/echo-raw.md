@@ -20,7 +20,7 @@ The building blocks, all from the core:
 | --- | --- |
 | setup | `telemetry.Init` |
 | server spans + `http.server.*` metrics + panic backstop | `nethttp.Handler(e)` |
-| panic recording | `endpoint.RecordPanic` |
+| panic recording | `endpoint.Recovered` |
 | per-endpoint metrics | `endpoint.Record` (or `endpoint.Instrument`) |
 | outbound propagation | `nethttp.HTTPClient` / `WrapClient` |
 | trace-correlated logs | `logging.Logger` |
@@ -131,8 +131,10 @@ func main() {
 
 ## 3. Recovery middleware
 
-Forward panics to `endpoint.RecordPanic`, respond `500`, and re-raise
-`http.ErrAbortHandler` so net/http handles it.
+`endpoint.Recovered` is the whole decision: it records the panic and returns
+`false` only for `http.ErrAbortHandler`, which you must re-panic so net/http
+handles it. Using it rather than `RecordPanic` directly is what keeps a hand-wired
+framework behaving identically to the adapters.
 
 ```go
 func TelemetryRecovery() echo.MiddlewareFunc {
@@ -140,10 +142,10 @@ func TelemetryRecovery() echo.MiddlewareFunc {
         return func(c echo.Context) error {
             defer func() {
                 if rec := recover(); rec != nil {
-                    if rec == http.ErrAbortHandler {
+                    // Pass the matched template so a panic spike names an endpoint.
+                    if !endpoint.Recovered(c.Request().Context(), rec, semconv.HTTPRoute(c.Path())) {
                         panic(rec)
                     }
-                    endpoint.RecordPanic(c.Request().Context(), rec)
                     _ = c.NoContent(http.StatusInternalServerError)
                 }
             }()

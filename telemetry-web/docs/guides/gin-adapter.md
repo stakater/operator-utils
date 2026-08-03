@@ -151,7 +151,7 @@ sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
 > `nethttp.WithoutRecovery()` suppresses **both**, not just `nethttp.Handler`'s.
 > The chain is then left with no recovery at all: panics escape to net/http and
 > are not counted. Only pass it when an outer layer recovers and calls
-> `endpoint.RecordPanic` itself.
+> `endpoint.Recovered` itself.
 
 ---
 
@@ -162,7 +162,7 @@ If you maintain your own middleware chain, use the pieces directly instead of
 
 ```go
 engine := gin.New()
-engine.Use(gintel.Recovery()) // panic -> RecordPanic + 500
+engine.Use(gintel.Recovery()) // panic -> Recovered + 500
 engine.Use(gintel.RouteTag()) // http.route -> span + duration metric
 engine.Use(gintel.Metrics())  // per-endpoint metrics by route template (optional)
 // ... your other middleware, then routes ...

@@ -55,16 +55,21 @@ runs:
           (cd "$mod" && go test -race -count=1 -shuffle=on ./...)
         done
 
-    # go.work above builds the adapters against the in-tree core; this builds
-    # them against the core pseudo-version their go.mod actually pins, which is
-    # what consumers resolve. A stale pin cannot hide behind the workspace.
-    - name: Build adapters against published core pin
+    # go.work above builds the adapters against the in-tree core; this runs them
+    # against the core pseudo-version their go.mod actually pins, which is what
+    # consumers resolve. A stale pin cannot hide behind the workspace.
+    #
+    # Tests, not just a build: a pin stale enough to change behaviour rather than
+    # break compilation would pass a build-only check. The conformance suite comes
+    # from the pinned core too, so this is where a core/adapter contract drift
+    # shows up.
+    - name: Test adapters against published core pin
       shell: bash
       working-directory: telemetry-web
       env:
         GOWORK: "off"
       run: |
         for mod in adapters/gin adapters/echo adapters/chi; do
-          echo "--- build $mod (GOWORK=off)"
-          (cd "$mod" && go build ./...)
+          echo "--- test $mod (GOWORK=off)"
+          (cd "$mod" && go build ./... && go test -count=1 ./...)
         done

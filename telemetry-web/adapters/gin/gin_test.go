@@ -19,29 +19,37 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func handlerFor(b adaptertest.Behavior) gin.HandlerFunc {
+	switch b {
+	case adaptertest.OK:
+		return func(c *gin.Context) { c.String(http.StatusOK, "ok") }
+	case adaptertest.Fail500:
+		return func(c *gin.Context) { c.String(http.StatusInternalServerError, "boom") }
+	case adaptertest.Fail400:
+		return func(c *gin.Context) { c.String(http.StatusBadRequest, "bad") }
+	case adaptertest.Panic:
+		return func(c *gin.Context) { panic("kaboom") }
+	case adaptertest.PanicAbort:
+		return func(c *gin.Context) { panic(http.ErrAbortHandler) }
+	case adaptertest.Stream:
+		return func(c *gin.Context) {
+			for i := range len(adaptertest.StreamBody) {
+				_, _ = c.Writer.WriteString(adaptertest.StreamBody[i : i+1])
+				c.Writer.Flush()
+			}
+		}
+	default:
+		// Silently skipping an unknown Behavior would leave the route
+		// unregistered and the conformance case asserting on a 404.
+		panic("unhandled adaptertest.Behavior")
+	}
+}
+
 func buildGin(routes []adaptertest.Route, opts ...nethttp.Option) http.Handler {
 	e := gin.New()
 	h := Instrument(e, opts...)
 	for _, r := range routes {
-		switch r.Behavior {
-		case adaptertest.OK:
-			e.GET(r.Template, func(c *gin.Context) { c.String(http.StatusOK, "ok") })
-		case adaptertest.Fail500:
-			e.GET(r.Template, func(c *gin.Context) { c.String(http.StatusInternalServerError, "boom") })
-		case adaptertest.Fail400:
-			e.GET(r.Template, func(c *gin.Context) { c.String(http.StatusBadRequest, "bad") })
-		case adaptertest.Panic:
-			e.GET(r.Template, func(c *gin.Context) { panic("kaboom") })
-		case adaptertest.PanicAbort:
-			e.GET(r.Template, func(c *gin.Context) { panic(http.ErrAbortHandler) })
-		case adaptertest.Stream:
-			e.GET(r.Template, func(c *gin.Context) {
-				for i := range len(adaptertest.StreamBody) {
-					_, _ = c.Writer.WriteString(adaptertest.StreamBody[i : i+1])
-					c.Writer.Flush()
-				}
-			})
-		}
+		e.Handle(adaptertest.MethodOf(r), r.Template, handlerFor(r.Behavior))
 	}
 	return h
 }

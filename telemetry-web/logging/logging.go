@@ -32,7 +32,13 @@ type logHandler struct {
 // NewLogHandler wraps base so every record carries trace_id, span_id, and
 // service.name pulled from the context / scope (when present). The stamps stay
 // top-level regardless of WithGroup nesting.
+//
+// base must not be nil. Panicking here rather than on the first record keeps the
+// failure at the wiring line that caused it.
 func NewLogHandler(base slog.Handler) slog.Handler {
+	if base == nil {
+		panic("logging.NewLogHandler: base handler is nil")
+	}
 	return &logHandler{base: base, applied: base}
 }
 

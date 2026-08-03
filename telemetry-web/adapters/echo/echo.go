@@ -11,6 +11,8 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 
 	"github.com/stakater/operator-utils/telemetry-web/endpoint"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
@@ -36,25 +38,34 @@ func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler {
 	return nethttp.Handler(e, opts...)
 }
 
-// Recovery forwards panics to endpoint.RecordPanic and responds 500. Use it
-// instead of Echo's middleware.Recover, which would swallow the panic before
-// telemetry sees it. http.ErrAbortHandler is re-raised.
+// Recovery forwards panics to endpoint.Recovered, tagging the panic counter with
+// the matched route, and responds 500. Use it instead of Echo's
+// middleware.Recover, which would swallow the panic before telemetry sees it.
+// http.ErrAbortHandler is re-raised.
 func Recovery() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			defer func() {
 				if rec := recover(); rec != nil {
-					// Sentinel arrives by identity, never wrapped.
-					if rec == http.ErrAbortHandler { //nolint:errorlint
+					if !endpoint.Recovered(c.Request().Context(), rec, routeAttrs(c)...) {
 						panic(rec)
 					}
-					endpoint.RecordPanic(c.Request().Context(), rec)
 					_ = c.NoContent(http.StatusInternalServerError)
 				}
 			}()
 			return next(c)
 		}
 	}
+}
+
+// routeAttrs tags the panic counter with the matched template, so a spike points
+// at an endpoint. Empty for an unmatched request, which keeps 404 scans from
+// creating a time series each.
+func routeAttrs(c echo.Context) []attribute.KeyValue {
+	if route := c.Path(); route != "" {
+		return []attribute.KeyValue{semconv.HTTPRoute(route)}
+	}
+	return nil
 }
 
 // RouteTag stamps http.route (c.Path()) on the server span and the duration

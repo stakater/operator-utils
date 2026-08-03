@@ -1,6 +1,8 @@
-// Package telemetry provides two-call OpenTelemetry setup for Go services:
-// traces + metrics + trace-correlated logs, exported over OTLP/gRPC. Call Init
-// once in main; the returned shutdown flushes providers.
+// Package telemetry provides two-call OpenTelemetry setup for Go services. Traces
+// and metrics are exported over OTLP, gRPC by default and http/protobuf when
+// OTEL_EXPORTER_OTLP_PROTOCOL asks for it. Logs are NOT exported: they go to
+// structured JSON on stdout, correlated by trace_id, unless logging.SetDefault
+// redirects them. Call Init once in main; the returned shutdown flushes providers.
 //
 // Setup (net/http):
 //
@@ -18,6 +20,7 @@
 //	logging.SetDefault(l)                     redirect what the library logs
 //	endpoint.Instrument(ctx, name)(&err)      count + time a named operation
 //	endpoint.Record(ctx, name, failed)        count only, outcome already known
+//	endpoint.Recovered(ctx, recovered)        the shared recovery rule (false => re-panic)
 //	endpoint.RecordPanic(ctx, recovered)      panic -> span + log + counter
 //	nethttp.Handler / nethttp.Recovery        inbound spans/metrics/recovery
 //	nethttp.StampRoute(ctx, method, route)    http.route on the span + metrics

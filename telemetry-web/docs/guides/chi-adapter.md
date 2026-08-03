@@ -120,7 +120,7 @@ For every matched route, with **zero per-handler code**:
 >
 > `nethttp.WithoutRecovery()` therefore leaves the chain with no recovery at all:
 > panics escape to net/http and are not counted. Only pass it when an outer layer
-> recovers and calls `endpoint.RecordPanic` itself.
+> recovers and calls `endpoint.Recovered` itself.
 
 ---
 

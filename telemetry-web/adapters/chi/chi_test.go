@@ -42,8 +42,12 @@ func handlerFor(b adaptertest.Behavior) http.HandlerFunc {
 				w.(http.Flusher).Flush()
 			}
 		}
-	default:
+	case adaptertest.OK:
 		return func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }
+	default:
+		// A default that quietly behaved like OK would let a new Behavior added to
+		// the suite pass here while testing nothing.
+		panic("unhandled adaptertest.Behavior")
 	}
 }
 
@@ -51,7 +55,7 @@ func buildChi(routes []adaptertest.Route, opts ...nethttp.Option) http.Handler {
 	r := chi.NewRouter()
 	h := Instrument(r, opts...)
 	for _, rt := range routes {
-		r.Get(rt.Template, handlerFor(rt.Behavior))
+		r.Method(adaptertest.MethodOf(rt), rt.Template, handlerFor(rt.Behavior))
 	}
 	return h
 }

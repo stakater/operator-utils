@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
@@ -55,7 +56,13 @@ var (
 // Calling Init twice without an intervening shutdown returns
 // ErrAlreadyInitialized. The returned shutdown is safe to call more than once;
 // after it runs, Init may be called again (tests rely on this).
-func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) {
+//
+// Re-Init caveat: an http.Handler built by nethttp.Handler before the re-Init
+// keeps producing spans, because otelhttp resolves the tracer per request, but
+// stops producing http.server.* metrics, because it resolves its meter once at
+// construction and this library cannot reach inside it to rebind. Rebuild the
+// handler after a re-Init if you depend on those metrics.
+func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, retErr error) {
 	if cfg.ServiceName == "" {
 		return nil, errors.New("telemetry: Config.ServiceName is required")
 	}
@@ -65,6 +72,26 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	if initialized {
 		return nil, ErrAlreadyInitialized
 	}
+
+	// Init mutates process-wide state (the globals, the propagator, the log
+	// scope) before anything can fail, so a failure has to put it all back.
+	// Otherwise the overwhelmingly common caller reaction — log the error and
+	// keep serving — leaves the service wired to a shut-down pipeline instead of
+	// to a noop.
+	defer func() {
+		if retErr != nil {
+			retire()
+		}
+	}()
+
+	// Routes SDK-internal failures (export refused, queue full, spans dropped)
+	// into the consumer's logger. Without this they go to otel's default handler,
+	// which prints to stderr and so produces exactly the second, differently
+	// formatted log stream logging.SetDefault exists to avoid. Set before the
+	// exporters are built so their errors are caught too.
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		logging.Logger().Error("telemetry: sdk error", "err", err)
+	}))
 
 	scope.Set(cfg.ServiceName)
 
@@ -126,9 +153,8 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	// global before this point. See the rebind package.
 	rebind.Notify()
 
-	// Bound to mp rather than the global provider, so mp.Shutdown retires the
-	// runtime callbacks with it. The contrib package exposes no Stop, which is
-	// the other reason Init refuses to run twice.
+	// Bound to mp rather than the global provider: contrib registers its
+	// callbacks through mp's meter, so mp.Shutdown retires them along with it.
 	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
 		_ = mp.Shutdown(ctx)
 		_ = tp.Shutdown(ctx)
@@ -142,12 +168,7 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	return func(shutdownCtx context.Context) error {
 		once.Do(func() {
 			shutdownErr = errors.Join(tp.Shutdown(shutdownCtx), mp.Shutdown(shutdownCtx))
-			// Retire the globals too, so a lingering goroutine writes into a
-			// noop rather than a dead pipeline. Notify because existing
-			// instruments never re-resolve their provider on their own.
-			otel.SetTracerProvider(tracenoop.NewTracerProvider())
-			otel.SetMeterProvider(metricnoop.NewMeterProvider())
-			rebind.Notify()
+			retire()
 
 			initMu.Lock()
 			initialized = false
@@ -157,15 +178,48 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	}, nil
 }
 
+// retire puts the process back in its pre-Init state: noop providers, no log
+// scope, and cached instruments rebuilt against the noops. Used both by shutdown
+// and by a failed Init, so a lingering goroutine writes into a noop rather than
+// into a dead pipeline. Notify is required because existing instruments never
+// re-resolve their provider on their own; see the rebind package.
+func retire() {
+	otel.SetTracerProvider(tracenoop.NewTracerProvider())
+	otel.SetMeterProvider(metricnoop.NewMeterProvider())
+	scope.Set("")
+	rebind.Notify()
+}
+
 // resolveRatio: config value if set, else OTEL_TRACES_SAMPLER_ARG, else 1.0.
+//
+// Only the _ARG variable is read. OTEL_TRACES_SAMPLER itself is not: the sampler
+// is always ParentBased(TraceIDRatioBased(ratio)), so always_on and always_off
+// are expressible as ratios of 1 and 0 and the parentbased_* variants are already
+// the behaviour. See docs/reference.md for the full list of env vars this library
+// does not read.
+//
+// A bad value is warned about and ignored rather than being allowed through.
+// Silently falling back to 1.0 on a typo would turn a sampling config into
+// full-volume export, which is a cost incident rather than a no-op.
 func resolveRatio(cfg Config) float64 {
 	if cfg.SampleRatio != nil {
 		return *cfg.SampleRatio
 	}
-	if arg := os.Getenv("OTEL_TRACES_SAMPLER_ARG"); arg != "" {
-		if r, err := strconv.ParseFloat(arg, 64); err == nil {
-			return r
-		}
+	const v = "OTEL_TRACES_SAMPLER_ARG"
+	arg := strings.TrimSpace(os.Getenv(v))
+	if arg == "" {
+		return 1.0
 	}
-	return 1.0
+	r, err := strconv.ParseFloat(arg, 64)
+	switch {
+	case err != nil:
+		logging.Logger().Warn("telemetry: ignoring unparseable sampler argument; sampling every trace",
+			"var", v, "value", arg, "err", err)
+		return 1.0
+	case r < 0 || r > 1:
+		// TraceIDRatioBased clamps, so behaviour is fine; the config is not.
+		logging.Logger().Warn("telemetry: sampler argument out of range, clamped to [0,1]",
+			"var", v, "value", arg)
+	}
+	return r
 }

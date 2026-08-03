@@ -12,6 +12,7 @@ import (
 
 	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -47,7 +48,9 @@ func Resolve(opts ...Option) Settings {
 		opt(&cfg)
 	}
 	return Settings{
-		SkipPaths:       cfg.skipPaths,
+		// Copied: the caller must not be able to reach back into the config a
+		// Handler built from the same options is using.
+		SkipPaths:       append([]string(nil), cfg.skipPaths...),
 		Recovery:        !cfg.noRecover,
 		EndpointMetrics: cfg.endpointMetrics,
 	}
@@ -171,11 +174,10 @@ func Recovery(next http.Handler) http.Handler {
 		tracked, responded := trackWrites(w)
 		defer func() {
 			if p := recover(); p != nil {
-				// Sentinel arrives by identity, never wrapped.
-				if p == http.ErrAbortHandler { //nolint:errorlint
+				ctx := r.Context()
+				if !endpoint.Recovered(ctx, p, routeAttrs(ctx)...) {
 					panic(p)
 				}
-				endpoint.RecordPanic(r.Context(), p)
 				// A handler that panicked mid-stream already sent its status;
 				// a second write would only be log noise.
 				if !responded() {
@@ -198,10 +200,31 @@ func Transport(base http.RoundTripper) http.RoundTripper {
 // HTTPClient returns a client whose Transport already propagates trace context.
 func HTTPClient() *http.Client { return &http.Client{Transport: Transport(nil)} }
 
-// WrapClient adds propagation to an existing client in place.
+// WrapClient adds propagation to an existing client, in place, and returns it so
+// it can be used inline. Calling it twice on the same client would nest one
+// otelhttp transport inside another and inject the headers twice, so a client
+// that is already wrapped is left alone.
 func WrapClient(c *http.Client) *http.Client {
-	c.Transport = Transport(c.Transport)
+	if _, ok := c.Transport.(*otelhttp.Transport); !ok {
+		c.Transport = Transport(c.Transport)
+	}
 	return c
+}
+
+// routeAttrs recovers http.route from the otelhttp labeler, where StampRoute put
+// it. Recovery runs outside the router, so at recover time the labeler is the
+// only place the matched template can still be read from.
+func routeAttrs(ctx context.Context) []attribute.KeyValue {
+	labeler, ok := otelhttp.LabelerFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	for _, kv := range labeler.Get() {
+		if kv.Key == semconv.HTTPRouteKey {
+			return []attribute.KeyValue{kv}
+		}
+	}
+	return nil
 }
 
 // RecordRoute emits one endpoint.requests data point for a matched route. It is
@@ -221,7 +244,10 @@ func RecordRoute(ctx context.Context, route string, status int) {
 }
 
 // warnNoLabeler fires at most once per process: the condition is a wiring
-// mistake, not a per-request event.
+// mistake, not a per-request event. Deliberately NOT reset when Init installs new
+// providers, unlike endpoint's instrument warning — whether a labeler reaches
+// StampRoute depends on how the chain was built, which no re-Init changes, so
+// re-arming it could only repeat the same message.
 var warnNoLabeler sync.Once
 
 // StampRoute puts http.route on the active server span and on the otelhttp
@@ -233,7 +259,18 @@ var warnNoLabeler sync.Once
 // The request must be inside Handler. Without the otelhttp labeler in ctx the
 // span attribute still lands but the metric one is dropped, and a warning is
 // logged once.
+//
+// A path excluded via WithSkipPaths returns immediately. otelhttp's filter
+// short-circuits before it injects the labeler, so a skipped request has neither
+// a labeler nor a recording span and there is nothing here to stamp — but the
+// adapters' RouteTag still runs, because a skip path is a registered route with a
+// real template. Without this the recommended
+// WithSkipPaths(DefaultSkipPaths...) setup would warn about a wiring mistake on
+// the first health probe.
 func StampRoute(ctx context.Context, method, route string) {
+	if Skipped(ctx) {
+		return
+	}
 	attr := semconv.HTTPRoute(route)
 	labeler, ok := otelhttp.LabelerFromContext(ctx)
 	if !ok {

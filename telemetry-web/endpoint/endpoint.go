@@ -28,10 +28,23 @@ type instruments struct {
 	panics   metric.Int64Counter
 }
 
+// durationBounds are the explicit second-scale buckets for endpoint.duration.
+// Without advice the SDK applies its default boundaries, which start at 5 and
+// run to 10000 — sane for milliseconds, useless for a unit of seconds, where
+// every operation under five seconds falls in one bucket and the quantiles say
+// nothing. These match otelhttp's http.server.request.duration set, so the two
+// histograms are directly comparable.
+var durationBounds = []float64{0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10}
+
 var (
-	current  atomic.Pointer[instruments]
-	buildMu  sync.Mutex
-	warnOnce sync.Once
+	current atomic.Pointer[instruments]
+	buildMu sync.Mutex
+	// warnOnce is replaced on every rebuild, so the warning is once per provider
+	// generation rather than once per process: a failure against the second
+	// MeterProvider must not be hidden by one that already fired against the
+	// first. Guarded by buildMu, which every build path holds. A pointer because
+	// assigning a sync.Once by value copies a lock.
+	warnOnce = new(sync.Once)
 )
 
 func init() {
@@ -60,6 +73,7 @@ func get() *instruments {
 func rebuild() {
 	buildMu.Lock()
 	defer buildMu.Unlock()
+	warnOnce = new(sync.Once)
 	current.Store(build())
 }
 
@@ -85,6 +99,7 @@ func build() *instruments {
 	i.duration, err = m.Float64Histogram("endpoint.duration",
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of a named operation, split by success/failure outcome."),
+		metric.WithExplicitBucketBoundaries(durationBounds...),
 	)
 	if err != nil {
 		i.duration, errs = nil, append(errs, err)

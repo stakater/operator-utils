@@ -22,9 +22,10 @@ import (
 > **`telemetry`** — a hyphen is not a legal Go identifier. Refer to it as
 > `telemetry.Init`, no alias needed.
 
-Telemetry is exported over **OTLP/gRPC only** to an OpenTelemetry Collector. Logs
-go to structured JSON on stdout with `trace_id` stamped in, unless you redirect
-them with `logging.SetDefault`.
+Traces and metrics are exported over **OTLP** to an OpenTelemetry Collector, gRPC
+by default and `http/protobuf` when `OTEL_EXPORTER_OTLP_PROTOCOL` asks for it.
+Logs are **not** exported: they go to structured JSON on stdout with `trace_id`
+stamped in, unless you redirect them with `logging.SetDefault`.
 
 ## Documentation
 
@@ -87,27 +88,34 @@ else is optional and falls back to standard `OTEL_*` env vars, then defaults.
 | `Environment`    | `string`   | Optional `"prod"`/`"staging"`/… Omitted from the resource when empty.   |
 | `OTLPEndpoint`   | `string`   | Optional collector endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT`.   |
 | `SampleRatio`    | `*float64` | `nil` = unset; a non-nil pointer is used verbatim, **including `0`** to never sample new roots. |
-| `Insecure`       | `bool`     | gRPC without TLS (local/dev collector).                                 |
+| `Insecure`       | `bool`     | Export without TLS (local/dev collector).                               |
 
 **Environment variables** (config fields take precedence):
 
-- `OTEL_EXPORTER_OTLP_ENDPOINT` — collector address (default `localhost:4317`).
-  Spec URL form (`http://host:4317`) and bare `host:port` are both accepted.
+- `OTEL_EXPORTER_OTLP_ENDPOINT` — collector address (default `localhost:4317` for
+  gRPC, `localhost:4318` for HTTP). Spec URL form (`http://host:4317`) and bare
+  `host:port` are both accepted.
 - `OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT` — per-signal overrides.
-- `OTEL_TRACES_SAMPLER_ARG` — head-sampling ratio (default `1.0`).
+- `OTEL_EXPORTER_OTLP_PROTOCOL` and its per-signal variants — `grpc` or
+  `http/protobuf`, per-signal wins. Unset means `grpc`.
+- `OTEL_TRACES_SAMPLER_ARG` — head-sampling ratio (default `1.0`). An
+  unparseable value is warned about and ignored.
 - `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` — merged into the resource;
   explicit `Config` fields win.
 
-**Not supported:** `OTEL_EXPORTER_OTLP_PROTOCOL` (and its per-signal variants).
-This library builds gRPC exporters only. Any other value logs a warning naming
-the variable; `Init` still succeeds and the service still boots — telemetry just
-will not reach the collector.
+The OpenTelemetry Operator's auto-instrumentation injects
+`OTEL_EXPORTER_OTLP_PROTOCOL` into pods, usually as `http/protobuf`, so both
+transports are built and the variable selects one. `http/json` is warned about and
+served over `http/protobuf` — the Go SDK has no JSON encoder, and a collector's
+OTLP/HTTP receiver accepts protobuf on the same port.
 
-> Worth knowing before you deploy: the OpenTelemetry Operator's
-> auto-instrumentation injects `OTEL_EXPORTER_OTLP_PROTOCOL` into pods, often as
-> `http/protobuf`. That is why this warns instead of failing — a library whose job
-> is observability must not be able to crash-loop the service it observes. If you
-> see that warning, point the variable at a gRPC (OTLP) receiver or remove it.
+Note the deliberate deviation from the spec: unset resolves to `grpc`, not the
+spec default of `http/protobuf`. Following the spec here would silently move every
+existing deployment from port 4317 to 4318.
+
+**Not read:** `OTEL_TRACES_SAMPLER` (the sampler is always
+`ParentBased(TraceIDRatioBased(ratio))`) and `OTEL_PROPAGATORS` (always W3C
+tracecontext + baggage). See [the reference](docs/reference.md) for the full list.
 
 Sampling is `ParentBased(TraceIDRatioBased(ratio))`, so a service honors an upstream
 sampling decision — you never get half a trace.
@@ -210,6 +218,10 @@ observation per call, both with the same two low-cardinality attributes:
 - **Success/failure split:** add `outcome` to the `by(...)` clause.
 - **Latency:** `histogram_quantile(0.95, sum by (le, endpoint) (rate(endpoint_duration_bucket[5m])))`
 
+`endpoint.duration` is in **seconds**, with the same explicit bucket boundaries
+otelhttp uses for `http.server.request.duration` (5ms to 10s), so the two
+histograms are directly comparable and the quantile above is meaningful.
+
 > `Instrument` is aimed at **non-HTTP** operations, which have no `otelhttp`
 > histogram covering them. For HTTP handlers served through `nethttp.Handler`,
 > `http.server.request.duration` already records latency per route.
@@ -264,21 +276,24 @@ logging.SetDefault(slog.New(logging.NewLogHandler(myHandler)))
 
 ### Panic recording (custom frameworks) — `endpoint`
 
-- **`RecordPanic(ctx, recovered any)`** — records the exception on the active span,
-  logs at error with `trace_id`, and increments `http.server.panics`. `nethttp.Recovery`
-  calls this for you; call it directly from your own framework's recovery
-  middleware (it does **not** re-raise or write a response — you decide how to
-  respond). Gin example:
+- **`Recovered(ctx, recovered any, attrs ...attribute.KeyValue) bool`** — the whole
+  recovery decision in one call: `false` means the value is `http.ErrAbortHandler`
+  and you must re-panic it, `true` means it was recorded. Prefer this over calling
+  `RecordPanic` yourself, so your framework applies the same rule the adapters do.
+- **`RecordPanic(ctx, recovered any, attrs ...attribute.KeyValue)`** — records the
+  exception + stack on the active span, logs at error with `trace_id` and a stack,
+  and increments `http.server.panics` with `attrs`. Pass the matched route
+  template so a panic spike names an endpoint. It does **not** re-raise or write a
+  response, and does not filter `ErrAbortHandler` either.
 
 ```go
 func telemetryRecovery() gin.HandlerFunc {
     return func(c *gin.Context) {
         defer func() {
             if rec := recover(); rec != nil {
-                if rec == http.ErrAbortHandler {
-                    panic(rec)
+                if !endpoint.Recovered(c.Request.Context(), rec, semconv.HTTPRoute(c.FullPath())) {
+                    panic(rec) // ErrAbortHandler: drop the connection, do not count it
                 }
-                endpoint.RecordPanic(c.Request.Context(), rec)
                 c.AbortWithStatus(http.StatusInternalServerError)
             }
         }()

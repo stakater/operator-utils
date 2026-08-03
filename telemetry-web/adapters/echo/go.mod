@@ -2,12 +2,14 @@ module github.com/stakater/operator-utils/telemetry-web/adapters/echo
 
 go 1.25.0
 
-require github.com/labstack/echo/v4 v4.13.3
+require (
+	github.com/labstack/echo/v4 v4.13.3
+	go.opentelemetry.io/otel v1.44.0
+)
 
 require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
-	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.44.0 // indirect
 )
 

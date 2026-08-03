@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -142,6 +142,61 @@ func histogram(t *testing.T, reader *sdkmetric.ManualReader, name, outcome strin
 		}
 	}
 	return count, sum, found
+}
+
+// The histogram is in seconds, so it needs explicit boundaries: the SDK default
+// set starts at 5 and runs to 10000, which puts every operation faster than five
+// seconds in one bucket and makes every quantile meaningless. Nothing else in the
+// suite would notice the advice being dropped.
+func TestDurationHistogramBuckets(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	resetInstruments()
+
+	var err error
+	Instrument(context.Background(), "orders.get")(&err)
+
+	var rm metricdata.ResourceMetrics
+	if cErr := reader.Collect(context.Background(), &rm); cErr != nil {
+		t.Fatalf("collect: %v", cErr)
+	}
+
+	var dp metricdata.HistogramDataPoint[float64]
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "endpoint.duration" {
+				continue
+			}
+			if m.Unit != "s" {
+				t.Errorf("unit = %q, want \"s\"", m.Unit)
+			}
+			h := m.Data.(metricdata.Histogram[float64])
+			dp, found = h.DataPoints[0], true
+		}
+	}
+	if !found {
+		t.Fatal("endpoint.duration not recorded")
+	}
+
+	if !slices.Equal(dp.Bounds, durationBounds) {
+		t.Errorf("bounds = %v, want %v", dp.Bounds, durationBounds)
+	}
+	// The sub-millisecond observation above must land in the first bucket, which
+	// is what the default boundaries got wrong.
+	if dp.BucketCounts[0] != 1 {
+		t.Errorf("a sub-millisecond observation landed in bucket %v, not the first: counts=%v",
+			firstNonZero(dp.BucketCounts), dp.BucketCounts)
+	}
+}
+
+func firstNonZero(counts []uint64) int {
+	for i, c := range counts {
+		if c > 0 {
+			return i
+		}
+	}
+	return -1
 }
 
 // Instrument is the one API that records latency, which is the whole point of
@@ -320,10 +375,11 @@ func TestInstrumentFailureWarningNamesTheErrors(t *testing.T) {
 	logging.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	t.Cleanup(func() { logging.SetDefault(nil) })
 
-	// warnOnce is process-wide, so drive build() directly rather than relying on
-	// this being the first failure in the run.
+	// No manual reset: rebuild re-arms warnOnce per provider generation, so this
+	// warns even though an earlier test in the run already triggered one. That is
+	// the point — a failure against this provider must not be hidden by a warning
+	// that fired against a previous one.
 	otel.SetMeterProvider(failingProvider{})
-	warnOnce = sync.Once{}
 	rebind.Notify()
 
 	out := buf.String()

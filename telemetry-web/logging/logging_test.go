@@ -170,3 +170,14 @@ func TestFastPathKeepsAttrsAndStamps(t *testing.T) {
 		}
 	}
 }
+
+// A nil base is a wiring mistake, and it used to surface as a nil dereference on
+// the first record — arbitrarily far from the line that caused it.
+func TestNewLogHandlerRejectsNilBase(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("NewLogHandler(nil) returned a handler that would nil-panic on first use")
+		}
+	}()
+	NewLogHandler(nil)
+}

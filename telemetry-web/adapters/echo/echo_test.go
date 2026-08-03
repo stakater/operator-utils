@@ -18,32 +18,40 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func handlerFor(b adaptertest.Behavior) echo.HandlerFunc {
+	switch b {
+	case adaptertest.OK:
+		return func(c echo.Context) error { return c.String(http.StatusOK, "ok") }
+	case adaptertest.Fail500:
+		return func(c echo.Context) error { return c.String(http.StatusInternalServerError, "boom") }
+	case adaptertest.Fail400:
+		return func(c echo.Context) error { return c.String(http.StatusBadRequest, "bad") }
+	case adaptertest.Panic:
+		return func(c echo.Context) error { panic("kaboom") }
+	case adaptertest.PanicAbort:
+		return func(c echo.Context) error { panic(http.ErrAbortHandler) }
+	case adaptertest.Stream:
+		return func(c echo.Context) error {
+			for i := range len(adaptertest.StreamBody) {
+				if _, err := c.Response().Write([]byte(adaptertest.StreamBody[i : i+1])); err != nil {
+					return err
+				}
+				c.Response().Flush()
+			}
+			return nil
+		}
+	default:
+		// Silently skipping an unknown Behavior would leave the route
+		// unregistered and the conformance case asserting on a 404.
+		panic("unhandled adaptertest.Behavior")
+	}
+}
+
 func buildEcho(routes []adaptertest.Route, opts ...nethttp.Option) http.Handler {
 	e := echo.New()
 	h := Instrument(e, opts...)
 	for _, r := range routes {
-		switch r.Behavior {
-		case adaptertest.OK:
-			e.GET(r.Template, func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
-		case adaptertest.Fail500:
-			e.GET(r.Template, func(c echo.Context) error { return c.String(http.StatusInternalServerError, "boom") })
-		case adaptertest.Fail400:
-			e.GET(r.Template, func(c echo.Context) error { return c.String(http.StatusBadRequest, "bad") })
-		case adaptertest.Panic:
-			e.GET(r.Template, func(c echo.Context) error { panic("kaboom") })
-		case adaptertest.PanicAbort:
-			e.GET(r.Template, func(c echo.Context) error { panic(http.ErrAbortHandler) })
-		case adaptertest.Stream:
-			e.GET(r.Template, func(c echo.Context) error {
-				for i := range len(adaptertest.StreamBody) {
-					if _, err := c.Response().Write([]byte(adaptertest.StreamBody[i : i+1])); err != nil {
-						return err
-					}
-					c.Response().Flush()
-				}
-				return nil
-			})
-		}
+		e.Add(adaptertest.MethodOf(r), r.Template, handlerFor(r.Behavior))
 	}
 	return h
 }
