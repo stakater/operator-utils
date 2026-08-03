@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-chi/chi/v5 v5.2.1
-	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260803074602-1a8b64b4d44a
+	github.com/stakater/operator-utils/telemetry-web v0.0.0-20260803121210-26f6be6ee32b
 )
 
 require (
