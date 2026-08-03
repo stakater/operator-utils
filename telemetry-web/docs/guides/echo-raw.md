@@ -7,9 +7,9 @@
 > adapter does).
 
 The core is framework-agnostic, so you can wire Echo yourself with a few lines.
-This guide shows the full pattern and, at the end, a small reusable Echo
-middleware that reproduces what the adapters do (automatic route-templated
-per-endpoint metrics).
+This guide shows the full pattern and, at the end, the two small Echo middlewares
+that reproduce what the adapters do (panic recording and route-templated
+metrics).
 
 See also: [API reference](../reference.md) · [Echo adapter guide](echo-adapter.md) ·
 [Gin adapter guide](gin-adapter.md).
@@ -21,7 +21,8 @@ The building blocks, all from the core:
 | setup | `telemetry.Init` |
 | server spans + `http.server.*` metrics + panic backstop | `nethttp.Handler(e)` |
 | panic recording | `endpoint.Recovered` |
-| per-endpoint metrics | `endpoint.Record` (or `endpoint.Instrument`) |
+| route attribution on span + metrics | `nethttp.StampRoute` |
+| timing non-HTTP operations | `endpoint.Instrument` |
 | outbound propagation | `nethttp.HTTPClient` / `WrapClient` |
 | trace-correlated logs | `logging.Logger` |
 
@@ -58,8 +59,8 @@ Key differences from a naive Echo setup:
 - **Serve through `nethttp.Handler(e)`**, not `e.Start()` — that is what adds
   spans and server metrics and the panic backstop around the whole engine.
 - **Replace `middleware.Recover()`** with a recovery middleware that calls
-  `endpoint.Recovered` (Echo's default recover would swallow the panic before
-  telemetry sees it).
+  `endpoint.Recovered`. Only the innermost recovery records a panic, and here that
+  is yours, so it has to be the one doing the recording.
 
 ```go
 package main
@@ -98,7 +99,6 @@ func main() {
     e.HideBanner = true
     e.Use(TelemetryRecovery()) // instead of middleware.Recover()
     e.Use(TelemetryRouteTag())  // http.route on span + duration metric (see §4)
-    e.Use(TelemetryMetrics())   // optional per-endpoint counter (see §4)
 
     // ... register routes ...
     e.GET("/users/:id", getUser)
@@ -122,8 +122,8 @@ func main() {
 
 > Unlike Gin, Echo applies `e.Use(...)` middleware to all routes regardless of
 > whether they were registered before or after the `Use` call, so ordering
-> between `Use` and route registration doesn't matter here. The recovery/metrics
-> middleware still sit *inside* `nethttp.Handler` (they're engine middleware, and
+> between `Use` and route registration doesn't matter here. Both middlewares still
+> sit *inside* `nethttp.Handler` (they're engine middleware, and
 > the engine is what `nethttp.Handler` wraps), so the span exists in `ctx` and the
 > `500` is measured.
 
@@ -161,7 +161,7 @@ After a recovered panic the handler returns `nil` (its zero return value) with a
 
 ---
 
-## 4. Route attribution and per-endpoint metrics
+## 4. Route attribution
 
 The first thing to wire is `http.route`, since it is what makes the standard
 `http.server.request.duration` metric break down per route and renames the span
@@ -181,57 +181,27 @@ func TelemetryRouteTag() echo.MiddlewareFunc {
 }
 ```
 
-With that in place the duration histogram already gives you request and failure
-rates per route, so the per-endpoint counter below is **optional** — the adapters
-leave it off unless you pass `nethttp.WithEndpointMetrics()`:
+With that in place the duration histogram is the whole per-route metric story: it
+carries `http.route`, `http.request.method` and `http.response.status_code`, so
+request rates, failure rates and quantiles all come from it.
 
 ```promql
+# request rate per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
+
+# failure ratio per route
 sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+  / sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
 ```
 
-If you do want the simpler `{endpoint, outcome}` label pair, use
-`nethttp.RecordRoute` — the same helper the adapters call, so your service
-classifies outcomes identically (`failure` iff status ≥ 500, unmatched routes and
-skipped paths ignored):
-
-```go
-func TelemetryMetrics() echo.MiddlewareFunc {
-    return func(next echo.HandlerFunc) echo.HandlerFunc {
-        return func(c echo.Context) error {
-            err := next(c)
-            nethttp.RecordRoute(c.Request().Context(), c.Path(), status(c, err))
-            return err
-        }
-    }
-}
-
-// status must mirror Echo's DefaultHTTPErrorHandler, not approximate it, or the
-// recorded outcome disagrees with the status the client received. Three details,
-// each of which the obvious implementation gets wrong:
-//
-//   - Committed first: once the handler has written, Echo's error handler returns
-//     without touching the response, so a non-nil error does NOT mean 500.
-//   - a plain type assertion, not errors.As: Echo does not unwrap, so
-//     fmt.Errorf("...: %w", echo.NewHTTPError(404)) answers 500.
-//   - he.Internal unwrapped one level, because Echo does that: the idiomatic
-//     NewHTTPError(500).SetInternal(NewHTTPError(404)) answers 404.
-//
-// This tracks Echo's DEFAULT handler; a custom HTTPErrorHandler can answer with
-// anything and the outcome recorded here will not follow it.
-func status(c echo.Context, err error) int {
-    if err == nil || c.Response().Committed {
-        return c.Response().Status
-    }
-    he, ok := err.(*echo.HTTPError)
-    if !ok {
-        return http.StatusInternalServerError
-    }
-    if inner, ok := he.Internal.(*echo.HTTPError); ok {
-        return inner.Code
-    }
-    return he.Code
-}
-```
+There is deliberately **no** per-endpoint counter middleware to write. A counter
+keyed `{endpoint, outcome}` would only pre-compute the `≥ 500` boundary into a
+label, and getting it right in a hand-wired Echo chain is harder than it looks:
+Echo runs its error handler *after* the middleware chain, so at the point your
+middleware sees the returned `error` the status has not been written yet, and
+resolving it means mirroring `DefaultHTTPErrorHandler` exactly — no unwrapping,
+`Internal` unwrapped one level, and an early bail on `Committed`. `otelhttp`
+sidesteps all of it by observing the response as written.
 
 ---
 
@@ -285,6 +255,6 @@ client := &http.Client{
 
 An Echo service needs, versus the two-line Gin adapter path: `telemetry.Init`,
 serve via `nethttp.Handler(e)`, and two small middlewares (`TelemetryRecovery`,
-`TelemetryMetrics`) plus the standard outbound-client / logger usage. Everything
+`TelemetryRouteTag`) plus the standard outbound-client / logger usage. Everything
 else — sampling, propagation, resource attributes, exemplars, the metric set — is
 identical, because it all lives in the framework-agnostic core.

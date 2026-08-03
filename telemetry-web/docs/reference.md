@@ -21,7 +21,7 @@ web framework**; framework glue lives in separate adapter modules.
 - [Package reference](#package-reference)
   - [`telemetry`](#package-telemetry) — setup
   - [`telemetry-web/logging`](#package-logging) — trace-correlated logs
-  - [`telemetry-web/endpoint`](#package-endpoint) — per-endpoint metrics & panics
+  - [`telemetry-web/endpoint`](#package-endpoint) — operation timing & panics
   - [`telemetry-web/nethttp`](#package-nethttp) — net/http server & client
   - [`adapters/gin`](#package-adaptersgin) — Gin adapter
   - [`adapters/echo`](#package-adaptersecho) — Echo adapter
@@ -41,7 +41,7 @@ web framework**; framework glue lives in separate adapter modules.
                           └──────────────────────────────────────────┘
   inbound   nethttp.Handler(engine) ─ otelhttp span+metrics ─ recovery ─▶ your routes
   outbound  nethttp.HTTPClient().Do(req) ─ injects traceparent ─▶ next hop
-  in-handler endpoint.Instrument / endpoint.Record / endpoint.Recovered
+  in-handler endpoint.Instrument / endpoint.Recovered
   logs      logging.Logger().InfoContext(ctx, …)  (trace_id/span_id stamped)
 ```
 
@@ -177,7 +177,6 @@ high-value operations.
 | --- | --- | --- | --- |
 | `http.server.request.duration` | histogram (s) | method, route*, status, … | `otelhttp` (via `nethttp.Handler`) |
 | `http.server.active_requests` | up/down counter | method, scheme | `otelhttp` |
-| `endpoint.requests` | counter | `endpoint`, `outcome` (success\|failure) | `endpoint.Record` / `Instrument`; adapters only under `WithEndpointMetrics` |
 | `endpoint.duration` | histogram (s) | `endpoint`, `outcome` | `endpoint.Instrument` |
 | `http.server.panics` | counter | `http.route` (when known) | `endpoint.Recovered` / `endpoint.RecordPanic` |
 | `go.goroutine.count`, `go.memory.used`, `go.memory.allocated`, `go.memory.gc.goal`, `go.processor.limit`, `go.config.gogc` | various | — | `contrib/runtime` |
@@ -186,20 +185,27 @@ high-value operations.
 framework adapters' `RouteTag()` middleware, which calls `nethttp.StampRoute`;
 with raw `net/http` you stamp it yourself (see the Echo raw guide).
 
-There is **no** separate `requests_total`: the duration histogram's `count`
-already gives request rate, and with `http.route` stamped it also gives the
-failure rate per route:
+There is **no** per-endpoint request counter, by design. The duration histogram's
+`count` already gives request rate, and with `http.route` stamped it also gives
+the failure rate per route:
 
 ```promql
+# request rate per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
+
+# failure ratio per route
 sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+  / sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
 ```
 
-That makes `endpoint.requests` a strict subset for HTTP, so the adapters
-leave it **off** unless you pass `nethttp.WithEndpointMetrics()`. Turn it on when
-you want the simpler `{endpoint, outcome}` label pair instead of status-code
-regexes. Where it is not redundant is **non-HTTP** work: `endpoint.Instrument`
-covers operations that have no otelhttp histogram at all, and pairs the counter
-with `endpoint.duration`.
+A counter keyed `{endpoint, outcome}` would be a strict subset of that: one label
+pair pre-computed, no information the histogram does not already carry. The
+trade-off is deliberate — you write the status-code regex instead of the library
+picking the `≥ 500` boundary for you.
+
+`endpoint.duration` is the one metric here that is **not** derivable elsewhere. It
+covers work otelhttp never sees: a DB query, a cache lookup, an outbound call, a
+background job. See [`endpoint`](#package-endpoint).
 
 Health probes and scrape endpoints are instrumented like any other path unless
 you opt out — pass `nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...)` to keep
@@ -289,16 +295,14 @@ re-delegates, so an instrument created earlier would stay bound to it forever.)
 
 ```go
 func Instrument(ctx context.Context, name string) func(err *error)
-func Record(ctx context.Context, name string, failed bool)
 func Recovered(ctx context.Context, recovered any, attrs ...attribute.KeyValue) bool
 func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue)
 ```
 
 **`Instrument`** — the ergonomic hand-instrumentation helper, and the intended
-entry point for **non-HTTP** operations. It records `endpoint.requests`
-*and* times the operation into `endpoint.duration`. Returns a finisher that takes
-the *address* of the operation's error; outcome is `failure` iff
-`err != nil && *err != nil`:
+entry point for **non-HTTP** operations. It times the operation into
+`endpoint.duration`. Returns a finisher that takes the *address* of the
+operation's error; outcome is `failure` iff `err != nil && *err != nil`:
 
 ```go
 func (c Controller) ListTenants(ctx context.Context) (err error) {
@@ -307,13 +311,16 @@ func (c Controller) ListTenants(ctx context.Context) (err error) {
 }
 ```
 
-**`Record`** — the low-level primitive when you already know the outcome (e.g.
-from an HTTP status). Counter only, no duration. Framework middleware reaches it
-through `nethttp.RecordRoute`, which applies the shared `status >= 500` rule:
+Do **not** reach for this inside an HTTP handler served through
+`nethttp.Handler` — that request is already timed by
+`http.server.request.duration`, per route, method and status. `Instrument` is for
+the work *inside* the handler that no HTTP metric covers, and for operations
+outside any request at all.
 
-```go
-endpoint.Record(ctx, "/api/v1/tenants/:id", resp.StatusCode >= 500)
-```
+The histogram is 17 Prometheus series per `{endpoint, outcome}` pair (15 buckets
+plus `_sum` and `_count`), so name operations, don't enumerate identifiers.
+Nothing is emitted until something calls `Instrument`, so a service that never
+does pays no series at all.
 
 **`Recovered`** — the whole recovery decision for a framework that has its own
 middleware. `false` means the value is `http.ErrAbortHandler` and the caller must
@@ -343,8 +350,8 @@ Pass the matched route template in `attrs` so a panic spike names an endpoint.
 Nothing is derived from the request automatically: a raw path or method would be
 unbounded and blow up the series count.
 
-`name` on `Record`/`Instrument` must be a **low-cardinality constant** (a route
-template or a stable operation name), never a raw path or an id.
+`name` on `Instrument` must be a **low-cardinality constant** (a stable operation
+name), never a raw path or an id.
 
 `endpoint.duration` uses explicit second-scale buckets (5ms to 10s), matching
 otelhttp's `http.server.request.duration` so the two are comparable. The SDK
@@ -361,12 +368,9 @@ net/http integration. Import path `…/telemetry-web/nethttp`.
 func Handler(next http.Handler, opts ...Option) http.Handler // inbound: otelhttp spans+metrics -> recovery -> next
 func WithSkipPaths(paths ...string) Option            // opt out exact paths from instrumentation; repeated calls accumulate
 var DefaultSkipPaths = []string{...}                  // /healthz /readyz /livez /metrics — pass to WithSkipPaths
-func WithEndpointMetrics() Option                     // opt IN to endpoint.requests in an adapter's Instrument
 func WithoutRecovery() Option                         // install NO recovery, not even the adapter's (an outer layer owns panics)
 func Resolve(opts ...Option) Settings                 // resolved option set, for adapters
-func Skipped(ctx context.Context) bool                // was this request excluded by WithSkipPaths?
 func StampRoute(ctx context.Context, method, route string) // http.route on span + duration metric; span renamed "{method} {route}"
-func RecordRoute(ctx context.Context, route string, status int) // the shared outcome rule: failure iff status >= 500
 func Recovery(next http.Handler) http.Handler         // panic -> RecordPanic + 500 if unwritten (ErrAbortHandler re-raised); preserves Flusher/Hijacker
 func Transport(base http.RoundTripper) http.RoundTripper // outbound: inject trace context
 func HTTPClient() *http.Client                        // client whose Transport already propagates
@@ -379,14 +383,15 @@ func WrapClient(c *http.Client) *http.Client          // add propagation to an e
   backstop. Recovery sits inside `otelhttp` so the span exists in `ctx` and the
   resulting `500` is measured.
 - **Filtering is opt-in.** Every path is instrumented unless you exclude it:
-  `WithSkipPaths(paths...)` gives excluded paths no span, no `http.server.*` data
-  points, and no `endpoint.requests` (they are still served, and recovery
-  still applies). Pass `DefaultSkipPaths` to keep k8s probes and `/metrics`
+  `WithSkipPaths(paths...)` gives excluded paths no span and no `http.server.*`
+  data points (they are still served, and recovery still applies). Pass
+  `DefaultSkipPaths` to keep k8s probes and `/metrics`
   scrapes from flooding traces and metrics:
   `Handler(mux, WithSkipPaths(nethttp.DefaultSkipPaths...))` — or append your own
   paths to that list. Repeated calls accumulate rather than replacing.
-  Middleware running inside a router checks `Skipped(ctx)` to honor the same
-  decision, since otelhttp's own filter cannot reach it.
+  `StampRoute` honors the same decision internally, so middleware running inside a
+  router — which otelhttp's own filter cannot reach — needs no exclusion check of
+  its own.
 - **A skipped path drops inbound trace context.** The filter runs before
   `propagators.Extract`, so a skipped path will not continue a caller's trace.
   Harmless for probes; do not skip paths that participate in traces.
@@ -401,9 +406,6 @@ func WrapClient(c *http.Client) *http.Client          // add propagation to an e
   connection without a response, and `http.server.panics` is not incremented.
   Only pass it when an outer layer recovers and calls `endpoint.RecordPanic`
   itself. See [Recovery layers](#recovery-layers) for why there are normally two.
-- **`RecordRoute`** is the single definition of outcome shared by every adapter:
-  `failure` iff `status >= 500`, skipping unmatched routes and skipped paths. A
-  4xx is a client error and counts as a success.
 - **Outbound propagation is opt-in and non-negotiable:** only calls made through
   `Transport`/`HTTPClient`/`WrapClient` inject `traceparent`. A hop that uses a
   plain client dead-ends the trace even though every service has `Handler`.
@@ -432,17 +434,16 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // packag
 ```
 
 ```go
-func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler // Recovery + RouteTag (+ Metrics when opted in) + nethttp.Handler
+func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler // Recovery + RouteTag + nethttp.Handler
 func Recovery() gin.HandlerFunc  // panic -> endpoint.Recovered + 500 (ErrAbortHandler re-raised)
 func RouteTag() gin.HandlerFunc  // http.route (c.FullPath()) -> server span + duration metric
-func Metrics() gin.HandlerFunc   // endpoint.requests{endpoint,outcome} by matched route template
 ```
 
 `RouteTag()` stamps `http.route` on the server span and the standard
 `http.server.request.duration` metric (via `nethttp.StampRoute`), so traces and
-semconv metrics are route-attributed. `Metrics()` records the per-endpoint
-counter and is **opt-in**: pass `nethttp.WithEndpointMetrics()`. `Instrument`
-forwards `nethttp` options — e.g.
+semconv metrics are route-attributed. That is the whole of the per-route metric
+story — there is no separate counter middleware. `Instrument` forwards `nethttp`
+options — e.g.
 `Instrument(engine, nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...))`.
 
 Gin applies global middleware only to routes registered *after* `Use`, so
@@ -462,20 +463,19 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // packa
 ```
 
 ```go
-func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler // Recovery + RouteTag (+ Metrics when opted in) + nethttp.Handler
+func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler // Recovery + RouteTag + nethttp.Handler
 func Recovery() echo.MiddlewareFunc  // panic -> endpoint.Recovered + 500 (ErrAbortHandler re-raised)
 func RouteTag() echo.MiddlewareFunc  // http.route (c.Path()) -> server span + duration metric
-func Metrics() echo.MiddlewareFunc   // endpoint.requests{endpoint,outcome} by matched route template
 ```
 
-`RouteTag()` and `Metrics()` split the work exactly like the Gin adapter, and
-`Metrics()` is opt-in the same way. Echo runs its error handler *after* the
-middleware chain, so the adapter resolves the status the request will actually
-answer with — a returned `*echo.HTTPError` reports its own code, any other
-returned error becomes Echo's default `500` — and then applies the shared
-`status >= 500` rule. Unlike Gin there is no ordering rule: Echo applies `Use`
-middleware to routes registered before or after the call. See the
-[Echo guide](guides/echo-adapter.md).
+Same shape as the Gin adapter. Echo runs its error handler *after* the middleware
+chain, so the status a request answers with is written outside the handler — a
+returned `*echo.HTTPError` reports its own code, any other returned error becomes
+Echo's default `500`. Nothing in the adapter has to resolve that: `otelhttp`
+observes the response as written, so the recorded
+`http.response.status_code` is whatever the client received. Unlike Gin there is
+no ordering rule: Echo applies `Use` middleware to routes registered before or
+after the call. See the [Echo guide](guides/echo-adapter.md).
 
 ---
 
@@ -490,13 +490,12 @@ import "github.com/stakater/operator-utils/telemetry-web/adapters/chi" // packag
 ```
 
 ```go
-func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler // RouteTag (+ Metrics when opted in) + nethttp.Handler
+func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler // RouteTag + nethttp.Handler
 func Recovery() Middleware   // = nethttp.Recovery; NOT installed by Instrument (see below)
 func RouteTag() Middleware   // http.route (RoutePattern()) -> server span + duration metric
-func Metrics() Middleware    // endpoint.requests{endpoint,outcome} by matched route pattern
 ```
 
-Same split as the other adapters, with two chi-specific notes. First, chi fills
+Same shape as the other adapters, with two chi-specific notes. First, chi fills
 `RoutePattern()` in *before* invoking the handler, so `RouteTag` stamps from a
 `defer` — a panicked request's span still carries `http.route`, matching gin and
 echo. Second, `Instrument` deliberately does **not** install `Recovery()`:
@@ -513,21 +512,30 @@ See the [chi guide](guides/chi-adapter.md).
 ### The adapter contract
 
 Every framework adapter exposes exactly `Instrument` / `Recovery` / `RouteTag`
-/ `Metrics` with the semantics above.
+with the semantics above.
 
-**There is one failure rule, not three.** All adapters route their outcome
-through `nethttp.RecordRoute`: `outcome=failure` iff the status the request
-answers with is ≥ 500. A 4xx is a client error and records `success`.
-Framework-native signals that disagree are deliberately *not* consulted — notably
-gin's `c.Error(...)`, which would otherwise make a 400 a failure in gin and a
-success everywhere else, breaking `sum by (outcome)` across services.
+**No adapter classifies anything.** The status the request answers with is
+observed by `otelhttp` from the response as written, so no adapter interprets
+framework-native error signals — not gin's `c.Error(...)`, not Echo's returned
+`error`. That removes the whole class of bug where the same 4xx means one thing in
+gin and another in echo: there is one number, `http.response.status_code`, and it
+is whatever the client received.
 
 `http.route` is stamped on every request's span and duration metric, including
 panicked ones, on all three adapters.
 
 #### Recovery layers
 
-A panic is **counted exactly once** everywhere, but the wiring differs:
+There is one rule, and everything else follows from it:
+
+> **The innermost recovery is the only one that records.** `recover()` consumes the
+> panic, so whatever catches it first decides whether `http.server.panics` moves.
+> Outer layers see nothing.
+
+That is why a panic is counted exactly once even where two of our layers are
+stacked, and it is also the whole answer to "can I keep my framework's own
+recovery?" — you can, as long as it is not the innermost one, or as long as it
+calls `endpoint.Recovered` itself.
 
 | Adapter | Framework `Recovery()` | `Handler`'s recovery |
 | --- | --- | --- |
@@ -542,15 +550,46 @@ or anything registered with `engine.Use(...)` before `gintel.Instrument`. Withou
 it those escape to net/http: connection torn down, no response, no
 `http.server.panics`, no exception on the span.
 
+##### Keeping your framework's recovery
+
+Applying the rule to each adapter gives a mechanical answer. `Use` order is
+outermost-first on all three frameworks, so a recovery registered **before**
+`Instrument` is outer to ours and harmless; one registered **after** is inner and
+silently takes over.
+
+| Where yours sits | gin, echo | chi |
+| --- | --- | --- |
+| registered before `Instrument` | outer, panic still counted | inner, count lost |
+| registered after `Instrument` | inner, count lost | inner, count lost |
+
+chi has no "before" case because `chitel.Instrument` installs no router-level
+recovery at all — ours lives in `nethttp.Handler`, outside the router — so *any*
+`middleware.Recoverer` is innermost.
+
+When you want your own recovery to be the innermost one, make it record. Pass
+`WithoutRecovery` **through `Instrument`**, not to a bare `Handler` — going around
+the adapter would also drop `RouteTag`, and with it every `http.route` attribute:
+
+```go
+engine.Use(myRecovery())                                        // calls endpoint.Recovered
+handler := gintel.Instrument(engine, nethttp.WithoutRecovery()) // ours steps aside
+```
+
+`WithoutRecovery` suppresses ours everywhere, so this is a straight handover, not
+a second layer. See [`Recovered`](#package-endpoint) for the one call your
+middleware needs.
+
 Adapters are held to the contract by a shared conformance suite —
 package `…/telemetry-web/internal/adaptertest`, internal because it is test
 scaffolding rather than consumer API, and importable from the adapter modules
 anyway since Go's internal rule is lexical on import path — that each adapter
-module runs against its own engine (`adaptertest.Run`): route-templated metrics (never raw paths),
-`500 → failure`, `4xx → success`, `http.route` on span + duration metric + the
+module runs against its own engine (`adaptertest.Run`): route-templated metrics
+(never raw paths), the client-visible status reaching the duration metric for a
+5xx and a 4xx alike, `http.route` on span + duration metric + the
 `"{method} {route}"` span rename, route retained on panicked requests, unmatched
-routes skipped, skipped paths recording nothing at all, panic → `500` + panic
-counter + no per-endpoint data point, `http.ErrAbortHandler` re-raised untouched.
+requests carrying no `http.route` at all, skipped paths recording nothing,
+panic → `500` + panic counter + a `500` on the duration metric,
+`http.ErrAbortHandler` re-raised untouched.
 Frameworks with a different route parameter syntax pass
 `adaptertest.WithTemplateRewrite` (chi rewrites `:id` → `{id}`). Every subtest
 issues its own requests and asserts on deltas, so the suite is order-independent
@@ -561,8 +600,8 @@ and `-shuffle=on` clean. A new adapter is done when it passes `adaptertest.Run`.
 ## Correlation model
 
 - **metrics ↔ traces:** exemplars, on by default in the SDK whenever a sampled
-  span is active in `ctx`. This is why you thread `ctx` into `Record`/`Instrument`
-  — never put `trace_id` on a metric as an attribute (unbounded cardinality).
+  span is active in `ctx`. This is why you thread `ctx` into `Instrument` — never
+  put `trace_id` on a metric as an attribute (unbounded cardinality).
 - **traces ↔ logs:** the `trace_id`/`span_id` fields the logging handler stamps
   from `ctx`.
 
@@ -612,10 +651,11 @@ Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
   (outbound). Miss the outbound half and the trace stops at that service.
 - **Background goroutines / queues lose the trace** unless you pass `ctx` in (or,
   for queues, inject/extract trace context in the message metadata).
-- **`name` must be low-cardinality.** Use route templates or fixed operation
-  names for `endpoint.Record`/`Instrument`, never raw paths or ids.
-- **Panicked requests** show on `http.server.panics` (+ a `500` in the otelhttp
-  metrics), not as a per-endpoint `endpoint.requests` data point — by design.
+- **`name` must be low-cardinality.** Use fixed operation names for
+  `endpoint.Instrument`, never raw paths or ids — it is a histogram, so each name
+  costs 17 series per outcome.
+- **Panicked requests** show on `http.server.panics` and as a `500` in the
+  otelhttp metrics.
 - **A panic mid-response keeps the status it already sent.** `nethttp.Recovery`
   writes `500` only if nothing has been committed yet, so a handler that
   panicked after starting its response is left alone rather than producing a

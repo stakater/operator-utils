@@ -1,8 +1,8 @@
 # Guide: integrating telemetry with Echo (via the adapter)
 
 The `adapters/echo` module wires the whole library into an Echo service in **one
-call**: framework-native panic recovery, automatic per-endpoint metrics keyed by
-the *matched route template*, and the core server spans + metrics. This is the
+call**: framework-native panic recovery, server spans and metrics keyed by the
+*matched route template*, and trace-correlated logging. This is the
 recommended path for an Echo app; [echo-raw.md](echo-raw.md) shows the same
 wiring done by hand.
 
@@ -75,7 +75,7 @@ func main() {
     // 2. Build the engine and instrument it.
     e := echo.New()
     e.HideBanner = true
-    handler := echotel.Instrument(e) // do NOT also add middleware.Recover() (it would pre-empt ours)
+    handler := echotel.Instrument(e) // installs Recovery + RouteTag, wraps e in nethttp.Handler
 
     // ... register routes on `e` here (before or after Instrument — both work) ...
     e.GET("/users/:id", getUser)
@@ -102,8 +102,37 @@ server metrics, and the panic backstop. Unlike Gin there is no ordering rule:
 Echo applies `e.Use(...)` middleware to routes registered before or after the
 call, so `Instrument` can run at any point during setup.
 
-**Do not add `middleware.Recover()`** — Echo's own recovery would swallow panics
-before the telemetry recovery sees them.
+### If you already use `middleware.Recover()`
+
+`recover()` consumes the panic, so **the innermost recovery is the only one that
+records it**. `Instrument` installs `echotel.Recovery` with `e.Use`, and Echo runs
+`Use` middleware outermost-first, so placement decides:
+
+```go
+e.Use(middleware.Recover())      // OUTER to ours: harmless, panic still counted
+handler := echotel.Instrument(e)
+```
+
+```go
+handler := echotel.Instrument(e)
+e.Use(middleware.Recover())      // INNER to ours: swallows it, http.server.panics stays flat
+```
+
+Neither is detectable from inside the adapter, and the second one fails silently:
+the request still answers `500`, only the metric and the span exception go missing.
+
+`middleware.Recover()` is also redundant here — `echotel.Recovery` already answers
+`500` and re-raises `http.ErrAbortHandler`, the same two things Echo's does. The
+simplest wiring is to drop it. If you want your own recovery to be innermost
+(custom response body, extra logging), hand recording over explicitly:
+
+```go
+e.Use(myRecovery())                                 // calls endpoint.Recovered
+handler := echotel.Instrument(e, nethttp.WithoutRecovery())
+```
+
+See [Recovery middleware](echo-raw.md#3-recovery-middleware) for what `myRecovery`
+looks like — `endpoint.Recovered` is a single call.
 
 ---
 
@@ -114,15 +143,12 @@ For every matched route, with **zero per-handler code**:
 - `http.route` stamped on the server span **and** the standard
   `http.server.request.duration` metric, and the span renamed to the semconv
   `"{method} {route}"` form, so traces and semconv metrics are route-attributed.
-- Optionally `endpoint.requests{endpoint="/users/:id", outcome="success|failure"}`
-  — `failure` when the status the request answers with is `≥ 500`, the same rule
-  every adapter uses; a 4xx is a client error and counts as `success`. **Off by
-  default**, since the duration histogram above already carries route, method and
-  status; turn it on with `Instrument(e, nethttp.WithEndpointMetrics())`.
-
-  Echo runs its error handler *after* the middleware chain, so the adapter
-  resolves the status the request will answer with: a returned `*echo.HTTPError`
-  reports its own code, any other returned error becomes Echo's default `500`.
+  Because that metric carries `http.response.status_code` too, request and failure
+  rates per route come from it directly — there is no separate per-endpoint
+  counter. Echo runs its error handler *after* the middleware chain, so a returned
+  `*echo.HTTPError` becomes its own code and any other error becomes Echo's default
+  `500`; the adapter does not interpret any of that, `otelhttp` records the status
+  as written to the response.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
   To keep k8s probes and `/metrics` scrapes out of traces and metrics, opt in to
@@ -133,12 +159,15 @@ For every matched route, with **zero per-handler code**:
 Example queries (PromQL, if exporting to Prometheus via the collector):
 
 ```promql
-# per-endpoint request rate
-sum by (endpoint) (rate(endpoint_requests_total[5m]))
+# request rate per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
 
-# per-endpoint failure ratio
-sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
-  / sum by (endpoint) (rate(endpoint_requests_total[5m]))
+# failure ratio per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+  / sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
+
+# p95 latency per route
+histogram_quantile(0.95, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket[5m])))
 ```
 
 > **Two layers, one count.** `Instrument` installs `echotel.Recovery()` *and* keeps
@@ -161,18 +190,15 @@ If you maintain your own middleware chain, use the pieces directly instead of
 
 ```go
 e := echo.New()
-e.Use(echotel.Recovery()) // panic -> Recovered + 500; keep it OUTSIDE Metrics
+e.Use(echotel.Recovery()) // panic -> Recovered + 500
 e.Use(echotel.RouteTag()) // http.route -> span + duration metric
-e.Use(echotel.Metrics())  // per-endpoint metrics by route template (optional)
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(e)} // spans + server metrics
 ```
 
-Keep `Recovery` before `Metrics` (outermost) so a panicking handler unwinds past
-the record call and surfaces only on the panic counter. Both must sit inside
-`nethttp.Handler` (they do here — they're engine middleware, and the engine is
-what `nethttp.Handler` wraps).
+Both must sit inside `nethttp.Handler` — they do here, since they are engine
+middleware and the engine is what `nethttp.Handler` wraps.
 
 ---
 
@@ -224,13 +250,15 @@ client := &http.Client{
 
 ## Notes
 
-- Per-endpoint metric cardinality is bounded because `Metrics()` uses `c.Path()`
-  (the template `/users/:id`), never the raw path. Unmatched requests (404
-  scans) have an empty `c.Path()` and are skipped.
-- Panicked requests appear on `http.server.panics`, not as a per-endpoint
-  `failure` data point — consistent with the library's panic philosophy.
-- Echo runs its error handler *after* the middleware chain returns, so the
-  adapter classifies the outcome from the **returned error** (resolving
-  `*echo.HTTPError` codes), not from the not-yet-written response status.
+- Metric cardinality is bounded because `RouteTag()` stamps `c.Path()` (the
+  template `/users/:id`), never the raw path. Unmatched requests (404 scans) have
+  an empty `c.Path()` and get no `http.route` at all, so a scan mints no series.
+- Panicked requests appear on `http.server.panics` and as a `500` on the duration
+  metric.
+- Echo runs its error handler *after* the middleware chain returns, so the status
+  is written outside the handler. The adapter does not resolve it — `otelhttp`
+  observes the response, so the recorded `http.response.status_code` is what the
+  client received, including the case where the handler had already committed a
+  `200` before returning an error.
 - Nothing is exported until a collector is reachable at the configured OTLP
   endpoint; for local dev run one and set `Insecure: true`.

@@ -1,7 +1,6 @@
 // Package chitel wires the telemetry library into a chi router: route-tagged
-// spans, optional per-endpoint metrics, and the core net/http Handler. The
-// package name differs from the directory so it never collides with go-chi's
-// "chi" — no alias needed:
+// spans and the core net/http Handler. The package name differs from the
+// directory so it never collides with go-chi's "chi" — no alias needed:
 //
 //	import "github.com/stakater/operator-utils/telemetry-web/adapters/chi" // package chitel
 package chitel
@@ -10,7 +9,6 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
@@ -18,27 +16,21 @@ import (
 // Middleware is chi's middleware shape — standard net/http chaining.
 type Middleware = func(http.Handler) http.Handler
 
-// Instrument installs RouteTag on r — plus Metrics under
-// nethttp.WithEndpointMetrics() — and returns it wrapped in nethttp.Handler,
-// ready to serve. Other nethttp options are forwarded. Call it before
-// registering routes; chi panics if Use runs after the first route.
+// Instrument installs RouteTag on r and returns it wrapped in nethttp.Handler,
+// ready to serve. nethttp options are forwarded. Call it before registering
+// routes; chi panics if Use runs after the first route.
 //
 // No Recovery is installed here: chitel.Recovery IS nethttp.Recovery, which
 // Handler already applies, so adding it would count every panic twice.
 //
-// Do NOT add chi's middleware.Recoverer either, idiomatic as it is. Registered on
-// the mux it is always inner to nethttp.Recovery, which sits outside, so it
-// consumes the panic first and the recorded telemetry inverts relative to gin and
-// echo: http.server.panics stays at 0, the span carries no error, and because
-// Metrics returns normally the request lands on
-// endpoint.requests{outcome=failure} instead. Leave the recovering to
-// nethttp.Handler, or own it with nethttp.WithoutRecovery().
+// Only the innermost recovery records a panic, since recover() consumes it. Ours
+// sits outside the mux, so chi's middleware.Recoverer is always inner to it,
+// idiomatic as it is, and takes over: http.server.panics stays at 0 and the span
+// carries no error. Unlike gin and echo there is no placement that avoids this.
+// Leave the recovering to nethttp.Handler, or own it with
+// nethttp.WithoutRecovery() and call endpoint.Recovered yourself.
 func Instrument(r chi.Router, opts ...nethttp.Option) http.Handler {
-	s := nethttp.Resolve(opts...)
 	r.Use(RouteTag())
-	if s.EndpointMetrics {
-		r.Use(Metrics())
-	}
 	return nethttp.Handler(r, opts...)
 }
 
@@ -65,23 +57,6 @@ func RouteTag() Middleware {
 				}
 			}()
 			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// Metrics records one endpoint.requests data point per request, keyed by the
-// matched route pattern. Outcome follows nethttp.RecordRoute's shared rule, so
-// it matches the gin and echo adapters. Mounted subrouters record chi's joined
-// pattern (e.g. /api/users/{id}) as-is. A panicking handler unwinds past the
-// record call, so panics land on the panic counter instead.
-//
-// Opt in via Instrument(r, nethttp.WithEndpointMetrics()).
-func Metrics() Middleware {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-			next.ServeHTTP(ww, r)
-			nethttp.RecordRoute(r.Context(), routePattern(r), ww.Status())
 		})
 	}
 }

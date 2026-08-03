@@ -162,29 +162,23 @@ handler type, ratio/endpoint resolution) — consumers never touch it.
   from `RouteTag`; call it yourself when wiring a framework by hand. The request
   must be inside `nethttp.Handler` — without it the metric attribute is dropped
   and a warning is logged once.
-- **`RecordRoute(ctx, route string, status int)`**
-  The one shared definition of outcome: records `endpoint.requests` with
-  `failure` iff `status >= 500`. Skips unmatched routes and skipped paths.
 
 #### Options
 
 - **`WithSkipPaths(paths ...string)`** — exclude exact paths from instrumentation:
-  no span, no `http.server.*`, and no `endpoint.requests`. Still served, and
-  recovery still applies. Repeated calls accumulate. Because the filter runs before
-  extraction, a skipped path also drops any inbound `traceparent` — fine for
-  probes, wrong for real traced paths.
+  no span and no `http.server.*`. Still served, and recovery still applies.
+  Repeated calls accumulate. Because the filter runs before extraction, a skipped
+  path also drops any inbound `traceparent` — fine for probes, wrong for real
+  traced paths.
 - **`DefaultSkipPaths`** — `/healthz`, `/readyz`, `/livez`, `/metrics`. Nothing is
   skipped unless you opt in: `nethttp.Handler(mux, nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...))`.
-- **`WithEndpointMetrics()`** — turn on the per-endpoint counter in an adapter's
-  `Instrument`. Off by default, see [Metrics emitted](#metrics-emitted).
 - **`WithoutRecovery()`** — install **no** recovery at all: not `Handler`'s, and
   not the adapter's framework middleware either. Panics then escape to net/http
   (which closes the connection) and are not counted. Use it only when an outer
   layer recovers and calls `endpoint.RecordPanic` itself.
 - **`Resolve(opts ...Option) Settings`** — adapter plumbing: lets an adapter's
-  `Instrument` learn which middleware to install from the same options it forwards
-  to `Handler`. Not needed when wiring by hand.
-  and hand-rolled middleware that need the same decisions `Handler` made.
+  `Instrument` learn whether to install its framework recovery from the same
+  options it forwards to `Handler`. Not needed when wiring by hand.
 
 ### Outbound HTTP (trace propagation) — `nethttp`
 
@@ -195,11 +189,10 @@ handler type, ratio/endpoint resolution) — consumers never touch it.
 - **`WrapClient(c *http.Client) *http.Client`** — add propagation to an existing
   client in place.
 
-### Per-endpoint metrics — `endpoint`
+### Operation timing — `endpoint`
 
-Drop this into **any** handler or function to emit per-endpoint request metrics.
-It is HTTP/framework-agnostic: it needs only a `context.Context` and, at the end,
-a pointer to the operation's `error`.
+Times a named operation. It is HTTP/framework-agnostic: it needs only a
+`context.Context` and, at the end, a pointer to the operation's `error`.
 
 - **`Instrument(ctx, name string) func(err *error)`**
 
@@ -211,30 +204,34 @@ func ListTenants(ctx context.Context) (err error) {
 }
 ```
 
-It records one `endpoint.requests` data point **and** one `endpoint.duration`
-observation per call, both with the same two low-cardinality attributes:
-`endpoint` (the `name` you pass) and `outcome` (`"failure"` iff
-`err != nil && *err != nil`, else `"success"`).
+It records one `endpoint.duration` observation per call, with two
+low-cardinality attributes: `endpoint` (the `name` you pass) and `outcome`
+(`"failure"` iff `err != nil && *err != nil`, else `"success"`).
 
-- **RPS per endpoint:** `sum by (endpoint) (rate(endpoint_requests_total[5m]))`
-- **Success/failure split:** add `outcome` to the `by(...)` clause.
 - **Latency:** `histogram_quantile(0.95, sum by (le, endpoint) (rate(endpoint_duration_seconds_bucket[5m])))`
+- **Call rate:** `sum by (endpoint) (rate(endpoint_duration_seconds_count[5m]))` — the
+  histogram's `_count` is the counter, so there is no separate one.
+- **Success/failure split:** add `outcome` to the `by(...)` clause.
 
 `endpoint.duration` is in **seconds**, with the same explicit bucket boundaries
 otelhttp uses for `http.server.request.duration` (5ms to 10s), so the two
 histograms are directly comparable and the quantile above is meaningful.
 
-> `Instrument` is aimed at **non-HTTP** operations, which have no `otelhttp`
-> histogram covering them. For HTTP handlers served through `nethttp.Handler`,
-> `http.server.request.duration` already records latency per route.
+> `Instrument` is for **non-HTTP** operations, which have no `otelhttp` histogram
+> covering them — a DB query, a cache lookup, an outbound call, a background job.
+> For HTTP handlers served through `nethttp.Handler`,
+> `http.server.request.duration` already records latency per route, method and
+> status, so do not wrap the handler itself.
 
 Why a **pointer**? `&err` is bound when the `defer` statement runs, but `*err` is
 read when the deferred finisher executes — *after* your named return is set — so it
 sees the final error. Passing a plain `nil` records a success.
 
 > `name` **must be a low-cardinality constant** (e.g. `"tenants.list"`), never a
-> value derived from the request (path, id, user). A dynamic name would explode
-> metric cardinality.
+> value derived from the request (path, id, user). Each `{endpoint, outcome}` pair
+> is 17 Prometheus series — 15 buckets plus `_sum` and `_count` — so a dynamic
+> name explodes cardinality fast. Nothing is emitted until you call `Instrument`,
+> so not using it costs nothing.
 
 Using Gin? Call it from the handler with the request context:
 
@@ -245,16 +242,6 @@ func (h *TenantController) GetAllTenants(c *gin.Context) {
     // ... set err on failures ...
 }
 ```
-
-**Note — `endpoint.Record`.** Adapters that already know the outcome (no named
-return to defer against) call the lower-level primitive directly instead of
-`Instrument`:
-
-- **`Record(ctx context.Context, name string, failed bool)`** — records the same
-  `endpoint.requests` data point as `Instrument`, but takes the outcome as a
-  plain `bool` instead of deferring on an `*error`. This is what framework
-  adapters (e.g. `adapters/gin`) use internally once they've already determined
-  success/failure from the response status.
 
 ### Trace-correlated logging — `logging`
 
@@ -345,7 +332,7 @@ func main() {
 }
 ```
 
-Every adapter exposes the same four things:
+Every adapter exposes the same three things:
 
 - **`Instrument(engine, opts ...nethttp.Option) http.Handler`** — installs the
   middleware below, wraps the engine in `nethttp.Handler`, and returns a plain
@@ -354,20 +341,20 @@ Every adapter exposes the same four things:
   `Instrument` on gin and echo; on chi it *is* `nethttp.Recovery`, which
   `Handler` already applies.
 - **`RouteTag()`** — stamps `http.route` on the span and the duration metric and
-  renames the span to `"{method} {route}"`.
-- **`Metrics()`** — records `endpoint.requests`, keyed by the matched route
-  template. Opt-in via `nethttp.WithEndpointMetrics()`.
+  renames the span to `"{method} {route}"`. That is the whole per-route metric
+  story; there is no counter middleware.
 
 Ordering: **gin** and **chi** need `Instrument` *before* any route is registered
 and panic if you call it late, rather than instrumenting nothing — gin with its own
 message, chi via `chi.Mux.Use`. **Echo** applies
 `Use` middleware to routes registered either side of the call, so it doesn't care.
 
-All three classify outcome identically (`status >= 500` is a failure) via
-`nethttp.RecordRoute`, and a panic is counted exactly once on each. The shared
-conformance suite in `internal/adaptertest` fails the build if one of them drifts. See
-[the adapter contract](docs/reference.md#the-adapter-contract) for the failure
-rule and how the recovery layers fit together.
+None of them classifies anything: the status comes from the response as
+`otelhttp` observed it, so no framework-native error signal is interpreted and
+there is nothing to drift between them. A panic is counted exactly once on each.
+The shared conformance suite in `internal/adaptertest` fails the build if one of
+them drifts. See [the adapter contract](docs/reference.md#the-adapter-contract)
+for how the recovery layers fit together.
 
 ---
 
@@ -376,7 +363,6 @@ rule and how the recovery layers fit together.
 | Metric                     | Type      | Source                                    |
 |----------------------------|-----------|-------------------------------------------|
 | `http.server.request.duration` & other `http.server.*` | histogram/… | `otelhttp` (via `nethttp.Handler`); carries `http.route` once `RouteTag`/`StampRoute` runs |
-| `endpoint.requests`   | counter   | `endpoint.Instrument` / `endpoint.Record`, and adapters under `WithEndpointMetrics` (`endpoint`, `outcome`) |
 | `endpoint.duration`        | histogram | `endpoint.Instrument` (`endpoint`, `outcome`) |
 | `http.server.panics`       | counter   | `endpoint.Recovered` / `nethttp.Recovery` |
 | runtime (goroutines/GC/heap) | gauges/counters | `contrib/runtime` (via `Init`)      |
@@ -385,20 +371,27 @@ Metrics ↔ traces are correlated via **exemplars** (on by default when a sample
 span is active in `ctx`). `trace_id` is **never** put on a metric as an attribute —
 exemplars only — to keep cardinality bounded.
 
-### Why `endpoint.requests` is opt-in for HTTP
+### Why there is no per-endpoint request counter
 
-Once `RouteTag` stamps `http.route`, `http.server.request.duration` carries
-route, method, and status code, and its `_count` gives you request and failure
-rates — a strict superset:
+Once `RouteTag` stamps `http.route`, `http.server.request.duration` carries route,
+method, and status code, and its `_count` gives you request and failure rates:
 
 ```promql
+# request rate per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
+
+# failure ratio per route
 sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+  / sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
 ```
 
-The counter buys one simpler label pair (`endpoint`, `outcome`) at the cost of a
-second instrument recording the same events, so adapters leave it off unless you
-pass `nethttp.WithEndpointMetrics()`. It remains the right tool for **non-HTTP**
-operations via `endpoint.Instrument`, where no `otelhttp` histogram exists.
+A counter keyed `{endpoint, outcome}` would carry no information that is not
+already there — it would just pre-compute the `≥ 500` boundary into a label. The
+library used to ship one and it has been removed: you write the status-code regex,
+and in exchange the adapters have no status-classification logic to get wrong.
+
+`endpoint.duration` stays, because it is the one signal `otelhttp` cannot give
+you: latency for work that is not an inbound HTTP request.
 
 ---
 
@@ -425,8 +418,8 @@ operations via `endpoint.Instrument`, where no `otelhttp` histogram exists.
 Run a collector locally (`otel/opentelemetry-collector` with an OTLP receiver on
 `:4317` and a debug exporter), start your service with
 `OTEL_EXPORTER_OTLP_ENDPOINT=localhost:4317` and `Insecure: true`, send a few
-requests, and confirm traces, `http.server.*` + `endpoint.requests` metrics,
-runtime metrics, and `trace_id`-carrying logs appear.
+requests, and confirm traces, `http.server.*` metrics, runtime metrics, and
+`trace_id`-carrying logs appear.
 
 ## Tests
 

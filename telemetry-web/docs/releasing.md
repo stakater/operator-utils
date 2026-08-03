@@ -25,8 +25,8 @@ commit is reachable. On a feature branch that means:
 So a pseudo-version pin is a development convenience, never a released state.
 
 **Invariant:** an adapter must not be tagged while its core requirement is a
-`v0.0.0-` pseudo-version. The release workflow enforces this; see
-[the release gate](#the-release-gate).
+`v0.0.0-` pseudo-version. Step 3 below is what establishes it, and step 3's
+`GOWORK=off` verification is what proves it.
 
 ---
 
@@ -52,15 +52,21 @@ Tags are path-prefixed, which is what `go get` resolves.
    done
    ```
 
-   Then verify what a consumer will actually resolve, outside the workspace:
+   Then verify what a consumer will actually resolve, outside the workspace. This
+   is the check the invariant rests on, and it can only pass here: the pin now
+   names a tag that exists.
 
    ```sh
    for m in gin echo chi; do
-     (cd telemetry-web/adapters/$m && GOWORK=off go build ./... && GOWORK=off go test -count=1 ./...)
+     (cd telemetry-web/adapters/$m &&
+       GOWORK=off go mod tidy -diff &&
+       GOWORK=off go build ./... &&
+       GOWORK=off go test -count=1 ./...)
    done
    ```
 
-   Commit and merge that.
+   If `go mod edit` left a `v0.0.0-` pseudo-version behind, this is where you find
+   out. Commit and merge that.
 
 4. **Tag the adapters, on that later commit.**
 
@@ -80,15 +86,21 @@ adapters together, and it is why step 3's verification sets `GOWORK=off`.
 
 ---
 
-## The release gate
+## What CI does and does not check
 
 `.github/workflows/release.yml` triggers on `v*`, `telemetry-web/v*` and
 `telemetry-web/adapters/*/v*`. In these filters `*` does not cross `/`, which is
 why the three patterns are listed separately rather than as `telemetry-web/**`.
+It cuts the GitHub release and nothing else — the ordering above is not enforced
+by a workflow, because a tag push is already past the point where failing is
+useful.
 
-Before publishing an adapter tag the workflow asserts the invariant above: the
-core requirement must be a real semver tag. That check belongs here rather than in
-the PR job, because only here can it be satisfied.
+The PR job builds and tests all four modules through `go.work`, so a core change
+that breaks an adapter fails there. What it cannot check is the adapters against
+their *pinned* core: `go mod tidy` ignores `go.work` by design, so it always
+resolves the pin, and a PR that adds or moves a core package cannot satisfy a pin
+that predates it. That check is step 3 above, run by hand once the core tag
+exists.
 
 ---
 

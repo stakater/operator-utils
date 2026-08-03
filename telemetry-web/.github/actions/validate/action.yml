@@ -36,8 +36,8 @@ runs:
     # No tidy check for the adapters here. go mod tidy ignores go.work by design, so
     # it always resolves their imports against the PINNED core — and a PR that adds
     # or moves a core package cannot satisfy a pin that predates it. Unsatisfiable
-    # pre-merge, exactly like the GOWORK=off build; both run at release time
-    # instead. See docs/releasing.md.
+    # pre-merge, exactly like the GOWORK=off build; both are release-time steps in
+    # docs/releasing.md.
 
     # go.work makes these resolve the in-tree core, so a breaking core change
     # fails here instead of after it is published.
@@ -61,10 +61,4 @@ runs:
 
     # Deliberately NOT a GOWORK=off build of the adapters against their pinned
     # core. That check cannot pass on a PR that changes the core API, because the
-    # pin has to name a commit that only exists once the PR is merged. A gate that
-    # is red on every such PR teaches people to ignore gates, so it lives in the
-    # release workflow instead, where it can be satisfied. See
-    # docs/releasing.md.
-    #
-    # On a PR the workspace build above is the real signal: it compiles the
-    # adapters against the in-tree core, so a breaking core change fails here.
+    # pin has to name a commit that only exists once the PR is merged.

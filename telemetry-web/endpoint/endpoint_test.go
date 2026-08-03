@@ -35,28 +35,6 @@ func resetInstruments() {
 	warnOnce = new(sync.Once)
 }
 
-func TestRecordOutcomes(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-	resetInstruments()
-
-	Record(context.Background(), "tenants.list", false) // success
-	Record(context.Background(), "tenants.list", true)  // failure
-	Record(context.Background(), "tenants.list", true)  // failure
-
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
-	success, failure := outcomeCounts(t, rm, "tenants.list")
-	if success != 1 {
-		t.Errorf("success = %d, want 1", success)
-	}
-	if failure != 2 {
-		t.Errorf("failure = %d, want 2", failure)
-	}
-}
-
 func TestInstrumentOutcome(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
@@ -68,15 +46,10 @@ func TestInstrumentOutcome(t *testing.T) {
 	Instrument(context.Background(), "orders.get")(&fail1) // failure
 	Instrument(context.Background(), "orders.get")(&fail2) // failure
 
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
-	success, failure := outcomeCounts(t, rm, "orders.get")
-	if success != 1 {
+	if success, _, _ := histogram(t, reader, "orders.get", "success"); success != 1 {
 		t.Errorf("success = %d, want 1", success)
 	}
-	if failure != 2 {
+	if failure, _, _ := histogram(t, reader, "orders.get", "failure"); failure != 2 {
 		t.Errorf("failure = %d, want 2", failure)
 	}
 }
@@ -90,34 +63,6 @@ func hasMetric(rm metricdata.ResourceMetrics, name string) bool {
 		}
 	}
 	return false
-}
-
-func outcomeCounts(t *testing.T, rm metricdata.ResourceMetrics, endpoint string) (success, failure int64) {
-	t.Helper()
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != "endpoint.requests" {
-				continue
-			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			if !ok {
-				t.Fatalf("endpoint.requests is not Sum[int64]")
-			}
-			for _, dp := range sum.DataPoints {
-				if ep, _ := dp.Attributes.Value(attribute.Key("endpoint")); ep.AsString() != endpoint {
-					continue
-				}
-				oc, _ := dp.Attributes.Value(attribute.Key("outcome"))
-				switch oc.AsString() {
-				case "success":
-					success += dp.Value
-				case "failure":
-					failure += dp.Value
-				}
-			}
-		}
-	}
-	return success, failure
 }
 
 // histogram returns the endpoint.duration data point count and sum for
@@ -255,20 +200,6 @@ func TestInstrumentDurationCarriesFailureOutcome(t *testing.T) {
 	}
 }
 
-// Record is the counter-only primitive: it must not emit a duration, otherwise
-// adapters would report a meaningless latency for every request.
-func TestRecordDoesNotEmitDuration(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-	resetInstruments()
-
-	Record(context.Background(), "/users/:id", false)
-
-	if count, _, found := histogram(t, reader, "/users/:id", "success"); found || count != 0 {
-		t.Errorf("Record emitted %d duration observations, want 0", count)
-	}
-}
-
 // otel's global meter delegates to the FIRST real MeterProvider and never
 // re-delegates, so instruments cached here would stay bound to it forever —
 // silently writing into a retired pipeline after a shutdown, and recording
@@ -281,8 +212,8 @@ func TestInstrumentsFollowTheCurrentProvider(t *testing.T) {
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(first)))
 	resetInstruments()
 
-	Record(context.Background(), "probe", false)
-	if got := counterValue(t, first, "probe", "success"); got != 1 {
+	Instrument(context.Background(), "probe")(nil)
+	if got, _, _ := histogram(t, first, "probe", "success"); got != 1 {
 		t.Fatalf("first provider count = %d, want 1", got)
 	}
 
@@ -290,12 +221,12 @@ func TestInstrumentsFollowTheCurrentProvider(t *testing.T) {
 	second := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(second)))
 
-	Record(context.Background(), "probe", false)
+	Instrument(context.Background(), "probe")(nil)
 
-	if got := counterValue(t, second, "probe", "success"); got != 1 {
+	if got, _, _ := histogram(t, second, "probe", "success"); got != 1 {
 		t.Errorf("second provider count = %d, want 1 — instruments did not follow the swap", got)
 	}
-	if got := counterValue(t, first, "probe", "success"); got != 1 {
+	if got, _, _ := histogram(t, first, "probe", "success"); got != 1 {
 		t.Errorf("first provider count = %d, want it frozen at 1 — still receiving after the swap", got)
 	}
 }
@@ -307,25 +238,10 @@ func TestInstrumentsBuildLazilyWithoutRebind(t *testing.T) {
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	resetInstruments()
 
-	Record(context.Background(), "lazy", false)
-	if got := counterValue(t, reader, "lazy", "success"); got != 1 {
+	Instrument(context.Background(), "lazy")(nil)
+	if got, _, _ := histogram(t, reader, "lazy", "success"); got != 1 {
 		t.Errorf("count = %d, want 1", got)
 	}
-}
-
-// counterValue collects from reader and returns the endpoint.requests value for
-// {endpoint,outcome}.
-func counterValue(t *testing.T, reader *sdkmetric.ManualReader, endpoint, outcome string) int64 {
-	t.Helper()
-	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("collect: %v", err)
-	}
-	success, failure := outcomeCounts(t, rm, endpoint)
-	if outcome == "failure" {
-		return failure
-	}
-	return success
 }
 
 // failingMeter reports an error for every instrument, standing in for a
@@ -352,7 +268,6 @@ func TestInstrumentCreationFailureDegradesGracefully(t *testing.T) {
 	resetInstruments()
 
 	ctx := context.Background()
-	Record(ctx, "degraded", false)
 	func() (err error) {
 		defer Instrument(ctx, "degraded")(&err)
 		return errors.New("boom")
@@ -360,7 +275,7 @@ func TestInstrumentCreationFailureDegradesGracefully(t *testing.T) {
 	RecordPanic(ctx, "kaboom")
 
 	i := get()
-	if i.requests != nil || i.duration != nil || i.panics != nil {
+	if i.duration != nil || i.panics != nil {
 		t.Error("instruments should be nil when the provider rejects them")
 	}
 
@@ -369,8 +284,8 @@ func TestInstrumentCreationFailureDegradesGracefully(t *testing.T) {
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	resetInstruments()
 
-	Record(ctx, "recovered", false)
-	if got := counterValue(t, reader, "recovered", "success"); got != 1 {
+	Instrument(ctx, "recovered")(nil)
+	if got, _, _ := histogram(t, reader, "recovered", "success"); got != 1 {
 		t.Errorf("count after recovery = %d, want 1", got)
 	}
 }
@@ -389,7 +304,7 @@ func TestInstrumentFailureWarningNamesTheErrors(t *testing.T) {
 	// this provider must not be hidden by a warning that fired against another.
 	otel.SetMeterProvider(failingProvider{})
 	resetInstruments()
-	Record(context.Background(), "probe", false)
+	Instrument(context.Background(), "probe")(nil)
 
 	out := buf.String()
 	if out == "" {

@@ -1,7 +1,7 @@
 // Package gintel wires the telemetry library into a Gin engine: recovery,
-// route-tagged spans, optional per-endpoint metrics, and the core net/http
-// Handler. The package name differs from the directory so it never collides
-// with gin-gonic's "gin" — no alias needed:
+// route-tagged spans, and the core net/http Handler. The package name differs
+// from the directory so it never collides with gin-gonic's "gin" — no alias
+// needed:
 //
 //	import "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // package gintel
 package gintel
@@ -17,10 +17,9 @@ import (
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
-// Instrument installs Recovery and RouteTag on engine — plus Metrics under
-// nethttp.WithEndpointMetrics() — and returns it wrapped in nethttp.Handler,
-// ready to serve. Other nethttp options are forwarded. The handler wraps the
-// engine by reference, so routes registered later are still served.
+// Instrument installs Recovery and RouteTag on engine and returns it wrapped in
+// nethttp.Handler, ready to serve. nethttp options are forwarded. The handler
+// wraps the engine by reference, so routes registered later are still served.
 //
 // Call it right after gin.New(), before registering routes: Gin applies global
 // middleware only to routes registered afterward, so a late call would
@@ -39,14 +38,18 @@ func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler {
 		engine.Use(Recovery())
 	}
 	engine.Use(RouteTag())
-	if s.EndpointMetrics {
-		engine.Use(Metrics())
-	}
 	return nethttp.Handler(engine, opts...)
 }
 
 // Recovery forwards panics to endpoint.Recovered, tagging the panic counter with
 // the matched route, and responds 500. http.ErrAbortHandler is re-raised.
+//
+// It replaces gin.Recovery rather than sitting under it: recover() consumes the
+// panic, so only the innermost recovery records anything. Gin runs Use middleware
+// outermost-first, so a gin.Recovery registered after Instrument is inner to this
+// one and silently takes over the count. gin.Default() registers before, so its
+// count is fine, but it turns http.ErrAbortHandler into a 500 instead of dropping
+// the connection.
 func Recovery() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
@@ -81,22 +84,5 @@ func RouteTag() gin.HandlerFunc {
 			nethttp.StampRoute(c.Request.Context(), c.Request.Method, route)
 		}
 		c.Next()
-	}
-}
-
-// Metrics records one endpoint.requests data point per request, keyed by the
-// matched route template. Outcome follows nethttp.RecordRoute's shared rule, so
-// it matches the echo and chi adapters. A panicking handler unwinds past the
-// record call, so panics land on the panic counter instead.
-//
-// c.Errors is deliberately not consulted: treating it as a failure would make a
-// gin 4xx mean something different from an echo or chi 4xx.
-//
-// Opt in via Instrument(engine, nethttp.WithEndpointMetrics()).
-func Metrics() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		route := c.FullPath()
-		c.Next()
-		nethttp.RecordRoute(c.Request.Context(), route, c.Writer.Status())
 	}
 }

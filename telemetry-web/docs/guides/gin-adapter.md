@@ -1,8 +1,8 @@
 # Guide: integrating telemetry with Gin (via the adapter)
 
 The `adapters/gin` module wires the whole library into a Gin service in **one
-call**: framework-native panic recovery, automatic per-endpoint metrics keyed by
-the *matched route template*, and the core server spans + metrics. This is the
+call**: framework-native panic recovery, server spans and metrics keyed by the
+*matched route template*, and trace-correlated logging. This is the
 recommended path for a Gin app.
 
 See also: [API reference](../reference.md) · [Echo adapter guide](echo-adapter.md) ·
@@ -74,7 +74,7 @@ func main() {
 
     // 2. Build the engine and instrument it BEFORE registering routes.
     engine := gin.New()
-    engine.Use(gin.Logger()) // optional; do NOT use gin.Default() (its recovery would pre-empt ours)
+    engine.Use(gin.Logger()) // optional; prefer gin.New() + Logger over gin.Default(), see below
     handler := gintel.Instrument(engine)
 
     // ... register routes on `engine` here ...
@@ -102,21 +102,43 @@ func main() {
 so global middleware must be installed first. The returned `handler` wraps the
 engine *by reference*, so routes you register afterward are still served.
 
-**Do not use `gin.Default()`** — but not for the reason you might expect. Its
-`Use(Logger(), Recovery())` runs at construction, so `gin.Recovery` ends up
-*outside* `gintel.Recovery` and the telemetry recovery still sees handler panics
-first; the count stays at exactly 1.
+### If you already use `gin.Recovery()` or `gin.Default()`
 
-The real problem is that `gin.Recovery` has **no `http.ErrAbortHandler`
-exemption**. That sentinel means "drop this connection without a response", and
-`gintel.Recovery` re-raises it deliberately; `gin.Recovery` swallows it and turns it
-into a 500, so the connection is not dropped and you get a duplicate stack log.
-Use `gin.New()` and add `gin.Logger()` yourself if you want request logging.
+`recover()` consumes the panic, so **the innermost recovery is the only one that
+records it**. Gin runs `Use` middleware outermost-first, so placement decides:
 
-The configuration that genuinely breaks the panic metric is installing a framework
-recovery **after** `Instrument` — `engine.Use(gin.Recovery())` at that point is
-inner to `gintel.Recovery`, consumes the panic first, and leaves
-`http.server.panics` at zero. Neither adapter can detect this; do not do it.
+```go
+engine.Use(gin.Recovery())          // OUTER to ours: harmless, panic still counted
+handler := gintel.Instrument(engine)
+```
+
+```go
+handler := gintel.Instrument(engine)
+engine.Use(gin.Recovery())          // INNER to ours: swallows it, http.server.panics stays flat
+```
+
+The second fails silently: the request still answers `500`, only the metric and the
+span exception go missing. Nothing in the adapter can detect it.
+
+**`gin.Default()` is the first case, so the count is fine** — its
+`Use(Logger(), Recovery())` runs at construction, before `Instrument`. Its real
+problem is smaller and different: `gin.Recovery` has **no `http.ErrAbortHandler`
+exemption**. That sentinel means "drop this connection without a response";
+`gintel.Recovery` re-raises it deliberately, `gin.Recovery` turns it into a `500`,
+so the connection is not dropped and you get a duplicate stack log. Prefer
+`gin.New()` plus `gin.Logger()` if you want request logging.
+
+If you want your own recovery to be innermost (custom response body, extra
+logging), hand recording over explicitly:
+
+```go
+engine.Use(myRecovery())                                        // calls endpoint.Recovered
+handler := gintel.Instrument(engine, nethttp.WithoutRecovery())
+```
+
+See [Recovery middleware](echo-raw.md#3-recovery-middleware) for the shape — it is
+a single call, and returning `false` is your signal to re-panic
+`http.ErrAbortHandler`.
 
 ---
 
@@ -127,15 +149,10 @@ For every matched route, with **zero per-handler code**:
 - `http.route` stamped on the server span **and** the standard
   `http.server.request.duration` metric, and the span renamed to the semconv
   `"{method} {route}"` form, so traces and semconv metrics are route-attributed.
-- Optionally `endpoint.requests{endpoint="/api/v1/tenants/:id", outcome="success|failure"}`
-  — `failure` when the status the request answers with is `≥ 500`, the same rule
-  every adapter uses; a 4xx is a client error and counts as `success`. **Off by
-  default**, since the duration histogram above already carries route, method and
-  status; turn it on with `Instrument(engine, nethttp.WithEndpointMetrics())`.
-
-  Note that `c.Error(...)` does **not** override the status: a handler that
-  records an error but still answers 400 counts as a success, so `outcome` means
-  the same thing here as in the echo and chi adapters.
+  Because that metric carries `http.response.status_code` too, request and failure
+  rates per route come from it directly — there is no separate per-endpoint
+  counter. `c.Error(...)` is not consulted anywhere: the recorded status is the one
+  the client received.
 - The standard `http.server.request.duration` / `active_requests` and a server
   span (from the core `nethttp.Handler` that `Instrument` wraps around the engine).
   To keep k8s probes and `/metrics` scrapes out of traces and metrics, opt in to
@@ -146,12 +163,15 @@ For every matched route, with **zero per-handler code**:
 Example queries (PromQL, if exporting to Prometheus via the collector):
 
 ```promql
-# per-endpoint request rate
-sum by (endpoint) (rate(endpoint_requests_total[5m]))
+# request rate per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
 
-# per-endpoint failure ratio
-sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
-  / sum by (endpoint) (rate(endpoint_requests_total[5m]))
+# failure ratio per route
+sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+  / sum by (http_route) (rate(http_server_request_duration_seconds_count[5m]))
+
+# p95 latency per route
+histogram_quantile(0.95, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket[5m])))
 ```
 
 > **Two layers, one count.** `Instrument` installs `gintel.Recovery()` *and* keeps
@@ -176,7 +196,6 @@ If you maintain your own middleware chain, use the pieces directly instead of
 engine := gin.New()
 engine.Use(gintel.Recovery()) // panic -> Recovered + 500
 engine.Use(gintel.RouteTag()) // http.route -> span + duration metric
-engine.Use(gintel.Metrics())  // per-endpoint metrics by route template (optional)
 // ... your other middleware, then routes ...
 
 srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + server metrics
@@ -244,10 +263,10 @@ client := &http.Client{
 
 ## Notes
 
-- Per-endpoint metric cardinality is bounded because `Metrics()` uses
-  `c.FullPath()` (the template `/api/v1/tenants/:id`), never the raw path.
-  Unmatched requests (404 scans) are skipped.
-- Panicked requests appear on `http.server.panics`, not as a per-endpoint
-  `failure` data point — consistent with the library's panic philosophy.
+- Metric cardinality is bounded because `RouteTag()` stamps `c.FullPath()` (the
+  template `/api/v1/tenants/:id`), never the raw path. Unmatched requests (404
+  scans) get no `http.route` at all, so a scan mints no time series.
+- Panicked requests appear on `http.server.panics` and as a `500` on the duration
+  metric.
 - Nothing is exported until a collector is reachable at the configured OTLP
   endpoint; for local dev run one and set `Insecure: true`.

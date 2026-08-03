@@ -77,7 +77,7 @@ func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 // on chi >= v5.2) as-is — truthful and cardinality-bounded.
 func TestMountedSubrouterPatternRecordedAsIs(t *testing.T) {
 	r := chi.NewRouter()
-	h := Instrument(r, nethttp.WithEndpointMetrics())
+	h := Instrument(r)
 	sub := chi.NewRouter()
 	sub.Get("/users/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	r.Mount("/api", sub)
@@ -88,9 +88,9 @@ func TestMountedSubrouterPatternRecordedAsIs(t *testing.T) {
 	}
 	after := adaptertest.Collect(t)
 
-	if delta := adaptertest.EndpointOutcome(after, "/api/users/{id}", "success") -
-		adaptertest.EndpointOutcome(before, "/api/users/{id}", "success"); delta != 1 {
-		t.Errorf("mounted pattern success delta = %d, want 1", delta)
+	if delta := adaptertest.DurationCount(after, "/api/users/{id}") -
+		adaptertest.DurationCount(before, "/api/users/{id}"); delta != 1 {
+		t.Errorf("mounted pattern observation delta = %d, want 1", delta)
 	}
 }
 
@@ -108,25 +108,6 @@ func TestRouteStampedOnPanickedRequest(t *testing.T) {
 	}
 	if !adaptertest.RouteOnSpan("/chi/boom/{id}") {
 		t.Error("panicked request must still carry http.route on its span")
-	}
-}
-
-// Endpoint metrics are opt-in: without WithEndpointMetrics no counter is
-// emitted, only the otelhttp duration histogram.
-func TestEndpointMetricsAreOptIn(t *testing.T) {
-	r := chi.NewRouter()
-	h := Instrument(r)
-	r.Get("/chi/optin", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-
-	before := adaptertest.EndpointTotal(adaptertest.Collect(t))
-	get(t, h, "/chi/optin")
-	after := adaptertest.EndpointTotal(adaptertest.Collect(t))
-
-	if after != before {
-		t.Errorf("endpoint.requests must be off by default, got delta %d", after-before)
-	}
-	if !adaptertest.RouteOnDuration(adaptertest.Collect(t), "/chi/optin") {
-		t.Error("the duration histogram must still carry http.route")
 	}
 }
 
@@ -148,22 +129,15 @@ func TestPanicCountedOnce(t *testing.T) {
 }
 
 // Instrument forwards nethttp options, so probe filtering is wireable through
-// the adapter's one-call path — and the exclusion must cover the per-endpoint
-// counter, not just otelhttp's own metrics.
+// the adapter's one-call path.
 func TestInstrumentForwardsSkipPaths(t *testing.T) {
 	adaptertest.Reset()
 	r := chi.NewRouter()
-	h := Instrument(r, nethttp.WithEndpointMetrics(), nethttp.WithSkipPaths("/chi/skipme"))
+	h := Instrument(r, nethttp.WithSkipPaths("/chi/skipme"))
 	r.Get("/chi/skipme", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
-	before := adaptertest.EndpointTotal(adaptertest.Collect(t))
 	if rec := get(t, h, "/chi/skipme"); rec.Code != http.StatusOK {
 		t.Fatalf("skipped path must still be served: status = %d", rec.Code)
-	}
-	after := adaptertest.EndpointTotal(adaptertest.Collect(t))
-
-	if after != before {
-		t.Errorf("skipped path must not record endpoint.requests, got delta %d", after-before)
 	}
 	if adaptertest.RouteOnDuration(adaptertest.Collect(t), "/chi/skipme") {
 		t.Error("skipped path must not appear on the duration metric")

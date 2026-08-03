@@ -25,9 +25,8 @@ import (
 type Option func(*config)
 
 type config struct {
-	skipPaths       []string
-	noRecover       bool
-	endpointMetrics bool
+	skipPaths []string
+	noRecover bool
 }
 
 // Settings is the resolved option set. Adapters call Resolve to learn which
@@ -35,8 +34,6 @@ type config struct {
 type Settings struct {
 	// Recovery reports whether the built-in recovery middleware is installed.
 	Recovery bool
-	// EndpointMetrics reports whether WithEndpointMetrics was requested.
-	EndpointMetrics bool
 }
 
 // Resolve applies opts and reports the result, so an adapter and the Handler
@@ -46,18 +43,7 @@ func Resolve(opts ...Option) Settings {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return Settings{
-		Recovery:        !cfg.noRecover,
-		EndpointMetrics: cfg.endpointMetrics,
-	}
-}
-
-// WithEndpointMetrics opts in to the endpoint.requests counter in an adapter's
-// Instrument. Off by default: once StampRoute runs, http.server.request.duration
-// already carries route, method, and status, making it a strict superset. Turn
-// this on when you want the simpler {endpoint,outcome} label pair.
-func WithEndpointMetrics() Option {
-	return func(c *config) { c.endpointMetrics = true }
+	return Settings{Recovery: !cfg.noRecover}
 }
 
 // DefaultSkipPaths are the usual noise endpoints — k8s health probes and the
@@ -69,9 +55,8 @@ func WithEndpointMetrics() Option {
 var DefaultSkipPaths = []string{"/healthz", "/readyz", "/livez", "/metrics"}
 
 // WithSkipPaths excludes the given exact request paths from instrumentation: no
-// span, no http.server.* metrics, and no endpoint.requests. The request is still
-// served and recovery still applies. Repeated calls accumulate; by default
-// nothing is skipped.
+// span and no http.server.* metrics. The request is still served and recovery
+// still applies. Repeated calls accumulate; by default nothing is skipped.
 //
 // The filter runs before trace context is extracted, so a skipped path also
 // drops any inbound traceparent and will not continue a caller's trace. Fine for
@@ -81,16 +66,13 @@ func WithSkipPaths(paths ...string) Option {
 }
 
 // WithoutRecovery installs no recovery at all — not Handler's, and not the
-// framework middleware an adapter's Instrument would add, since that consults
-// Resolve too. Only pass it when an outer layer recovers and calls
-// endpoint.RecordPanic itself.
+// framework middleware an adapter's Instrument would add. Only pass it when an
+// outer layer recovers and calls endpoint.RecordPanic itself.
 //
-// A panic then escapes otelhttp, which costs more than the panic counter: its only
-// deferred work is span.End(), so the status, the response attributes, the span
-// rename and the metric record are all skipped. The span ends Unset with no
-// response attributes and the request contributes NO http.server.* metrics at all,
-// which makes a service panicking on every request look like it is serving zero
-// traffic. The same applies on the ErrAbortHandler re-raise path.
+// A panic then escapes otelhttp, whose only deferred work is span.End(): the span
+// ends Unset with no response attributes and the request contributes no
+// http.server.* metrics at all, so a service panicking on every request looks
+// like it is serving zero traffic. Same on the ErrAbortHandler re-raise path.
 func WithoutRecovery() Option {
 	return func(c *config) { c.noRecover = true }
 }
@@ -100,20 +82,18 @@ func WithoutRecovery() Option {
 type skipKey struct{}
 
 // skipped reports whether this request's path was excluded via WithSkipPaths.
-// Unexported: RecordRoute and StampRoute consult it for their callers, so nothing
-// outside this package ever needs to ask.
 func skipped(ctx context.Context) bool {
 	v, _ := ctx.Value(skipKey{}).(bool)
 	return v
 }
 
 // Handler is the composed inbound chain: otelhttp (spans + metrics) -> recovery
-// -> next. Frameworks that don't expose http.Handler chaining should instead
-// call endpoint.RecordPanic and endpoint.Record from their own middleware.
-// Every path is instrumented unless excluded via WithSkipPaths.
+// -> next. Frameworks that don't expose http.Handler chaining should instead call
+// StampRoute and endpoint.Recovered from their own middleware. Every path is
+// instrumented unless excluded via WithSkipPaths.
 func Handler(next http.Handler, opts ...Option) http.Handler {
 	// The config directly, not via Resolve: Handler is the one caller that needs
-	// the skip paths themselves, and Settings deliberately does not carry them.
+	// the skip paths themselves, which Settings does not carry.
 	cfg := config{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -124,8 +104,6 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		inner = Recovery(next)
 	}
 
-	// otelhttp reads the globals in its own defaults, so passing them here
-	// would only restate them.
 	instrumented := otelhttp.NewHandler(inner, "server",
 		otelhttp.WithFilter(func(r *http.Request) bool { return !skipped(r.Context()) }),
 	)
@@ -150,10 +128,9 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 // trackWrites returns w wrapped so responded reports whether anything has been
 // committed to the client yet.
 //
-// httpsnoop is used rather than an embedded http.ResponseWriter because it
-// re-exposes exactly the optional interfaces w already implements. Embedding
-// would promote only Header/Write/WriteHeader, and gin's and echo's Flush
-// type-assert for Flusher — streaming handlers would panic outright.
+// httpsnoop rather than an embedded http.ResponseWriter: it re-exposes exactly
+// the optional interfaces w already implements, where embedding would promote
+// only Header/Write/WriteHeader and make streaming handlers panic.
 func trackWrites(w http.ResponseWriter) (wrapped http.ResponseWriter, responded func() bool) {
 	var wrote bool
 	wrapped = httpsnoop.Wrap(w, httpsnoop.Hooks{
@@ -167,13 +144,9 @@ func trackWrites(w http.ResponseWriter) (wrapped http.ResponseWriter, responded 
 		Hijack: func(next httpsnoop.HijackFunc) httpsnoop.HijackFunc {
 			return func() (net.Conn, *bufio.ReadWriter, error) { wrote = true; return next() }
 		},
-		// Flush and ReadFrom also commit an implicit 200 in net/http, and
-		// httpsnoop.Wrap passes unhooked methods straight through — so without
-		// these, io.Copy(w, src) or an SSE handler that flushes its headers leaves
-		// wrote false and a later panic makes Recovery call WriteHeader(500)
-		// pointlessly. otelhttp tracks the real status either way, so the only
-		// symptom is a "superfluous response.WriteHeader" line from net/http, but
-		// there is no reason to emit it.
+		// Flush and ReadFrom also commit an implicit 200, so without these an SSE
+		// or io.Copy handler leaves wrote false and a later panic makes Recovery
+		// call WriteHeader(500) pointlessly.
 		Flush: func(next httpsnoop.FlushFunc) httpsnoop.FlushFunc {
 			return func() { wrote = true; next() }
 		},
@@ -247,27 +220,8 @@ func routeAttrs(ctx context.Context) []attribute.KeyValue {
 	return nil
 }
 
-// RecordRoute emits one endpoint.requests data point for a matched route. It is
-// the single definition of "failure" every adapter shares: status >= 500. A 4xx
-// is the caller's fault, so it counts as a success.
-//
-// Unmatched routes (empty template) are skipped to bound 404-scan cardinality,
-// and WithSkipPaths exclusions are honored here too, not just in otelhttp.
-//
-// Adapters call this from their Metrics middleware; call it directly when
-// wiring a framework by hand.
-func RecordRoute(ctx context.Context, route string, status int) {
-	if route == "" || skipped(ctx) {
-		return
-	}
-	endpoint.Record(ctx, route, status >= 500)
-}
-
-// warnNoLabeler fires at most once per process: the condition is a wiring
-// mistake, not a per-request event. Deliberately NOT reset when Init installs new
-// providers, unlike endpoint's instrument warning — whether a labeler reaches
-// StampRoute depends on how the chain was built, which no re-Init changes, so
-// re-arming it could only repeat the same message.
+// warnNoLabeler fires at most once per process: a missing labeler is a wiring
+// mistake, not a per-request event, and no re-Init can change it.
 var warnNoLabeler sync.Once
 
 // StampRoute puts http.route on the active server span and on the otelhttp
@@ -280,13 +234,10 @@ var warnNoLabeler sync.Once
 // span attribute still lands but the metric one is dropped, and a warning is
 // logged once.
 //
-// A path excluded via WithSkipPaths returns immediately. otelhttp's filter
-// short-circuits before it injects the labeler, so a skipped request has neither
-// a labeler nor a recording span and there is nothing here to stamp — but the
-// adapters' RouteTag still runs, because a skip path is a registered route with a
-// real template. Without this the recommended
-// WithSkipPaths(DefaultSkipPaths...) setup would warn about a wiring mistake on
-// the first health probe.
+// A path excluded via WithSkipPaths returns immediately: it has neither a labeler
+// nor a recording span, but the adapters' RouteTag still runs for it, so without
+// this the recommended WithSkipPaths(DefaultSkipPaths...) setup would warn on the
+// first health probe.
 func StampRoute(ctx context.Context, method, route string) {
 	if skipped(ctx) {
 		return

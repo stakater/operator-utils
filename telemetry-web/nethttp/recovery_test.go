@@ -168,9 +168,6 @@ func TestResolveDefaults(t *testing.T) {
 	if !s.Recovery {
 		t.Error("recovery must be on by default")
 	}
-	if s.EndpointMetrics {
-		t.Error("endpoint metrics must be off by default")
-	}
 }
 
 // WrapClient adds propagation in place, and Transport(nil) falls back to the

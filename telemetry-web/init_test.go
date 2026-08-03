@@ -299,7 +299,7 @@ func TestInitRoutesSDKErrorsToTheLogger(t *testing.T) {
 // Cached instruments must follow the provider Init installs. otel's global meter
 // delegates to the first real provider and never re-delegates, so anything that
 // cached an instrument earlier would otherwise keep writing into the provider it
-// first saw, stranding endpoint.requests, endpoint.duration and the panic counter.
+// first saw, stranding endpoint.duration and the panic counter.
 //
 // Asserted on where the data lands, not on a notification mechanism: the endpoint
 // package compares the global provider per use, so there is no hook to observe.
@@ -307,7 +307,7 @@ func TestInitRebindsCachedInstruments(t *testing.T) {
 	// Bind the instruments to some other provider first.
 	stale := sdkmetric.NewManualReader()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(stale)))
-	endpoint.Record(context.Background(), "before-init", false)
+	endpoint.Instrument(context.Background(), "before-init")(nil)
 
 	live := sdkmetric.NewManualReader()
 	shutdown := initOnce(t)
@@ -315,7 +315,7 @@ func TestInitRebindsCachedInstruments(t *testing.T) {
 
 	// Stand in for Init's provider with one we can read, as the next test does.
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(live)))
-	endpoint.Record(context.Background(), "after-init", false)
+	endpoint.Instrument(context.Background(), "after-init")(nil)
 
 	if got := endpointPoints(t, live); got == 0 {
 		t.Error("instruments stayed bound to the earlier provider after a provider swap")
@@ -332,7 +332,7 @@ func TestShutdownStopsWritesToRetiredProvider(t *testing.T) {
 	// Stand in for Init's provider with one we can read.
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(retired)))
 
-	endpoint.Record(context.Background(), "probe", false)
+	endpoint.Instrument(context.Background(), "probe")(nil)
 	live := endpointPoints(t, retired)
 	if live == 0 {
 		t.Fatal("setup: nothing recorded into the provider before shutdown")
@@ -340,7 +340,7 @@ func TestShutdownStopsWritesToRetiredProvider(t *testing.T) {
 
 	_ = shutdown(bounded(t))
 
-	endpoint.Record(context.Background(), "probe", false)
+	endpoint.Instrument(context.Background(), "probe")(nil)
 	if got := endpointPoints(t, retired); got != live {
 		t.Errorf("retired provider received %d points after shutdown, want it frozen at %d", got, live)
 	}
@@ -355,12 +355,12 @@ func endpointPoints(t *testing.T, r *sdkmetric.ManualReader) int64 {
 	var total int64
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "endpoint.requests" {
+			if m.Name != "endpoint.duration" {
 				continue
 			}
-			if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
-				for _, dp := range sum.DataPoints {
-					total += dp.Value
+			if h, ok := m.Data.(metricdata.Histogram[float64]); ok {
+				for _, dp := range h.DataPoints {
+					total += int64(dp.Count)
 				}
 			}
 		}

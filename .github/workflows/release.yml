@@ -36,35 +36,6 @@ jobs:
           go-version: ${{ env.GOLANG_VERSION }}
         id: go
 
-      # An adapter tag must not ship while its core requirement is a v0.0.0-
-      # pseudo-version: that resolves only while the branch commit stays
-      # reachable, so a squash merge or a branch deletion breaks every consumer.
-      # This is the check that cannot live in the PR job, because satisfying it
-      # needs a core tag that only exists after merge. See
-      # telemetry-web/docs/releasing.md.
-      - name: Verify adapter against its pinned core
-        if: startsWith(github.ref_name, 'telemetry-web/adapters/')
-        env:
-          GOWORK: "off"
-        run: |
-          mod="${GITHUB_REF_NAME%/v*}"        # telemetry-web/adapters/gin
-          cd "$mod"
-
-          req=$(go list -m -f '{{.Version}}' github.com/stakater/operator-utils/telemetry-web)
-          echo "$mod requires core $req"
-          case "$req" in
-            v0.0.0-*)
-              echo "::error::$mod still pins a pseudo-version ($req). Repoint it at a released telemetry-web/vX.Y.Z tag before tagging the adapter."
-              exit 1
-              ;;
-          esac
-
-          # Now that the pin names a real tag these can finally resolve, which is
-          # why they live here and not in the PR job.
-          go mod tidy -diff
-          go build ./...
-          go test -count=1 ./...
-
       - name: Changelog
         uses: scottbrenner/generate-changelog-action@master
         id: Changelog

@@ -25,14 +25,10 @@ const (
 )
 
 // hasScheme reports whether the endpoint is URL-form (http://host:port) rather
-// than bare host:port; the two need different exporter options. A non-empty
-// scheme is not enough — "localhost:4317" parses with Scheme="localhost" — so
-// the test is that the scheme is followed by "://".
-//
-// The comparison is case-insensitive because url.Parse lowercases u.Scheme while
-// the input keeps its case, so "HTTP://host" would otherwise be classed as a bare
-// host and handed to WithEndpoint, which fails to parse and takes Init down with
-// an opaque net/url error.
+// than bare host:port; the two need different exporter options. A non-empty scheme
+// is not enough — "localhost:4317" parses with Scheme="localhost" — so the test is
+// that the scheme is followed by "://". Case-insensitive, because url.Parse
+// lowercases u.Scheme while the input keeps its case.
 func hasScheme(endpoint string) bool {
 	u, err := url.Parse(endpoint)
 	return err == nil && u.Scheme != "" &&
@@ -42,11 +38,10 @@ func hasScheme(endpoint string) bool {
 // resolveProtocol reports which transport to export one signal over. The
 // per-signal variable wins over the generic one, per the OTel spec.
 //
-// An unset value resolves to gRPC, which deviates from the spec default of
-// http/protobuf on purpose: gRPC has been this library's only transport, and
-// silently moving every existing deployment from port 4317 to 4318 would break
-// working pipelines. An explicit value is always honored, which is what matters
-// in practice, since the OpenTelemetry Operator injects one.
+// An unset value resolves to gRPC rather than the spec default of http/protobuf:
+// gRPC has been this library's only transport, and silently moving deployments
+// from port 4317 to 4318 would break working pipelines. An explicit value is
+// always honored.
 func resolveProtocol(signalVar string) string {
 	for _, name := range []string{signalVar, "OTEL_EXPORTER_OTLP_PROTOCOL"} {
 		p := strings.TrimSpace(os.Getenv(name))
@@ -57,9 +52,8 @@ func resolveProtocol(signalVar string) string {
 		case protoGRPC, protoHTTP:
 			return p
 		case protoJSON:
-			// The Go SDK ships no JSON encoder. A collector's OTLP/HTTP receiver
-			// accepts protobuf on the same port, so this reaches the intended
-			// endpoint rather than falling back to a different one.
+			// The Go SDK ships no JSON encoder, but a collector's OTLP/HTTP receiver
+			// accepts protobuf on the same port.
 			logging.Logger().Warn("telemetry: OTLP protocol http/json is not implemented by the Go SDK; "+
 				"exporting http/protobuf to the same HTTP endpoint instead",
 				"var", name, "value", p)
@@ -74,15 +68,12 @@ func resolveProtocol(signalVar string) string {
 }
 
 // endpointOpts builds the endpoint and TLS options shared by every exporter
-// variant. Each exporter package declares its own Option type, so the
-// constructors come in as parameters instead of this block being written four
-// times.
+// variant. Each exporter package declares its own Option type, so the constructors
+// come in as parameters instead of this block being written four times.
 //
-// Only Config.OTLPEndpoint is applied. When it is unset no endpoint option is
-// passed at all, leaving the exporter SDK's own env handling in charge
-// (OTEL_EXPORTER_OTLP_ENDPOINT, the per-signal overrides, and the default port).
-// Reading those here and feeding them to WithEndpoint would break spec-compliant
-// URL values.
+// Only Config.OTLPEndpoint is applied. When unset, no endpoint option is passed at
+// all, leaving the exporter SDK's own env handling in charge; reading those vars
+// here and feeding them to WithEndpoint would break spec-compliant URL values.
 func endpointOpts[O any](cfg Config, withEndpoint, withEndpointURL func(string) O, withInsecure func() O) []O {
 	var opts []O
 	if ep := cfg.OTLPEndpoint; ep != "" {

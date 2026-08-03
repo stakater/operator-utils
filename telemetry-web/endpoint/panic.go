@@ -15,22 +15,10 @@ import (
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
-// Recovered decides what a recovery middleware should do with a recovered value,
-// and records the telemetry when there is any to record. It returns false for
-// http.ErrAbortHandler, which the caller must re-panic: that sentinel is
-// net/http's "drop this connection without a response" signal, not an error.
-//
-// Every framework's recovery reduces to the same three lines, so the rule lives
-// here once instead of in each adapter:
-//
-//	defer func() {
-//	    if rec := recover(); rec != nil {
-//	        if !endpoint.Recovered(ctx, rec) {
-//	            panic(rec)
-//	        }
-//	        // ... respond 500 the framework's way ...
-//	    }
-//	}()
+// Recovered records a recovered panic and reports whether the caller may respond
+// normally. It returns false for http.ErrAbortHandler, which the caller must
+// re-panic: that sentinel is net/http's "drop this connection without a
+// response" signal, not an error.
 //
 // attrs are attached to http.server.panics; pass the matched route template when
 // the caller knows it.
@@ -44,22 +32,17 @@ func Recovered(ctx context.Context, recovered any, attrs ...attribute.KeyValue) 
 }
 
 // RecordPanic records an exception on the active span, logs at error with
-// trace_id and a stack, and increments http.server.panics. Call it from a
-// recovery middleware (any framework), passing the request context and recovered
-// value. It does NOT re-raise or write a response — the caller decides how to
-// respond, and does not filter http.ErrAbortHandler either; prefer Recovered,
-// which does both.
+// trace_id and a stack, and increments http.server.panics. It does NOT re-raise
+// or write a response, and does not filter http.ErrAbortHandler; prefer
+// Recovered, which does both.
 //
 // attrs land on the counter. Pass the matched route template so a spike can be
-// traced to an endpoint. Anything unbounded (a raw path, a raw method) would
-// blow up the time series count, so nothing is derived from the request here.
+// traced to an endpoint. Nothing is derived from the request here, since a raw
+// path or method would blow up the time series count.
 func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue) {
-	// Captured once and shared. The exception event is built by hand rather than
-	// via span.RecordError for two reasons: RecordError takes exception.type from
-	// reflect.TypeOf, so wrapping the value in fmt.Errorf would report
-	// errors.errorString for every panic in the fleet and make "which class of
-	// panic is spiking" unanswerable; and its own stack capture uses a fixed 2 KB
-	// buffer with no growth loop, which cuts a deep middleware stack mid-line.
+	// Built by hand rather than via span.RecordError: that takes exception.type
+	// from reflect.TypeOf, so every panic would report errors.errorString, and its
+	// stack capture uses a fixed 2 KB buffer that truncates deep stacks.
 	stack := string(debug.Stack())
 	message := fmt.Sprint(recovered)
 
@@ -71,10 +54,8 @@ func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue
 	))
 	span.SetStatus(codes.Error, "panic")
 
-	// The stack goes on the log as well as the span. On the span alone it is lost
-	// whenever tracing is off, the sampler dropped the trace, or the collector is
-	// unreachable, and a panic is the one event where the stack is the whole
-	// point.
+	// Also on the log, since the span is lost when tracing is off, the trace is
+	// unsampled, or the collector is unreachable.
 	logging.Logger().ErrorContext(ctx, "recovered panic",
 		"panic", message,
 		"stack", stack)
