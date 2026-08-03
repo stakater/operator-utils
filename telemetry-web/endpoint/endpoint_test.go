@@ -1,23 +1,31 @@
 package endpoint
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
+	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
-// resetInstruments rebinds the counters to the current global MeterProvider so
-// each test's ManualReader sees its own data. Test-only.
+// resetInstruments rebinds the instruments to the current global MeterProvider
+// so each test's ManualReader sees its own data. This is the same path
+// telemetry.Init drives via rebind.Notify.
 func resetInstruments() {
-	once = sync.Once{}
-	ensure()
+	rebind.Notify()
 }
 
 func TestRecordOutcomes(t *testing.T) {
@@ -196,5 +204,136 @@ func TestRecordDoesNotEmitDuration(t *testing.T) {
 
 	if count, _, found := histogram(t, reader, "/users/:id", "success"); found || count != 0 {
 		t.Errorf("Record emitted %d duration observations, want 0", count)
+	}
+}
+
+// M1: otel's global meter delegates to the FIRST real MeterProvider and never
+// re-delegates, so instruments cached here would stay bound to it forever —
+// silently writing into a retired pipeline after a shutdown, and recording
+// nothing into the provider a second Init installs. rebind.Notify (which
+// telemetry.Init calls) must move them to the current provider.
+func TestRebindMovesInstrumentsToTheCurrentProvider(t *testing.T) {
+	first := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(first)))
+	resetInstruments()
+
+	Record(context.Background(), "probe", false)
+	if got := counterValue(t, first, "probe", "success"); got != 1 {
+		t.Fatalf("first provider count = %d, want 1", got)
+	}
+
+	// Stand in for a second Init: new provider, then the rebind Init performs.
+	second := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(second)))
+	rebind.Notify()
+
+	Record(context.Background(), "probe", false)
+
+	if got := counterValue(t, second, "probe", "success"); got != 1 {
+		t.Errorf("second provider count = %d, want 1 — instruments did not rebind", got)
+	}
+	if got := counterValue(t, first, "probe", "success"); got != 1 {
+		t.Errorf("first provider count = %d, want it frozen at 1 — still receiving after rebind", got)
+	}
+}
+
+// Without a rebind the instruments must still work: the lazy first build binds
+// to whatever provider is global at that moment.
+func TestInstrumentsBuildLazilyWithoutRebind(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	resetInstruments()
+
+	Record(context.Background(), "lazy", false)
+	if got := counterValue(t, reader, "lazy", "success"); got != 1 {
+		t.Errorf("count = %d, want 1", got)
+	}
+}
+
+// counterValue collects from reader and returns the endpoint.requests value for
+// {endpoint,outcome}.
+func counterValue(t *testing.T, reader *sdkmetric.ManualReader, endpoint, outcome string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	success, failure := outcomeCounts(t, rm, endpoint)
+	if outcome == "failure" {
+		return failure
+	}
+	return success
+}
+
+// failingMeter reports an error for every instrument, standing in for a
+// MeterProvider that rejects them (duplicate registration, bad configuration).
+type failingMeter struct{ metricnoop.Meter }
+
+func (failingMeter) Int64Counter(string, ...metric.Int64CounterOption) (metric.Int64Counter, error) {
+	return nil, errors.New("instrument rejected")
+}
+
+func (failingMeter) Float64Histogram(string, ...metric.Float64HistogramOption) (metric.Float64Histogram, error) {
+	return nil, errors.New("instrument rejected")
+}
+
+type failingProvider struct{ metricnoop.MeterProvider }
+
+func (failingProvider) Meter(string, ...metric.MeterOption) metric.Meter { return failingMeter{} }
+
+// If the provider refuses to create instruments, the affected metrics are
+// skipped and the library keeps working. Recording must not panic on the nil
+// instrument — a telemetry failure must never become an application failure.
+func TestInstrumentCreationFailureDegradesGracefully(t *testing.T) {
+	otel.SetMeterProvider(failingProvider{})
+	resetInstruments()
+
+	ctx := context.Background()
+	Record(ctx, "degraded", false)
+	func() (err error) {
+		defer Instrument(ctx, "degraded")(&err)
+		return errors.New("boom")
+	}()
+	RecordPanic(ctx, "kaboom")
+
+	i := get()
+	if i.requests != nil || i.duration != nil || i.panics != nil {
+		t.Error("instruments should be nil when the provider rejects them")
+	}
+
+	// And recovery is automatic: a working provider plus a rebind restores them.
+	reader := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	rebind.Notify()
+
+	Record(ctx, "recovered", false)
+	if got := counterValue(t, reader, "recovered", "success"); got != 1 {
+		t.Errorf("count after recovery = %d, want 1", got)
+	}
+}
+
+// The diagnostic exists to name which instrument failed. A []error value is
+// marshalled by slog's JSON handler as [{},{}] — the messages vanish — so the
+// errors must be joined into a single error value.
+func TestInstrumentFailureWarningNamesTheErrors(t *testing.T) {
+	var buf bytes.Buffer
+	logging.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { logging.SetDefault(nil) })
+
+	// warnOnce is process-wide, so drive build() directly rather than relying on
+	// this being the first failure in the run.
+	otel.SetMeterProvider(failingProvider{})
+	warnOnce = sync.Once{}
+	rebind.Notify()
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("no warning logged")
+	}
+	if strings.Contains(out, "[{}") {
+		t.Errorf("errors marshalled as empty objects, messages lost: %s", out)
+	}
+	if !strings.Contains(out, "instrument rejected") {
+		t.Errorf("warning does not name the failure: %s", out)
 	}
 }

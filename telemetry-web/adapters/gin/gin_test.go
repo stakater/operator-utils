@@ -187,3 +187,25 @@ func TestWithoutRecoveryHonoredThroughInstrument(t *testing.T) {
 		t.Errorf("WithoutRecovery must record no panic, got delta %d", delta)
 	}
 }
+
+// Middleware registered with engine.Use BEFORE Instrument runs upstream of
+// gintel.Recovery — and Instrument's guard cannot catch it, since middleware
+// creates no routes. Only nethttp.Handler's recovery is outside the engine,
+// which is why Instrument keeps it.
+func TestPreInstrumentMiddlewarePanicIsRecoveredAndCounted(t *testing.T) {
+	e := gin.New()
+	e.Use(func(*gin.Context) { panic("pre-instrument boom") })
+	h := Instrument(e)
+	e.GET("/gin/pre", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	before := adaptertest.PanicCount(adaptertest.Collect(t))
+	rec := get(t, h, "/gin/pre")
+	after := adaptertest.PanicCount(adaptertest.Collect(t))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if delta := after - before; delta != 1 {
+		t.Errorf("panic counter delta = %d, want 1", delta)
+	}
+}

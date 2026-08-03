@@ -4,7 +4,10 @@ A small, **framework-agnostic** Go library that gives any service consistent
 OpenTelemetry **traces + metrics + trace-correlated logs** with a two-call setup.
 It is *composition over OpenTelemetry* — it leans on the OTel SDK, `otelhttp`, and
 `contrib/runtime`; it does not hand-roll spans, propagation, or instruments, and
-it imports **no web framework**.
+it imports **no web framework**. Its only non-OTel dependency is
+[`felixge/httpsnoop`](https://github.com/felixge/httpsnoop), already in the graph
+via `otelhttp`, used so panic recovery can wrap a `ResponseWriter` without
+dropping `Flusher`/`Hijacker`.
 
 ```
 import (
@@ -325,32 +328,28 @@ func main() {
 }
 ```
 
-Every adapter exposes the same three things:
+Every adapter exposes the same four things:
 
-- **`Instrument(engine, opts ...nethttp.Option) http.Handler`** — installs
-  `Recovery` and `RouteTag` (plus `Metrics` when you pass
-  `nethttp.WithEndpointMetrics()`), wraps the engine in `nethttp.Handler`, and
-  returns a plain `http.Handler` to serve. `nethttp` options are forwarded.
+- **`Instrument(engine, opts ...nethttp.Option) http.Handler`** — installs the
+  middleware below, wraps the engine in `nethttp.Handler`, and returns a plain
+  `http.Handler` to serve. `nethttp` options are forwarded.
+- **`Recovery()`** — panic → `endpoint.RecordPanic` + `500`. Installed by
+  `Instrument` on gin and echo; on chi it *is* `nethttp.Recovery`, which
+  `Handler` already applies.
 - **`RouteTag()`** — stamps `http.route` on the span and the duration metric and
   renames the span to `"{method} {route}"`.
 - **`Metrics()`** — records `endpoint.requests`, keyed by the matched route
-  template. Opt-in.
+  template. Opt-in via `nethttp.WithEndpointMetrics()`.
 
-Per-framework notes:
-
-- **Gin** — call `Instrument` *before* registering routes; Gin applies global
-  middleware only to routes registered afterward. It panics if you call it late,
-  rather than silently instrumenting nothing.
-- **chi** — call `Instrument` before registering routes (chi panics on late
-  `Use`). It does **not** install `chitel.Recovery()`, because `nethttp.Handler`
-  already recovers and `chitel.Recovery` *is* `nethttp.Recovery` — installing both
-  would count every panic twice.
-- **Echo** — ordering doesn't matter; Echo applies `Use` middleware to routes
-  registered before or after the call.
+Ordering: **gin** and **chi** need `Instrument` *before* any route is registered
+and panic if you call it late, rather than instrumenting nothing. **Echo** applies
+`Use` middleware to routes registered either side of the call, so it doesn't care.
 
 All three classify outcome identically (`status >= 500` is a failure) via
-`nethttp.RecordRoute`, and the shared conformance suite in `adaptertest` fails the
-build if one of them drifts.
+`nethttp.RecordRoute`, and a panic is counted exactly once on each. The shared
+conformance suite in `adaptertest` fails the build if one of them drifts. See
+[the adapter contract](docs/reference.md#the-adapter-contract) for the failure
+rule and how the recovery layers fit together.
 
 ---
 
@@ -370,9 +369,9 @@ exemplars only — to keep cardinality bounded.
 
 ### Why `endpoint.requests` is opt-in for HTTP
 
-`http.server.request.duration` is a strict superset of it: once `RouteTag` stamps
-`http.route`, the histogram carries route, method, and status code, and its
-`_count` gives you request and failure rates:
+Once `RouteTag` stamps `http.route`, `http.server.request.duration` carries
+route, method, and status code, and its `_count` gives you request and failure
+rates — a strict superset:
 
 ```promql
 sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
@@ -387,12 +386,9 @@ operations via `endpoint.Instrument`, where no `otelhttp` histogram exists.
 
 ## Notes & limits
 
-- **`http.route` needs a router to supply it.** Bare `otelhttp` on a wrapped
-  engine cannot know the matched template, so `nethttp.StampRoute` exists to
-  supply it: the adapters call it from `RouteTag`, and the raw guides show the
-  hand-wired equivalent. Once stamped, the built-in `http.server.*` metrics *do*
-  break down per route and the span is renamed to `"{method} {route}"`. You do
-  **not** need `otelgin`/`otelchi` alongside this library.
+- **You do not need `otelgin`/`otelchi`.** Bare `otelhttp` cannot know the matched
+  template, which is what `StampRoute` supplies; once stamped, the built-in
+  `http.server.*` metrics break down per route on their own.
 - **A skipped path loses inbound trace context.** `WithSkipPaths` filters before
   extraction, so a skipped path will not continue a caller's trace. Correct for
   probes, wrong for real paths.

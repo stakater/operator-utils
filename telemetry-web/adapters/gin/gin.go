@@ -1,7 +1,7 @@
 // Package gintel wires the telemetry library into a Gin engine: recovery,
-// automatic per-endpoint metrics keyed by the matched route template, and the
-// core net/http Handler (spans + server metrics). The package name differs from
-// the directory so it never collides with gin-gonic's "gin" — no alias needed:
+// route-tagged spans, optional per-endpoint metrics, and the core net/http
+// Handler. The package name differs from the directory so it never collides
+// with gin-gonic's "gin" — no alias needed:
 //
 //	import "github.com/stakater/operator-utils/telemetry-web/adapters/gin" // package gintel
 package gintel
@@ -15,16 +15,14 @@ import (
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
-// Instrument installs Recovery and RouteTag on engine — plus Metrics when
-// nethttp.WithEndpointMetrics() is passed — and returns it wrapped in
-// nethttp.Handler, ready to serve. Extra nethttp options (e.g.
-// nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...)) are forwarded to the
-// Handler. The returned handler wraps the engine by reference, so later routes
-// are served.
+// Instrument installs Recovery and RouteTag on engine — plus Metrics under
+// nethttp.WithEndpointMetrics() — and returns it wrapped in nethttp.Handler,
+// ready to serve. Other nethttp options are forwarded. The handler wraps the
+// engine by reference, so routes registered later are still served.
 //
-// Call right after gin.New(), BEFORE registering routes: Gin applies global
-// middleware only to routes registered afterward, so a late call silently
-// instruments nothing. Instrument panics rather than let that happen quietly.
+// Call it right after gin.New(), before registering routes: Gin applies global
+// middleware only to routes registered afterward, so a late call would
+// instrument nothing. Instrument panics rather than fail silently.
 func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler {
 	if len(engine.Routes()) > 0 {
 		panic("gintel.Instrument must be called before registering routes: " +
@@ -32,6 +30,10 @@ func Instrument(engine *gin.Engine, opts ...nethttp.Option) http.Handler {
 	}
 	s := nethttp.Resolve(opts...)
 	if s.Recovery {
+		// Two layers on purpose. Gin's consumes handler panics first, so the
+		// count stays at one; nethttp.Handler's is the only one outside the
+		// engine, and so the only thing covering middleware registered before
+		// this call.
 		engine.Use(Recovery())
 	}
 	engine.Use(RouteTag())
@@ -59,10 +61,10 @@ func Recovery() gin.HandlerFunc {
 	}
 }
 
-// RouteTag stamps http.route (the matched route template) on the server span
-// and the otelhttp duration metric, and renames the span to "{method} {route}".
-// It runs before the handler, so even panicked requests carry the route on
-// their span. Unmatched requests are skipped.
+// RouteTag stamps http.route (c.FullPath()) on the server span and the duration
+// metric, and renames the span to "{method} {route}". It runs before the
+// handler, so panicked requests keep their route. Unmatched requests are
+// skipped.
 func RouteTag() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if route := c.FullPath(); route != "" {
@@ -72,16 +74,13 @@ func RouteTag() gin.HandlerFunc {
 	}
 }
 
-// Metrics records one endpoint.requests data point per request, keyed by
-// the matched route template (c.FullPath()). Outcome follows
-// nethttp.RecordRoute's shared rule (status >= 500 is a failure), so it matches
-// the echo and chi adapters. A panicking handler unwinds past the record call,
-// so panics surface on the panic counter, not here.
+// Metrics records one endpoint.requests data point per request, keyed by the
+// matched route template. Outcome follows nethttp.RecordRoute's shared rule, so
+// it matches the echo and chi adapters. A panicking handler unwinds past the
+// record call, so panics land on the panic counter instead.
 //
-// Note that c.Errors is deliberately NOT consulted: a handler that calls
-// c.Error() while still returning 4xx has recorded a client error, and counting
-// it as a server-side failure would make this metric mean something different
-// here than in the other adapters.
+// c.Errors is deliberately not consulted: treating it as a failure would make a
+// gin 4xx mean something different from an echo or chi 4xx.
 //
 // Opt in via Instrument(engine, nethttp.WithEndpointMetrics()).
 func Metrics() gin.HandlerFunc {

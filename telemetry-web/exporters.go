@@ -15,28 +15,25 @@ import (
 )
 
 // hasScheme reports whether the endpoint is URL-form (http://host:port) rather
-// than bare host:port. The two need different exporter options.
-// A bare "localhost:4317" parses with Scheme="localhost", so a non-empty scheme
-// is not enough. The exact test is whether the scheme is followed by "://",
-// which also rejects a separator buried later ("host:4317/x://y") and correctly
-// classifies "unix:///path" as URL-form so the exporter reports its own error
-// instead of silently receiving it as a host.
+// than bare host:port; the two need different exporter options. A non-empty
+// scheme is not enough — "localhost:4317" parses with Scheme="localhost" — so
+// the test is that the scheme is followed by "://".
 func hasScheme(endpoint string) bool {
 	u, err := url.Parse(endpoint)
 	return err == nil && u.Scheme != "" && strings.HasPrefix(endpoint, u.Scheme+"://")
 }
 
-// warnProtocol logs once per signal when the environment asks for a transport
-// this library does not build. Only OTLP/gRPC is supported.
+// warnProtocol warns when the environment asks for a transport this library does
+// not build; only OTLP/gRPC is supported. The per-signal variable wins over the
+// generic one, per the OTel spec.
 //
-// This warns rather than failing Init on purpose. The OpenTelemetry Operator's
-// auto-instrumentation injects OTEL_EXPORTER_OTLP_PROTOCOL into pods, often as
-// http/protobuf, so hard-failing would let an unrelated pod-spec change
-// crash-loop a service that was previously healthy. A library whose job is
-// observability must not be able to take down what it observes: telemetry
-// degrades, the service keeps serving, and the warning names the cause.
+// It warns rather than failing Init on purpose: the OpenTelemetry Operator
+// injects OTEL_EXPORTER_OTLP_PROTOCOL into pods, often as http/protobuf, and a
+// library whose job is observability must not crash-loop what it observes.
+// Telemetry degrades, the service keeps serving.
 //
-// The per-signal variable wins over the generic one, matching the OTel spec.
+// Called once per signal per Init, and deliberately not deduplicated across
+// signals — a sync.Once would hide the second one.
 func warnProtocol(signalVar string) {
 	for _, name := range []string{signalVar, "OTEL_EXPORTER_OTLP_PROTOCOL"} {
 		p := strings.TrimSpace(os.Getenv(name))
@@ -54,16 +51,14 @@ func warnProtocol(signalVar string) {
 	}
 }
 
-// newSpanProcessor builds the OTLP/gRPC trace exporter and wraps it in a batch
-// span processor.
+// newSpanProcessor builds the OTLP/gRPC trace exporter behind a batch span
+// processor.
 //
-// Endpoint resolution: only Config.OTLPEndpoint is applied here — as
-// WithEndpointURL for URL-form values, WithEndpoint for bare host:port. When
-// unset, NO endpoint option is passed, so the exporter SDK's own env handling
-// applies: OTEL_EXPORTER_OTLP_ENDPOINT (URL-form per spec), the per-signal
-// OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT overrides, and the
-// localhost:4317 default. Re-reading the env here and feeding it to
-// WithEndpoint would break spec-compliant URL values.
+// Only Config.OTLPEndpoint is applied here. When it is unset no endpoint option
+// is passed at all, leaving the exporter SDK's own env handling in charge
+// (OTEL_EXPORTER_OTLP_ENDPOINT, the per-signal overrides, and the
+// localhost:4317 default). Reading those here and feeding them to WithEndpoint
+// would break spec-compliant URL values.
 func newSpanProcessor(ctx context.Context, cfg Config) (sdktrace.SpanProcessor, error) {
 	warnProtocol("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
 	var opts []otlptracegrpc.Option

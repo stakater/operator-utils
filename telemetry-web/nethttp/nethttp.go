@@ -53,15 +53,10 @@ func Resolve(opts ...Option) Settings {
 	}
 }
 
-// WithEndpointMetrics opts in to the per-endpoint endpoint.requests counter
-// in an adapter's Instrument. It is off by default because
-// http.server.request.duration already records per-route request counts and
-// outcomes — it carries http.route (see StampRoute) plus the status code and
-// method, so it is a strict superset:
-//
-//	sum by (http_route) (rate(http_server_request_duration_count{http_response_status_code=~"5.."}[5m]))
-//
-// Turn it on when you want the simpler {endpoint,outcome} label pair.
+// WithEndpointMetrics opts in to the endpoint.requests counter in an adapter's
+// Instrument. Off by default: once StampRoute runs, http.server.request.duration
+// already carries route, method, and status, making it a strict superset. Turn
+// this on when you want the simpler {endpoint,outcome} label pair.
 func WithEndpointMetrics() Option {
 	return func(c *config) { c.endpointMetrics = true }
 }
@@ -74,21 +69,23 @@ func WithEndpointMetrics() Option {
 // or append your own: WithSkipPaths(append(nethttp.DefaultSkipPaths, "/ping")...).
 var DefaultSkipPaths = []string{"/healthz", "/readyz", "/livez", "/metrics"}
 
-// WithSkipPaths excludes the given exact request paths from instrumentation:
-// no span, no http.server.* metrics, and no endpoint.requests from an
-// adapter's Metrics middleware. The request is still served, and recovery
-// still applies. Repeated calls accumulate. By default nothing is skipped.
+// WithSkipPaths excludes the given exact request paths from instrumentation: no
+// span, no http.server.* metrics, and no endpoint.requests. The request is still
+// served and recovery still applies. Repeated calls accumulate; by default
+// nothing is skipped.
 //
-// Because the filter runs before trace context is extracted, a skipped path
-// also drops any inbound traceparent — it will not continue a caller's trace.
-// That is harmless for probes; do not skip paths that participate in traces.
+// The filter runs before trace context is extracted, so a skipped path also
+// drops any inbound traceparent and will not continue a caller's trace. Fine for
+// probes, wrong for paths that participate in traces.
 func WithSkipPaths(paths ...string) Option {
 	return func(c *config) { c.skipPaths = append(c.skipPaths, paths...) }
 }
 
-// WithoutRecovery omits the built-in recovery middleware. Use it when an outer
-// layer already recovers panics and calls endpoint.RecordPanic, so the panic is
-// not counted twice.
+// WithoutRecovery installs no recovery at all — not Handler's, and not the
+// framework middleware an adapter's Instrument would add, since that consults
+// Resolve too. Panics then escape to net/http, which closes the connection
+// without a response, and http.server.panics is not incremented. Only pass it
+// when an outer layer recovers and calls endpoint.RecordPanic itself.
 func WithoutRecovery() Option {
 	return func(c *config) { c.noRecover = true }
 }
@@ -143,12 +140,10 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 // trackWrites returns w wrapped so responded reports whether anything has been
 // committed to the client yet.
 //
-// httpsnoop generates a wrapper exposing exactly the optional interfaces w
-// already implements — Flusher, Hijacker, ReadFrom, and so on. That matters:
-// embedding the http.ResponseWriter interface directly would promote only
-// Header/Write/WriteHeader and silently drop the rest, and gin's
-// responseWriter.Flush and echo's Response.Flush type-assert for Flusher, so
-// streaming handlers would panic and WebSocket upgrades would fail.
+// httpsnoop is used rather than an embedded http.ResponseWriter because it
+// re-exposes exactly the optional interfaces w already implements. Embedding
+// would promote only Header/Write/WriteHeader, and gin's and echo's Flush
+// type-assert for Flusher — streaming handlers would panic outright.
 func trackWrites(w http.ResponseWriter) (wrapped http.ResponseWriter, responded func() bool) {
 	var wrote bool
 	wrapped = httpsnoop.Wrap(w, httpsnoop.Hooks{
@@ -169,23 +164,20 @@ func trackWrites(w http.ResponseWriter) (wrapped http.ResponseWriter, responded 
 // Recovery recovers panics, records telemetry via endpoint.RecordPanic, and
 // writes 500 if nothing has been written yet. http.ErrAbortHandler is
 // re-raised. Must sit inside the otelhttp handler so the span exists in ctx and
-// the response is measured.
-//
-// The response writer handed to next preserves whatever optional interfaces the
-// original had, so SSE, flushing, and connection hijacking keep working.
+// the response is measured. The writer handed to next keeps whatever optional
+// interfaces the original had, so SSE and hijacking keep working.
 func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tracked, responded := trackWrites(w)
 		defer func() {
 			if p := recover(); p != nil {
-				// recover() yields the sentinel by identity, never wrapped —
-				// net/http compares it the same way.
+				// Sentinel arrives by identity, never wrapped.
 				if p == http.ErrAbortHandler { //nolint:errorlint
 					panic(p)
 				}
 				endpoint.RecordPanic(r.Context(), p)
 				// A handler that panicked mid-stream already sent its status;
-				// overwriting it is impossible and only produces log noise.
+				// a second write would only be log noise.
 				if !responded() {
 					tracked.WriteHeader(http.StatusInternalServerError)
 				}
@@ -212,14 +204,12 @@ func WrapClient(c *http.Client) *http.Client {
 	return c
 }
 
-// RecordRoute emits one endpoint.requests data point for a matched route.
-// It is the single definition of "failure" shared by every adapter: a
-// server-side status (5xx). Client errors are the caller's fault, not the
-// service's, so a 4xx is a success.
+// RecordRoute emits one endpoint.requests data point for a matched route. It is
+// the single definition of "failure" every adapter shares: status >= 500. A 4xx
+// is the caller's fault, so it counts as a success.
 //
-// Unmatched routes (empty template) are skipped to keep 404 scans from
-// exploding cardinality, and paths excluded by WithSkipPaths are skipped so the
-// exclusion covers this counter too, not just otelhttp's own metrics.
+// Unmatched routes (empty template) are skipped to bound 404-scan cardinality,
+// and WithSkipPaths exclusions are honored here too, not just in otelhttp.
 //
 // Adapters call this from their Metrics middleware; call it directly when
 // wiring a framework by hand.
@@ -235,15 +225,14 @@ func RecordRoute(ctx context.Context, route string, status int) {
 var warnNoLabeler sync.Once
 
 // StampRoute puts http.route on the active server span and on the otelhttp
-// metric attributes (via the request Labeler) for this request, and renames
-// the span to the semconv form "{method} {route}" (method may be empty to
-// leave the span name alone). The framework adapters call it from their
-// RouteTag middleware once the matched route template is known; call it
-// yourself when integrating a framework by hand.
+// metric attributes (via the request Labeler), and renames the span to the
+// semconv "{method} {route}" form. An empty method leaves the name alone. The
+// adapters call it from RouteTag; call it yourself when wiring a framework by
+// hand.
 //
-// The request must be inside nethttp.Handler. Without it there is no otelhttp
-// labeler in ctx, so the span attribute still lands but the metric attribute
-// is silently dropped; StampRoute logs a warning once when it detects this.
+// The request must be inside Handler. Without the otelhttp labeler in ctx the
+// span attribute still lands but the metric one is dropped, and a warning is
+// logged once.
 func StampRoute(ctx context.Context, method, route string) {
 	attr := semconv.HTTPRoute(route)
 	labeler, ok := otelhttp.LabelerFromContext(ctx)

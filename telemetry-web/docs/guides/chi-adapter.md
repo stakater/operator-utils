@@ -114,9 +114,13 @@ For every matched route, with **zero per-handler code**:
 - Panics → `http.server.panics` + an exception/stack on the span + an error
   log, and a `500` response. (`http.ErrAbortHandler` is re-raised untouched.)
 
-> `nethttp.WithoutRecovery()` suppresses recovery here too, not just in
-> `nethttp.Handler` — `Instrument` skips the core recovery (it installs none of its own). The chain is then left with
-> no recovery at all: panics escape to net/http and are not counted.
+> **One layer here, unlike gin and echo.** `chitel.Recovery` *is*
+> `nethttp.Recovery`, so `Instrument` installs none of its own and lets `Handler`
+> do the recovering — adding both would count every panic twice.
+>
+> `nethttp.WithoutRecovery()` therefore leaves the chain with no recovery at all:
+> panics escape to net/http and are not counted. Only pass it when an outer layer
+> recovers and calls `endpoint.RecordPanic` itself.
 
 ---
 

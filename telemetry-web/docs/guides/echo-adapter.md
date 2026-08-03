@@ -141,9 +141,16 @@ sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
   / sum by (endpoint) (rate(endpoint_requests_total[5m]))
 ```
 
-> `nethttp.WithoutRecovery()` suppresses recovery here too, not just in
-> `nethttp.Handler` — `Instrument` skips `echotel.Recovery()`. The chain is then left with
-> no recovery at all: panics escape to net/http and are not counted.
+> **Two layers, one count.** `Instrument` installs `echotel.Recovery()` *and* keeps
+> `nethttp.Handler`'s. The framework layer consumes handler panics before the
+> outer one sees them, so nothing is double counted — and the outer one is the
+> only one outside the engine, so it is what covers `e.Pre(...)` middleware, which Echo runs before the entire `Use` chain. A panic there would
+> otherwise escape to net/http with no metric, no span error, and no 500.
+>
+> `nethttp.WithoutRecovery()` suppresses **both**, not just `nethttp.Handler`'s.
+> The chain is then left with no recovery at all: panics escape to net/http and
+> are not counted. Only pass it when an outer layer recovers and calls
+> `endpoint.RecordPanic` itself.
 
 ---
 

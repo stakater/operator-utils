@@ -15,8 +15,6 @@ import (
 // middleware (any framework), passing the request context and recovered value.
 // It does NOT re-raise or write a response — the caller decides how to respond.
 func RecordPanic(ctx context.Context, recovered any) {
-	ensure()
-
 	err := fmt.Errorf("panic: %v", recovered)
 	span := trace.SpanFromContext(ctx)
 	span.RecordError(err, trace.WithStackTrace(true))
@@ -24,7 +22,7 @@ func RecordPanic(ctx context.Context, recovered any) {
 
 	logging.Logger().ErrorContext(ctx, "recovered panic", "panic", fmt.Sprint(recovered))
 
-	if panics != nil {
-		panics.Add(ctx, 1)
+	if c := get().panics; c != nil {
+		c.Add(ctx, 1)
 	}
 }

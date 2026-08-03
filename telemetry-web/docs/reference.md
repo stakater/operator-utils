@@ -50,7 +50,12 @@ value you must thread is `context.Context` — that is what carries the active s
 (for exemplars and log correlation).
 
 Dependency direction inside the module (no cycles):
-`adapters/{gin,echo,chi} → nethttp → endpoint → logging → internal/scope → otel`.
+
+```
+adapters/{gin,echo,chi} ─▶ nethttp ─▶ endpoint ─▶ logging ─▶ internal/scope
+telemetry (root) ────────▶ internal/rebind ─▶ logging
+endpoint ────────────────▶ internal/rebind, internal/version
+```
 
 ---
 
@@ -180,6 +185,7 @@ Setup. Import path `github.com/stakater/operator-utils/telemetry-web`.
 
 ```go
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, err error)
+var ErrAlreadyInitialized error // second Init without an intervening shutdown
 ```
 
 Wires the global `TracerProvider`, `MeterProvider`, propagator, resource,
@@ -242,8 +248,11 @@ logging.Logger().InfoContext(ctx, "created tenant", "id", id)
 ### package `endpoint`
 
 Per-endpoint metrics and panic recording. Import path `…/telemetry-web/endpoint`.
-Instruments are created lazily from the global meter, so these are safe to call
-before `Init` (they no-op against the default provider until a real one is set).
+Instruments are built lazily on first use and **rebuilt whenever `Init` installs
+new providers**, so these are safe to call before `Init` — early calls no-op, and
+everything after `Init` lands on the real pipeline. (The rebuild is necessary:
+otel's global meter delegates to the first real `MeterProvider` and never
+re-delegates, so an instrument created earlier would stay bound to it forever.)
 
 ```go
 func Instrument(ctx context.Context, name string) func(err *error)
@@ -322,12 +331,12 @@ func WrapClient(c *http.Client) *http.Client          // add propagation to an e
   the request to be inside `Handler` — without the otelhttp labeler in `ctx` the
   span attribute still lands but the metric attribute is dropped, and a warning
   is logged once.
-- **`WithoutRecovery`** suppresses recovery everywhere, not just in `Handler`.
-  Every adapter's `Instrument` consults `Resolve(...).Recovery` before installing
-  its framework middleware, so the option leaves the chain with no recovery at
-  all: panics escape to net/http, which closes the connection without a response,
-  and `http.server.panics` is not incremented. Only pass it when an outer layer
-  recovers and calls `endpoint.RecordPanic` itself.
+- **`WithoutRecovery`** suppresses recovery everywhere, not just in `Handler`:
+  each adapter's `Instrument` consults `Resolve(...).Recovery` too, so the chain
+  is left with none at all. Panics then escape to net/http, which closes the
+  connection without a response, and `http.server.panics` is not incremented.
+  Only pass it when an outer layer recovers and calls `endpoint.RecordPanic`
+  itself. See [Recovery layers](#recovery-layers) for why there are normally two.
 - **`RecordRoute`** is the single definition of outcome shared by every adapter:
   `failure` iff `status >= 500`, skipping unmatched routes and skipped paths. A
   4xx is a client error and counts as a success.
@@ -443,19 +452,31 @@ Every framework adapter exposes exactly `Instrument` / `Recovery` / `RouteTag`
 / `Metrics` with the semantics above.
 
 **There is one failure rule, not three.** All adapters route their outcome
-through `nethttp.RecordRoute`:
-
-| | `outcome=failure` when |
-| --- | --- |
-| every adapter | the status the request answers with is ≥ 500 |
-
-A 4xx is a client error and records `success`. Framework-native signals that
-disagree are deliberately *not* consulted — notably gin's `c.Error(...)`, which
-would otherwise make a 400 a failure in gin and a success everywhere else and
-break `sum by (outcome)` across services.
+through `nethttp.RecordRoute`: `outcome=failure` iff the status the request
+answers with is ≥ 500. A 4xx is a client error and records `success`.
+Framework-native signals that disagree are deliberately *not* consulted — notably
+gin's `c.Error(...)`, which would otherwise make a 400 a failure in gin and a
+success everywhere else, breaking `sum by (outcome)` across services.
 
 `http.route` is stamped on every request's span and duration metric, including
 panicked ones, on all three adapters.
+
+#### Recovery layers
+
+A panic is **counted exactly once** everywhere, but the wiring differs:
+
+| Adapter | Framework `Recovery()` | `Handler`'s recovery |
+| --- | --- | --- |
+| gin, echo | installed | kept |
+| chi | not installed (`chitel.Recovery` *is* `nethttp.Recovery`) | kept |
+
+For gin and echo the framework layer consumes a handler panic before the outer
+one sees it, so two layers still yield one count. The outer layer is not
+redundant: it is the only one **outside the engine**, so it is what catches a
+panic in middleware running before the framework's recovery — echo's `e.Pre(...)`,
+or anything registered with `engine.Use(...)` before `gintel.Instrument`. Without
+it those escape to net/http: connection torn down, no response, no
+`http.server.panics`, no exception on the span.
 
 Adapters are held to the contract by a shared conformance suite —
 package `…/telemetry-web/adaptertest` — that each adapter module runs against
@@ -510,6 +531,7 @@ and generally safe to log-and-ignore.
   names for `endpoint.Record`/`Instrument`, never raw paths or ids.
 - **Panicked requests** show on `http.server.panics` (+ a `500` in the otelhttp
   metrics), not as a per-endpoint `endpoint.requests` data point — by design.
-- **`nethttp.Recovery` writes `500` unconditionally.** If a handler already wrote
-  a status before panicking, that write is a no-op (Go logs "superfluous
-  WriteHeader") — inherent to the simple recovery pattern.
+- **A panic mid-response keeps the status it already sent.** `nethttp.Recovery`
+  writes `500` only if nothing has been committed yet, so a handler that
+  panicked after starting its response is left alone rather than producing a
+  "superfluous WriteHeader" warning.

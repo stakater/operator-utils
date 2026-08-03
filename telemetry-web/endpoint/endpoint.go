@@ -1,59 +1,112 @@
 // Package endpoint records per-endpoint request metrics and panics against the
-// global OpenTelemetry meter. Instruments are created lazily on first use.
+// global OpenTelemetry meter. Instruments are created lazily on first use and
+// rebuilt whenever telemetry.Init installs new global providers.
 package endpoint
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/internal/version"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
-var (
-	once     sync.Once
+// instruments is swapped as a unit so a rebuild is atomic from a recorder's
+// point of view: a caller sees either the old set or the new one, never a
+// half-updated mix.
+type instruments struct {
 	requests metric.Int64Counter
 	duration metric.Float64Histogram
 	panics   metric.Int64Counter
+}
+
+var (
+	current  atomic.Pointer[instruments]
+	buildMu  sync.Mutex
+	warnOnce sync.Once
 )
 
-// ensure lazily creates the instruments from the global MeterProvider.
-// Idempotent; safe to call before telemetry.Init (records no-op against the
-// default provider until a real one is installed and this first runs).
-func ensure() {
-	once.Do(func() {
-		m := otel.GetMeterProvider().Meter(
-			version.ModulePath,
-			metric.WithInstrumentationVersion(version.Version()),
-		)
-		var err error
-		requests, err = m.Int64Counter("endpoint.requests",
-			metric.WithUnit("{request}"),
-			metric.WithDescription("Per-endpoint request count, split by success/failure outcome."),
-		)
-		if err != nil {
-			logging.Logger().Warn("failed to create endpoint.requests counter; per-endpoint metrics disabled", "err", err)
-		}
-		duration, err = m.Float64Histogram("endpoint.duration",
-			metric.WithUnit("s"),
-			metric.WithDescription("Duration of a named operation, split by success/failure outcome."),
-		)
-		if err != nil {
-			logging.Logger().Warn("failed to create endpoint.duration histogram; operation latency disabled", "err", err)
-		}
-		panics, err = m.Int64Counter("http.server.panics",
-			metric.WithUnit("{panic}"),
-			metric.WithDescription("Panics recovered from HTTP handlers."),
-		)
-		if err != nil {
-			logging.Logger().Warn("failed to create http.server.panics counter; panic metrics disabled", "err", err)
-		}
-	})
+func init() {
+	// Without this the instruments would stay bound to whichever provider was
+	// global on first use; see the rebind package for why.
+	rebind.On(rebuild)
+}
+
+// get returns the current instruments, building them on first use.
+func get() *instruments {
+	if i := current.Load(); i != nil {
+		return i
+	}
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	if i := current.Load(); i != nil {
+		return i
+	}
+	i := build()
+	current.Store(i)
+	return i
+}
+
+// rebuild recreates the instruments against the current global MeterProvider,
+// unbinding them from any earlier one.
+func rebuild() {
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	current.Store(build())
+}
+
+// build creates the instrument set from whatever MeterProvider is global now.
+// A creation failure is warned about once per process and leaves that
+// instrument nil, so the corresponding metric is skipped rather than panicking.
+func build() *instruments {
+	m := otel.GetMeterProvider().Meter(
+		version.ModulePath,
+		metric.WithInstrumentationVersion(version.Version()),
+	)
+	var i instruments
+	var errs []error
+
+	var err error
+	i.requests, err = m.Int64Counter("endpoint.requests",
+		metric.WithUnit("{request}"),
+		metric.WithDescription("Per-endpoint request count, split by success/failure outcome."),
+	)
+	if err != nil {
+		i.requests, errs = nil, append(errs, err)
+	}
+	i.duration, err = m.Float64Histogram("endpoint.duration",
+		metric.WithUnit("s"),
+		metric.WithDescription("Duration of a named operation, split by success/failure outcome."),
+	)
+	if err != nil {
+		i.duration, errs = nil, append(errs, err)
+	}
+	i.panics, err = m.Int64Counter("http.server.panics",
+		metric.WithUnit("{panic}"),
+		metric.WithDescription("Panics recovered from HTTP handlers."),
+	)
+	if err != nil {
+		i.panics, errs = nil, append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		// Joined, not a []error: slog's JSON handler renders a slice of errors
+		// as [{},{}], losing every message. Warned once per process, since a
+		// rebuild runs on every Init.
+		warnOnce.Do(func() {
+			logging.Logger().Warn("telemetry: some endpoint instruments could not be created; those metrics are disabled",
+				"err", errors.Join(errs...))
+		})
+	}
+	return &i
 }
 
 // Record emits one endpoint.requests data point for a named endpoint.
@@ -61,11 +114,15 @@ func ensure() {
 // with an outcome derived from the response status; hand-written code should
 // prefer Instrument.
 func Record(ctx context.Context, name string, failed bool) {
-	ensure()
-	if requests == nil {
+	get().record(ctx, name, failed)
+}
+
+// record emits the counter data point against one instrument set.
+func (i *instruments) record(ctx context.Context, name string, failed bool) {
+	if i.requests == nil {
 		return
 	}
-	requests.Add(ctx, 1, metric.WithAttributes(
+	i.requests.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("endpoint", name),
 		attribute.String("outcome", outcomeOf(failed)),
 	))
@@ -79,24 +136,27 @@ func Record(ctx context.Context, name string, failed bool) {
 //	    // ... set err on failure paths; outcome follows the final err ...
 //	}
 //
-// It records both endpoint.requests and endpoint.duration. The pointer
+// It records both endpoint.requests and endpoint.duration. The pointer is what
 // makes the one-line defer work: &err is bound at defer time, but *err is read
-// when the finisher runs, after the named return is set. Passing a plain nil
-// records a success.
+// when the finisher runs, after the named return is set. A plain nil records a
+// success.
 //
-// This is the intended entry point for NON-HTTP operations, which have no
-// otelhttp histogram covering them. For HTTP handlers served through
-// nethttp.Handler, http.server.request.duration already records latency per
-// route.
+// This is the entry point for NON-HTTP operations, which no otelhttp histogram
+// covers. HTTP handlers served through nethttp.Handler already get latency per
+// route from http.server.request.duration.
 func Instrument(ctx context.Context, name string) func(err *error) {
 	start := time.Now()
 	return func(err *error) {
 		failed := err != nil && *err != nil
-		Record(ctx, name, failed) // also runs ensure()
-		if duration == nil {
+
+		// One get(): a rebuild between the two records would otherwise split
+		// them across providers.
+		i := get()
+		i.record(ctx, name, failed)
+		if i.duration == nil {
 			return
 		}
-		duration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+		i.duration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
 			attribute.String("endpoint", name),
 			attribute.String("outcome", outcomeOf(failed)),
 		))

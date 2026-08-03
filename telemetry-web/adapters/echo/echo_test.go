@@ -182,3 +182,27 @@ func TestWithoutRecoveryHonoredThroughInstrument(t *testing.T) {
 		t.Errorf("WithoutRecovery must record no panic, got delta %d", delta)
 	}
 }
+
+// Echo runs e.Pre middleware before the entire Use chain, so it is upstream of
+// echotel.Recovery. Only nethttp.Handler's recovery is outside the engine, which
+// is why Instrument keeps it: without that layer a panic here escapes to
+// net/http with no metric, no span error, and no response.
+func TestPrePanicIsRecoveredAndCounted(t *testing.T) {
+	e := echo.New()
+	e.Pre(func(echo.HandlerFunc) echo.HandlerFunc {
+		return func(echo.Context) error { panic("pre-chain boom") }
+	})
+	h := Instrument(e)
+	e.GET("/echo/pre", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
+
+	before := adaptertest.PanicCount(adaptertest.Collect(t))
+	rec := get(t, h, "/echo/pre")
+	after := adaptertest.PanicCount(adaptertest.Collect(t))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if delta := after - before; delta != 1 {
+		t.Errorf("panic counter delta = %d, want 1", delta)
+	}
+}

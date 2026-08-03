@@ -142,9 +142,16 @@ sum by (endpoint) (rate(endpoint_requests_total{outcome="failure"}[5m]))
   / sum by (endpoint) (rate(endpoint_requests_total[5m]))
 ```
 
-> `nethttp.WithoutRecovery()` suppresses recovery here too, not just in
-> `nethttp.Handler` — `Instrument` skips `gintel.Recovery()`. The chain is then left with
-> no recovery at all: panics escape to net/http and are not counted.
+> **Two layers, one count.** `Instrument` installs `gintel.Recovery()` *and* keeps
+> `nethttp.Handler`'s. The framework layer consumes handler panics before the
+> outer one sees them, so nothing is double counted — and the outer one is the
+> only one outside the engine, so it is what covers middleware you registered with `engine.Use(...)` **before** calling `Instrument`. A panic there would
+> otherwise escape to net/http with no metric, no span error, and no 500.
+>
+> `nethttp.WithoutRecovery()` suppresses **both**, not just `nethttp.Handler`'s.
+> The chain is then left with no recovery at all: panics escape to net/http and
+> are not counted. Only pass it when an outer layer recovers and calls
+> `endpoint.RecordPanic` itself.
 
 ---
 
@@ -164,7 +171,11 @@ srv := &http.Server{Addr: ":8080", Handler: nethttp.Handler(engine)} // spans + 
 ```
 
 `gintel.Recovery()` must sit inside `nethttp.Handler` (it does here, because it's a
-Gin middleware inside the engine, and `nethttp.Handler` wraps the engine).
+Gin middleware inside the engine, and `nethttp.Handler` wraps the engine). Keep
+**both** layers, as `Instrument` does: the Gin one handles handler panics and
+consumes them, so nothing is double counted, while `nethttp.Handler`'s is the only
+one outside the engine and therefore the only thing that catches a panic in
+middleware registered before `gintel.Recovery()`.
 
 Register all of these **before** your routes — Gin applies global middleware only
 to routes added afterward. `Instrument` enforces this by panicking if the engine

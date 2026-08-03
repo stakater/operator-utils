@@ -9,6 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/stakater/operator-utils/telemetry-web/endpoint"
+	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
@@ -154,4 +160,69 @@ func TestResolveRatio(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Init must trigger the instrument rebind. otel's global meter never
+// re-delegates, so anything caching instruments (the endpoint package) would
+// otherwise stay bound to whichever provider was global before this call —
+// stranding endpoint.requests, endpoint.duration, and http.server.panics after
+// a re-Init.
+func TestInitNotifiesRebind(t *testing.T) {
+	var called int
+	rebind.On(func() { called++ })
+
+	shutdown := initOnce(t)
+	defer func() { _ = shutdown(bounded(t)) }()
+
+	if called != 1 {
+		t.Errorf("rebind hook ran %d times during Init, want 1", called)
+	}
+}
+
+// Shutdown must stop the cached instruments writing into the provider it just
+// retired. Swapping the globals to noop is not enough on its own: instruments
+// that already exist never re-resolve their provider, so shutdown has to notify
+// the rebind hooks the same way Init does.
+func TestShutdownStopsWritesToRetiredProvider(t *testing.T) {
+	retired := sdkmetric.NewManualReader()
+
+	shutdown := initOnce(t)
+	// Stand in for Init's provider with one we can read.
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(retired)))
+	rebind.Notify()
+
+	endpoint.Record(context.Background(), "probe", false)
+	live := endpointPoints(t, retired)
+	if live == 0 {
+		t.Fatal("setup: nothing recorded into the provider before shutdown")
+	}
+
+	_ = shutdown(bounded(t))
+
+	endpoint.Record(context.Background(), "probe", false)
+	if got := endpointPoints(t, retired); got != live {
+		t.Errorf("retired provider received %d points after shutdown, want it frozen at %d", got, live)
+	}
+}
+
+func endpointPoints(t *testing.T, r *sdkmetric.ManualReader) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := r.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "endpoint.requests" {
+				continue
+			}
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
+				for _, dp := range sum.DataPoints {
+					total += dp.Value
+				}
+			}
+		}
+	}
+	return total
 }

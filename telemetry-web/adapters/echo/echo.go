@@ -1,7 +1,7 @@
 // Package echotel wires the telemetry library into an Echo engine: recovery,
-// automatic per-endpoint metrics keyed by the matched route template, and the
-// core net/http Handler (spans + server metrics). The package name differs from
-// the directory so it never collides with labstack's "echo" — no alias needed:
+// route-tagged spans, optional per-endpoint metrics, and the core net/http
+// Handler. The package name differs from the directory so it never collides
+// with labstack's "echo" — no alias needed:
 //
 //	import "github.com/stakater/operator-utils/telemetry-web/adapters/echo" // package echotel
 package echotel
@@ -16,15 +16,17 @@ import (
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
-// Instrument installs Recovery, RouteTag, and Metrics on e and returns it
-// wrapped in nethttp.Handler, ready to serve. Extra nethttp options (e.g.
-// nethttp.WithSkipPaths(nethttp.DefaultSkipPaths...)) are forwarded to the
-// Handler. Unlike Gin, Echo applies Use middleware to routes registered before
-// or after the call, so ordering doesn't matter. The returned handler wraps
-// the engine by reference.
+// Instrument installs Recovery and RouteTag on e — plus Metrics under
+// nethttp.WithEndpointMetrics() — and returns it wrapped in nethttp.Handler,
+// ready to serve. Other nethttp options are forwarded. Unlike Gin, Echo applies
+// Use middleware to routes registered before or after the call, so ordering
+// doesn't matter. The handler wraps the engine by reference.
 func Instrument(e *echo.Echo, opts ...nethttp.Option) http.Handler {
 	s := nethttp.Resolve(opts...)
 	if s.Recovery {
+		// Two layers on purpose. Echo's consumes handler panics first, so the
+		// count stays at one; nethttp.Handler's is the only one outside the
+		// engine, and so the only thing covering e.Pre middleware.
 		e.Use(Recovery())
 	}
 	e.Use(RouteTag())
@@ -55,10 +57,10 @@ func Recovery() echo.MiddlewareFunc {
 	}
 }
 
-// RouteTag stamps http.route (the matched route template) on the server span
-// and the otelhttp duration metric via nethttp.StampRoute. It runs before the
-// handler, so even panicked requests carry the route on their span. Unmatched
-// requests are skipped. Use it without Metrics for a semconv-only setup.
+// RouteTag stamps http.route (c.Path()) on the server span and the duration
+// metric, and renames the span to "{method} {route}". It runs before the
+// handler, so panicked requests keep their route. Unmatched requests are
+// skipped.
 func RouteTag() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -70,11 +72,10 @@ func RouteTag() echo.MiddlewareFunc {
 	}
 }
 
-// Metrics records one endpoint.requests data point per request, keyed by
-// the matched route template (c.Path()). Outcome follows nethttp.RecordRoute's
-// shared rule (status >= 500 is a failure), so it matches the gin and chi
-// adapters. A panicking handler unwinds past the record call, so panics surface
-// on the panic counter, not here.
+// Metrics records one endpoint.requests data point per request, keyed by the
+// matched route template. Outcome follows nethttp.RecordRoute's shared rule, so
+// it matches the gin and chi adapters. A panicking handler unwinds past the
+// record call, so panics land on the panic counter instead.
 //
 // Opt in via Instrument(e, nethttp.WithEndpointMetrics()).
 func Metrics() echo.MiddlewareFunc {
@@ -88,11 +89,10 @@ func Metrics() echo.MiddlewareFunc {
 	}
 }
 
-// status resolves the status code this request will actually answer with. Echo
-// runs its error handler AFTER the middleware chain returns, so for a returned
-// error the response status is not written yet and the error carries the
-// answer: an *echo.HTTPError reports its own Code, anything else becomes Echo's
-// default 500.
+// status resolves the code the request will answer with. Echo runs its error
+// handler after the middleware chain, so on a returned error nothing is written
+// yet and the error carries the answer: an *echo.HTTPError reports its own
+// Code, anything else becomes Echo's default 500.
 func status(c echo.Context, err error) int {
 	if err != nil {
 		var he *echo.HTTPError

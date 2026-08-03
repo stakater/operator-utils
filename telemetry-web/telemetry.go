@@ -1,8 +1,3 @@
-// Package telemetry is a framework-agnostic house-style wrapper over
-// OpenTelemetry. Call Init once in main; use Handler to wrap a net/http
-// handler, InstrumentEndpoint for per-endpoint metrics, and Transport/HTTPClient
-// for outbound trace propagation. No web framework is imported here — consumers
-// call the exported functions from their own middleware.
 package telemetry
 
 import (
@@ -23,6 +18,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/stakater/operator-utils/telemetry-web/internal/rebind"
 	"github.com/stakater/operator-utils/telemetry-web/internal/scope"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
@@ -40,11 +36,10 @@ type Config struct {
 	Insecure    bool
 }
 
-// ErrAlreadyInitialized is returned by a second Init that is not preceded by
-// the first one's shutdown. Re-initializing would orphan the previous
-// providers — their batch processor goroutine and reader ticker have no
-// remaining path to Shutdown — and would register the runtime instrumentation
-// callbacks a second time.
+// ErrAlreadyInitialized is returned by a second Init not preceded by the first
+// one's shutdown. Re-initializing would orphan the previous providers — their
+// batch processor goroutine and reader ticker lose any path to Shutdown — and
+// register the runtime instrumentation callbacks twice.
 var ErrAlreadyInitialized = errors.New("telemetry: Init already called; run the returned shutdown before re-initializing")
 
 var (
@@ -127,9 +122,13 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	)
 	otel.SetMeterProvider(mp)
 
-	// Bound to mp rather than the global provider, so mp.Shutdown below retires
-	// the runtime callbacks with it. The contrib package exposes no Stop, which
-	// is the other reason Init refuses to run twice.
+	// Cached instruments must be rebuilt now, or they stay bound to whatever was
+	// global before this point. See the rebind package.
+	rebind.Notify()
+
+	// Bound to mp rather than the global provider, so mp.Shutdown retires the
+	// runtime callbacks with it. The contrib package exposes no Stop, which is
+	// the other reason Init refuses to run twice.
 	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
 		_ = mp.Shutdown(ctx)
 		_ = tp.Shutdown(ctx)
@@ -143,12 +142,12 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 	return func(shutdownCtx context.Context) error {
 		once.Do(func() {
 			shutdownErr = errors.Join(tp.Shutdown(shutdownCtx), mp.Shutdown(shutdownCtx))
-			// Retire the globals too: leaving them pointing at shut-down
-			// providers means anything still recording — a lingering goroutine,
-			// or code running before a re-Init — writes into a dead pipeline.
-			// Noop providers make that a visible no-op instead.
+			// Retire the globals too, so a lingering goroutine writes into a
+			// noop rather than a dead pipeline. Notify because existing
+			// instruments never re-resolve their provider on their own.
 			otel.SetTracerProvider(tracenoop.NewTracerProvider())
 			otel.SetMeterProvider(metricnoop.NewMeterProvider())
+			rebind.Notify()
 
 			initMu.Lock()
 			initialized = false
@@ -157,9 +156,6 @@ func Init(ctx context.Context, cfg Config) (func(context.Context) error, error) 
 		return shutdownErr
 	}, nil
 }
-
-// (The shutdown timeout is chosen by the consumer in main via
-// context.WithTimeout — the library does not impose one.)
 
 // resolveRatio: config value if set, else OTEL_TRACES_SAMPLER_ARG, else 1.0.
 func resolveRatio(cfg Config) float64 {

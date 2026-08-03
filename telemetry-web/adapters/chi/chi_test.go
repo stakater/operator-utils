@@ -191,3 +191,40 @@ func TestWithoutRecoveryHonoredThroughInstrument(t *testing.T) {
 		t.Errorf("WithoutRecovery must record no panic, got delta %d", delta)
 	}
 }
+
+// Recovery is exported for hand-built chains but Instrument does not install
+// it, so nothing else here exercises the behavior its doc promises. Paired with
+// nethttp.WithoutRecovery this is the supported way to own recovery yourself.
+func TestExportedRecoveryHandlesPanics(t *testing.T) {
+	r := chi.NewRouter()
+	r.Use(Recovery())
+	h := Instrument(r, nethttp.WithoutRecovery())
+	r.Get("/chi/own", func(http.ResponseWriter, *http.Request) { panic("kaboom") })
+
+	before := adaptertest.PanicCount(adaptertest.Collect(t))
+	if rec := get(t, h, "/chi/own"); rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if delta := adaptertest.PanicCount(adaptertest.Collect(t)) - before; delta != 1 {
+		t.Errorf("panic counter delta = %d, want 1", delta)
+	}
+}
+
+// ...and it re-raises ErrAbortHandler untouched rather than counting it.
+func TestExportedRecoveryReRaisesErrAbortHandler(t *testing.T) {
+	r := chi.NewRouter()
+	r.Use(Recovery())
+	h := Instrument(r, nethttp.WithoutRecovery())
+	r.Get("/chi/abort", func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) })
+
+	before := adaptertest.PanicCount(adaptertest.Collect(t))
+	defer func() {
+		if rec := recover(); rec != http.ErrAbortHandler { //nolint:errorlint // sentinel compared by identity
+			t.Errorf("ErrAbortHandler must propagate, got %v", rec)
+		}
+		if delta := adaptertest.PanicCount(adaptertest.Collect(t)) - before; delta != 0 {
+			t.Errorf("ErrAbortHandler must not be counted, got delta %d", delta)
+		}
+	}()
+	get(t, h, "/chi/abort")
+}
