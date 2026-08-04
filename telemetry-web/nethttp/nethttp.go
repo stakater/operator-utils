@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/felixge/httpsnoop"
@@ -106,6 +107,7 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 
 	instrumented := otelhttp.NewHandler(inner, "server",
 		otelhttp.WithFilter(func(r *http.Request) bool { return !skipped(r.Context()) }),
+		otelhttp.WithSpanNameFormatter(spanName),
 	)
 
 	if len(cfg.skipPaths) == 0 {
@@ -197,7 +199,14 @@ func HTTPClient() *http.Client { return &http.Client{Transport: Transport(nil)} 
 // it can be used inline. Calling it twice on the same client would nest one
 // otelhttp transport inside another and inject the headers twice, so a client
 // that is already wrapped is left alone.
+//
+// A nil client yields a new propagating one rather than panicking, matching
+// Transport(nil), so a caller threading an optional client through does not have
+// to nil-check first.
 func WrapClient(c *http.Client) *http.Client {
+	if c == nil {
+		return HTTPClient()
+	}
 	if _, ok := c.Transport.(*otelhttp.Transport); !ok {
 		c.Transport = Transport(c.Transport)
 	}
@@ -224,6 +233,64 @@ func routeAttrs(ctx context.Context) []attribute.KeyValue {
 // mistake, not a per-request event, and no re-Init can change it.
 var warnNoLabeler sync.Once
 
+// stdMethods are the methods semconv keeps verbatim in a span name. Anything else
+// becomes "HTTP", so an attacker-supplied method cannot create a span name per
+// request. The set is frozen by the HTTP spec, not by otelhttp.
+var stdMethods = map[string]bool{
+	http.MethodGet: true, http.MethodHead: true, http.MethodPost: true,
+	http.MethodPut: true, http.MethodPatch: true, http.MethodDelete: true,
+	http.MethodConnect: true, http.MethodOptions: true, http.MethodTrace: true,
+}
+
+// spanName names the server span, preferring the route StampRoute put on the
+// labeler over the one net/http derived from its own mux pattern.
+//
+// Without this, otelhttp re-sets the span name after the handler returns whenever
+// r.Pattern != "" (handler.go:187 in contrib v0.69), which silently overwrites
+// StampRoute's rename with the coarser outer pattern. Mounting an instrumented
+// router under a mux, say outer.Handle("/api/", nethttp.Handler(router)), would
+// otherwise leave the span named "GET /api/" while http.route on the very same
+// span reads "/api/users/{id}".
+//
+// otelhttp calls this twice: once at span creation, before it puts the labeler in
+// ctx, so the labeler is empty and the r.Pattern branch is what runs; and once
+// after the handler, where the labeler has the adapter's template. The fallback
+// therefore has to reproduce otelhttp's default (semconv HTTPServer.SpanName),
+// which is unexported.
+func spanName(_ string, r *http.Request) string {
+	method := strings.ToUpper(r.Method)
+	if !stdMethods[method] {
+		method = "HTTP"
+	}
+	route := labelerRoute(r.Context())
+	if route == "" {
+		route = patternRoute(r.Pattern)
+	}
+	if route == "" {
+		return method
+	}
+	return method + " " + route
+}
+
+// labelerRoute returns the http.route StampRoute recorded, or "" before it has run.
+func labelerRoute(ctx context.Context) string {
+	if attrs := routeAttrs(ctx); len(attrs) > 0 {
+		return attrs[0].Value.AsString()
+	}
+	return ""
+}
+
+// patternRoute reduces a net/http mux pattern to its path, mirroring otelhttp's
+// internal httpRoute verbatim. A pattern may carry a method and a host, as in
+// "GET example.com/x", and neither belongs in a route; taking everything from the
+// first slash drops both.
+func patternRoute(pattern string) string {
+	if i := strings.IndexByte(pattern, '/'); i >= 0 {
+		return pattern[i:]
+	}
+	return ""
+}
+
 // StampRoute puts http.route on the active server span and on the otelhttp
 // metric attributes (via the request Labeler), and renames the span to the
 // semconv "{method} {route}" form. An empty method leaves the name alone. The
@@ -233,6 +300,12 @@ var warnNoLabeler sync.Once
 // The request must be inside Handler. Without the otelhttp labeler in ctx the
 // span attribute still lands but the metric one is dropped, and a warning is
 // logged once.
+//
+// The rename here is not the only thing naming the span: Handler also installs
+// spanName, which re-derives the name from the labeler after the handler returns.
+// Both are needed. otelhttp only re-derives when r.Pattern != "", so this call is
+// what names the span for a router served at the root, and spanName is what keeps
+// a mounted router from being renamed to its outer mux pattern.
 //
 // A path excluded via WithSkipPaths returns immediately: it has neither a labeler
 // nor a recording span, but the adapters' RouteTag still runs for it, so without

@@ -416,6 +416,30 @@ func Run(t *testing.T, build BuildFunc, opts ...RunOption) {
 		}
 	})
 
+	// Every other case serves the handler at the root, which hides a whole failure
+	// mode: otelhttp re-names the span after the handler returns whenever
+	// r.Pattern != "", so an instrumented router mounted under a mux pattern can end
+	// up named after the coarse outer pattern while http.route on the same span
+	// holds the real template. Mounting an API router beside /healthz is ordinary
+	// wiring, so the adapter has to survive it.
+	t.Run("MountedUnderMuxKeepsRouteNamedSpan", func(t *testing.T) {
+		Reset()
+		outer := http.NewServeMux()
+		outer.Handle("/mounted/", http.StripPrefix("/mounted", h))
+
+		rec := httptest.NewRecorder()
+		outer.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mounted/conf/ok/42", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if want := "GET " + okT; !SpanNamed(want) {
+			t.Errorf("span not named %q; the outer mux pattern overwrote the route", want)
+		}
+		if !RouteOnSpan(okT) {
+			t.Errorf("http.route %q missing from the span", okT)
+		}
+	})
+
 	t.Run("PanickedRequestStillCarriesRouteOnSpan", func(t *testing.T) {
 		Reset()
 		get(h, "/conf/panic/1")

@@ -196,9 +196,16 @@ func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(uncancellable, flushFloor)
 }
 
-// retire puts the process back in its pre-Init state, so a lingering goroutine
-// writes into a noop rather than a dead pipeline. Cached instruments follow on
-// their own, because they compare the global provider on each use.
+// retire points the global providers at noops, so a lingering goroutine writes
+// into a noop rather than a dead pipeline. Cached instruments follow on their own,
+// because they compare the global provider on each use.
+//
+// It deliberately does NOT restore the propagator or the error handler. Neither
+// holds a pipeline, so neither can write anywhere after shutdown; the propagator
+// in particular is better left installed, since a straggler outbound call still
+// emits a well formed traceparent instead of silently dropping context. Undoing
+// them would mean stashing the pre-Init error handler in package state, which is
+// more machinery than the problem justifies.
 func retire() {
 	otel.SetTracerProvider(tracenoop.NewTracerProvider())
 	otel.SetMeterProvider(metricnoop.NewMeterProvider())
@@ -215,7 +222,19 @@ func retire() {
 // would turn a sampling config into full-volume export.
 func resolveRatio(cfg Config) float64 {
 	if cfg.SampleRatio != nil {
-		return *cfg.SampleRatio
+		r := *cfg.SampleRatio
+		// Same hazard as the env path below, and reachable without anyone writing
+		// NaN: a computed ratio like float64(sampled)/float64(total) is NaN when
+		// total is 0. NaN compares false against every bound, so it would slip past
+		// TraceIDRatioBased's own guards into uint64(NaN * (1<<63)), which is an
+		// upper bound of 0 — every new root span dropped, silently.
+		if math.IsNaN(r) {
+			logging.Logger().Warn("telemetry: ignoring NaN Config.SampleRatio; sampling every trace")
+			return 1.0
+		}
+		// Out of range is left alone: TraceIDRatioBased clamps, so the behaviour is
+		// already what the caller asked for.
+		return r
 	}
 	const v = "OTEL_TRACES_SAMPLER_ARG"
 	arg := strings.TrimSpace(os.Getenv(v))

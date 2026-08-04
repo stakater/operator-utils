@@ -21,12 +21,17 @@ go get github.com/stakater/operator-utils/telemetry-web/adapters/gin@<commit-sha
 go mod tidy
 ```
 
+> Use the **full 40 character** SHA. A short one makes Go resolve the *parent*
+> module and fail with a confusing error, since `telemetry-web` is nested:
+> `module github.com/stakater/operator-utils@e559a46 found, but does not contain
+> package github.com/stakater/operator-utils/telemetry-web`.
+
 Your `go.mod` then records something like:
 
 ```gomod
 require (
-    github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
-    github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0-20260708082012-8f1fdddd3dca
+    github.com/stakater/operator-utils/telemetry-web v0.0.0-<timestamp>-<full-commit-sha>
+    github.com/stakater/operator-utils/telemetry-web/adapters/gin v0.0.0-<timestamp>-<full-commit-sha>
 )
 ```
 

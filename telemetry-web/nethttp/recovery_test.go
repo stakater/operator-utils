@@ -190,6 +190,20 @@ func TestWrapClientAndTransportFallback(t *testing.T) {
 	}
 }
 
+// WrapClient(nil) must behave like Transport(nil) and yield something usable,
+// rather than nil-dereferencing on c.Transport. Two adjacent functions in the same
+// public API taking nil differently is the kind of asymmetry a caller threading an
+// optional client through discovers in production.
+func TestWrapClientNil(t *testing.T) {
+	got := WrapClient(nil)
+	if got == nil {
+		t.Fatal("WrapClient(nil) must return a usable client")
+	}
+	if got.Transport == nil {
+		t.Error("WrapClient(nil) must return a propagating client")
+	}
+}
+
 // Wrapping twice would nest one otelhttp transport in another and inject the
 // propagation headers twice. Easy to reach: a helper that wraps defensively plus a
 // caller that already used HTTPClient().

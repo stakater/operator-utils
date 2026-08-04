@@ -117,3 +117,96 @@ func TestHandlerNamesSpanByMethodWithoutRoute(t *testing.T) {
 		t.Errorf("span name = %q, want %q", got, http.MethodPost)
 	}
 }
+
+// Mounting an instrumented router under a mux pattern must not cost the span its
+// route-derived name. otelhttp re-sets the name after the handler returns whenever
+// r.Pattern != "", so without Handler's spanName formatter the outer mux's coarse
+// "/api/" would overwrite the template StampRoute recorded, leaving the span name
+// and http.route on the SAME span disagreeing. Nothing else in the suite catches
+// this, because everywhere else serves the handler at the root.
+func TestMountedHandlerKeepsStampedSpanName(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+
+	const template = "/api/users/{id}"
+	inner := Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		StampRoute(r.Context(), r.Method, template)
+		w.WriteHeader(http.StatusOK)
+	}))
+	outer := http.NewServeMux()
+	outer.Handle("/api/", inner)
+
+	outer.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/users/42", nil))
+
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(ended))
+	}
+	if got, want := ended[0].Name(), "GET "+template; got != want {
+		t.Errorf("span name = %q, want %q", got, want)
+	}
+	var route string
+	for _, kv := range ended[0].Attributes() {
+		if kv.Key == attribute.Key("http.route") {
+			route = kv.Value.AsString()
+		}
+	}
+	if route != template {
+		t.Errorf("http.route = %q, want %q", route, template)
+	}
+	if name := ended[0].Name(); route != "" && name != "GET "+route {
+		t.Errorf("span name %q and http.route %q disagree on the same span", name, route)
+	}
+}
+
+// With nothing stamped, the mux pattern is the only route available and must still
+// be used — that is otelhttp's own behavior and the reason a bare net/http mux
+// gets route-attributed for free. Guards the formatter's fallback.
+func TestMountedHandlerFallsBackToMuxPattern(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+
+	mux := http.NewServeMux()
+	mux.Handle("/items/{id}", Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})))
+
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/items/7", nil))
+
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(ended))
+	}
+	if got, want := ended[0].Name(), "GET /items/{id}"; got != want {
+		t.Errorf("span name = %q, want %q", got, want)
+	}
+}
+
+// A non-standard method must collapse to "HTTP" rather than becoming part of the
+// span name, so a client cannot mint a span name per request. semconv does this;
+// the formatter has to keep doing it.
+func TestSpanNameCollapsesNonStandardMethod(t *testing.T) {
+	if got := spanName("", httptest.NewRequest("PROPFIND", "/x", nil)); got != "HTTP" {
+		t.Errorf("span name = %q, want %q", got, "HTTP")
+	}
+	if got := spanName("", httptest.NewRequest(http.MethodGet, "/x", nil)); got != http.MethodGet {
+		t.Errorf("span name = %q, want %q", got, http.MethodGet)
+	}
+}
+
+// patternRoute mirrors otelhttp's internal httpRoute, which a mux pattern needs
+// because it may carry a method and a host that do not belong in a route.
+func TestPatternRoute(t *testing.T) {
+	for _, tc := range []struct{ pattern, want string }{
+		{"", ""},
+		{"/foo/{id}", "/foo/{id}"},
+		{"GET /foo/{id}", "/foo/{id}"},
+		{"example.com/foo/{id}", "/foo/{id}"},
+		{"GET example.com/foo/{id}", "/foo/{id}"},
+		{"nohostnoslash", ""},
+	} {
+		if got := patternRoute(tc.pattern); got != tc.want {
+			t.Errorf("patternRoute(%q) = %q, want %q", tc.pattern, got, tc.want)
+		}
+	}
+}

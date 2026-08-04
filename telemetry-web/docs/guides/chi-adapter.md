@@ -20,6 +20,11 @@ go get github.com/stakater/operator-utils/telemetry-web/adapters/chi@<commit-sha
 go mod tidy
 ```
 
+> Use the **full 40 character** SHA. A short one makes Go resolve the *parent*
+> module and fail with a confusing error, since `telemetry-web` is nested:
+> `module github.com/stakater/operator-utils@e559a46 found, but does not contain
+> package github.com/stakater/operator-utils/telemetry-web`.
+
 Prefer this pinned version over a local `replace` directive — it is reproducible
 for every clone and in CI. Reserve `replace`/`go.work` for developing the
 library itself.

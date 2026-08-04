@@ -67,15 +67,21 @@ func (h *logHandler) Handle(ctx context.Context, rec slog.Record) error {
 	if len(st) == 0 {
 		return h.applied.Handle(ctx, rec)
 	}
-	// Fast path: with no group open, record-level attrs already land
-	// top-level, so the pre-applied handler can be reused as-is. Only an open
-	// group would capture the stamps, and that is the rare case.
+	// Fast path: with no group open, record-level attrs already land top-level, so
+	// the pre-applied handler can be reused as-is.
 	if !h.grouped {
 		rec = rec.Clone()
 		rec.AddAttrs(st...)
 		return h.applied.Handle(ctx, rec)
 	}
 	// Slow path: stamp the base handler first, then reopen the groups on top.
+	//
+	// Note the cost: once any WithGroup is in play this runs for EVERY record, one
+	// handler allocation per group or attr set. It is not avoidable by caching,
+	// because the stamps include trace_id and span_id and so differ per record.
+	// The rebuild is what keeps them top-level; rec.AddAttrs here would bury them
+	// inside the open group, where a log pipeline keying on trace_id cannot see
+	// them. If a hot path needs the allocations gone, log without groups.
 	base := h.base.WithAttrs(st)
 	for _, ga := range h.goas {
 		if ga.group != "" {

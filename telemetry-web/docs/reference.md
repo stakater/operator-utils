@@ -70,10 +70,15 @@ commit and let Go resolve the pseudo-version:
 go get github.com/stakater/operator-utils/telemetry-web@<commit-sha>
 ```
 
+> Use the **full 40 character** SHA. A short one makes Go resolve the *parent*
+> module and fail with a confusing error, since `telemetry-web` is nested:
+> `module github.com/stakater/operator-utils@e559a46 found, but does not contain
+> package github.com/stakater/operator-utils/telemetry-web`.
+
 which records something like:
 
 ```gomod
-require github.com/stakater/operator-utils/telemetry-web v0.0.0-20260708082012-8f1fdddd3dca
+require github.com/stakater/operator-utils/telemetry-web v0.0.0-<timestamp>-<full-commit-sha>
 ```
 
 The framework adapters are **separate** nested modules — add one the same way
@@ -660,3 +665,11 @@ Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
   writes `500` only if nothing has been committed yet, so a handler that
   panicked after starting its response is left alone rather than producing a
   "superfluous WriteHeader" warning.
+- **Mounting an instrumented router under a mux is safe, and `Handler` is what
+  makes it safe.** `otelhttp` re-names the span after the handler returns whenever
+  `r.Pattern != ""`, so `outer.Handle("/api/", nethttp.Handler(router))` would
+  otherwise leave the span named `GET /api/` while `http.route` on the same span
+  read `/api/users/{id}`. `Handler` installs a span-name formatter that prefers the
+  route `StampRoute` recorded, so the name and the attribute always agree. Do not
+  pass your own `otelhttp.WithSpanNameFormatter` on top; it would replace that one.
+  The conformance suite covers this for all three adapters.

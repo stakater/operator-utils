@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -197,6 +198,10 @@ func TestResolveRatio(t *testing.T) {
 		// An explicit out-of-range Config value is the caller's own doing and is
 		// not second-guessed here.
 		{name: "config value not range checked", cfg: Config{SampleRatio: f(2)}, want: 2},
+		// NaN is the exception: it is not a range the sampler clamps, it is a value
+		// that defeats every bound and silently drops all new roots. Reachable from
+		// a computed ratio (n/total with total == 0), not just a literal.
+		{name: "config NaN warns and falls back to 1.0", cfg: Config{SampleRatio: f(math.NaN())}, want: 1.0, wantWarn: true},
 	}
 
 	for _, tt := range tests {
@@ -212,7 +217,10 @@ func TestResolveRatio(t *testing.T) {
 			if got := resolveRatio(tt.cfg); got != tt.want {
 				t.Errorf("resolveRatio() = %v, want %v", got, tt.want)
 			}
-			if warned := strings.Contains(buf.String(), "sampler argument"); warned != tt.wantWarn {
+			// Any output at all is a warning: resolveRatio logs nothing else. Checked
+			// this way rather than by message text so rewording a warning cannot
+			// silently turn these assertions off.
+			if warned := buf.Len() > 0; warned != tt.wantWarn {
 				t.Errorf("warned = %v, want %v (log: %s)", warned, tt.wantWarn, buf.String())
 			}
 		})
