@@ -2,8 +2,7 @@
 // of the pseudo-version pinned in their go.mod. Without this, a breaking change
 // to the core is invisible until after it is published.
 //
-// The pins in each adapter's go.mod are what consumers actually get, so CI also
-// builds with GOWORK=off to keep verifying them.
+// The pins in each adapter's go.mod are what consumers actually get
 go 1.25.0
 
 use (
