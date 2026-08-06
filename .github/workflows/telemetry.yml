@@ -1,0 +1,75 @@
+name: Telemetry
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "telemetry-web/**"
+      # The workflow itself, so a change to the gate is checked by the gate.
+      - ".github/workflows/telemetry.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "telemetry-web/**"
+      - ".github/workflows/telemetry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Superseded PR runs are wasted work, so cancel them. Never on master: those runs
+# gate the tags cut from it, and a fast follow-up push would silently drop the
+# only validation of the commit in between.
+concurrency:
+  group: telemetry-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GOLANG_CI_LINT_VERSION: v2.12.2
+
+jobs:
+  validate:
+    name: Validate telemetry
+    runs-on: ubuntu-latest
+    # Gated on the PR title only. github.event.commits is empty on pull_request
+    # payloads, so a commit-message check could never skip a PR run; on push,
+    # this expression is simply false and the job always runs.
+    if: "! contains(github.event.pull_request.title, '[skip-ci]')"
+    steps:
+      # Default checkout: the merge result on pull_request, the pushed commit
+      # on push. Pinning to head.sha would test the branch, not what merging
+      # would actually produce.
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Validate telemetry
+        uses: ./telemetry-web/.github/actions/validate
+
+  lint:
+    name: Lint ${{ matrix.module || 'core' }}
+    runs-on: ubuntu-latest
+    if: "! contains(github.event.pull_request.title, '[skip-ci]')"
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ["", adapters/gin, adapters/echo, adapters/chi]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: telemetry-web/go.mod
+          cache-dependency-path: |
+            telemetry-web/go.sum
+            telemetry-web/adapters/*/go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANG_CI_LINT_VERSION }}
+          working-directory: telemetry-web/${{ matrix.module }}
+          args: --timeout 10m

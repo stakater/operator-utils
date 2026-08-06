@@ -1,0 +1,32 @@
+version: "2"
+
+# Shared by the core module and all three adapter modules — golangci-lint walks
+# up from each module directory to find this file.
+linters:
+  enable:
+    # Beyond the defaults (errcheck, govet, ineffassign, staticcheck, unused):
+    - bodyclose # a library that hands out http.Clients must not leak bodies
+    - errorlint # %w / errors.As correctness
+    - gocritic
+    - misspell
+    - predeclared # shadowing len, cap, new... in exported API is a trap
+    - revive
+  settings:
+    revive:
+      rules:
+        # No checkPrivateReceivers: methods on unexported types implementing
+        # stdlib interfaces (slog.Handler, http.ResponseWriter) do not each
+        # need a doc comment.
+        - name: exported
+        - name: package-comments
+        - name: indent-error-flow
+        - name: errorf
+        - name: context-as-argument
+        - name: unexported-return
+  exclusions:
+    rules:
+      # Conformance helpers assert, they do not consume return values.
+      - path: adaptertest/
+        linters: [errcheck]
+      - path: _test\.go$
+        linters: [bodyclose, errcheck]

@@ -1,0 +1,13 @@
+// Development workspace: builds the adapters against the in-tree core instead
+// of the pseudo-version pinned in their go.mod. Without this, a breaking change
+// to the core is invisible until after it is published.
+//
+// The pins in each adapter's go.mod are what consumers actually get
+go 1.25.0
+
+use (
+	.
+	./adapters/chi
+	./adapters/echo
+	./adapters/gin
+)
