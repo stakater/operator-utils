@@ -14,11 +14,17 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// WatchKey uniquely identifies a watch by GVR and namespace.
+// WatchKey uniquely identifies a watch by GVR, namespace, and identity.
 // An empty namespace means cluster-scoped.
+//
+// Identity selects which client the informer is started with (see ClientProvider)
+// and is part of the key on purpose: watches under different identities are never
+// shared, since they may be authorized differently. The registry treats the value
+// as opaque; an empty identity means the registry's default client.
 type WatchKey struct {
 	GVR       schema.GroupVersionResource
 	Namespace string
+	Identity  string
 }
 
 // WatchRequest pairs a watch key with its callback. Passed as a slice to EnsureWatchSet.
@@ -55,6 +61,34 @@ type WatchRegistration struct {
 	HasSynced  cache.InformerSynced
 }
 
+// ClientProvider supplies the dynamic client for a given identity. The identity
+// string is opaque to the registry — which credentials or cluster it maps to is
+// entirely up to the implementation. An empty identity must return the default
+// client. Implementations must never return (nil, nil); the registry rejects a
+// nil client defensively.
+//
+// Implementations must be safe for concurrent use and should cache clients per
+// identity, since ClientFor is called every time an informer starts.
+type ClientProvider interface {
+	ClientFor(identity string) (dynamic.Interface, error)
+}
+
+// singleClientProvider serves one fixed client for the empty identity only.
+// It backs NewWatchRegistry for callers that predate identities.
+type singleClientProvider struct {
+	client dynamic.Interface
+}
+
+func (p singleClientProvider) ClientFor(identity string) (dynamic.Interface, error) {
+	if identity != "" {
+		return nil, fmt.Errorf("identity %q is not supported: this registry serves only the default identity (use NewWatchRegistryWithProvider for per-identity clients)", identity)
+	}
+	if p.client == nil {
+		return nil, fmt.Errorf("registry was created with a nil dynamic client")
+	}
+	return p.client, nil
+}
+
 // WatchRegistry manages dynamic informers for arbitrary GroupVersionResource types
 // at runtime. Each consumer registers callbacks per watch key. The registry deduplicates
 // informers, manages handler lifecycle, and cleans up stale watches automatically.
@@ -64,18 +98,26 @@ type WatchRegistry struct {
 	mu           sync.Mutex
 	watches      map[WatchKey]*WatchEntry
 	consumerKeys map[string]map[WatchKey]struct{} // consumerID → set of WatchKeys
-	dynamic      dynamic.Interface
+	clients      ClientProvider
 	resyncPeriod time.Duration
 }
 
 // NewWatchRegistry creates a new registry backed by the given dynamic client.
+// All watch keys must use the empty identity. Use NewWatchRegistryWithProvider
+// to serve watches under multiple identities.
 // The resyncPeriod controls how often each informer relists from the API server.
 // A non-zero value is required to recover from dropped events (30s is typical).
 func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duration) *WatchRegistry {
+	return NewWatchRegistryWithProvider(singleClientProvider{client: dynamicClient}, resyncPeriod)
+}
+
+// NewWatchRegistryWithProvider creates a registry that resolves the client for
+// each watch from the provider, keyed by WatchKey.Identity.
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry {
 	return &WatchRegistry{
 		watches:      make(map[WatchKey]*WatchEntry),
 		consumerKeys: make(map[string]map[WatchKey]struct{}),
-		dynamic:      dynamicClient,
+		clients:      provider,
 		resyncPeriod: resyncPeriod,
 	}
 }
@@ -178,10 +220,21 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		entry, exists := r.watches[key]
 		if !exists {
+			cli, err := r.clients.ClientFor(key.Identity)
+			if err == nil && cli == nil {
+				// The provider is caller-supplied; guard against (nil, nil) so
+				// the failure surfaces here instead of a panic inside the informer.
+				err = fmt.Errorf("ClientFor returned a nil client")
+			}
+			if err != nil {
+				return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
+					fmt.Errorf("failed to get client for %v: %w", key, err))
+			}
+
 			ctx, cancel := context.WithCancel(parentCtx)
 
 			factory := kubedynamicinformer.NewFilteredDynamicSharedInformerFactory(
-				r.dynamic,
+				cli,
 				r.resyncPeriod,
 				key.Namespace,
 				nil,
@@ -210,15 +263,8 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		reg, err := entry.informer.AddEventHandler(callbackToHandler(w.Callback))
 		if err != nil {
-			// Clean up only handlers added in this call; deduped (pre-existing)
-			// handlers are untouched so the consumer keeps its previous state.
-			rollbackErrs := []error{fmt.Errorf("failed to add event handler for %v: %w", key, err)}
-			for _, key := range newlyAdded {
-				if rErr := r.releaseWatchLocked(key, consumerID); rErr != nil {
-					rollbackErrs = append(rollbackErrs, rErr)
-				}
-			}
-			return nil, errors.Join(rollbackErrs...)
+			return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
+				fmt.Errorf("failed to add event handler for %v: %w", key, err))
 		}
 
 		entry.handlers[consumerID] = &handlerRegistration{
@@ -244,6 +290,20 @@ func (r *WatchRegistry) EnsureWatchSet(
 	r.consumerKeys[consumerID] = newCurrent
 
 	return regs, errors.Join(errs...)
+}
+
+// rollbackNewlyAddedLocked releases the watches added earlier in the same
+// EnsureWatchSet call and joins any release errors onto cause. Deduped
+// (pre-existing) handlers are untouched, so the consumer keeps its previous
+// watch set on failure. Caller must hold r.mu.
+func (r *WatchRegistry) rollbackNewlyAddedLocked(consumerID string, newlyAdded []WatchKey, cause error) error {
+	errs := []error{cause}
+	for _, key := range newlyAdded {
+		if rErr := r.releaseWatchLocked(key, consumerID); rErr != nil {
+			errs = append(errs, rErr)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ReleaseAll releases all registrations for a given consumer across all watch keys.

@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -21,20 +22,56 @@ var (
 	deploymentsGVR = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
 	servicesGVR    = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}
 	configmapsGVR  = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
+	secretsGVR     = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 )
 
-func newFakeRegistry(t *testing.T) (*WatchRegistry, context.Context, context.CancelFunc) {
-	t.Helper()
+func newFakeDynamicClient() *dynamicfake.FakeDynamicClient {
 	scheme := runtime.NewScheme()
 	gvrToListKind := map[schema.GroupVersionResource]string{
 		deploymentsGVR: "DeploymentList",
 		servicesGVR:    "ServiceList",
 		configmapsGVR:  "ConfigMapList",
+		secretsGVR:     "SecretList",
 	}
-	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
-	registry := NewWatchRegistry(client, 30*time.Second)
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, gvrToListKind)
+}
+
+func newFakeRegistry(t *testing.T) (*WatchRegistry, context.Context, context.CancelFunc) {
+	t.Helper()
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	return registry, ctx, cancel
+}
+
+// fakeClientProvider serves a distinct fake dynamic client per identity and
+// records which identities were requested. Identities in errFor fail.
+type fakeClientProvider struct {
+	mu      sync.Mutex
+	clients map[string]dynamic.Interface
+	calls   []string
+	errFor  map[string]error
+}
+
+func newFakeClientProvider() *fakeClientProvider {
+	return &fakeClientProvider{
+		clients: make(map[string]dynamic.Interface),
+		errFor:  make(map[string]error),
+	}
+}
+
+func (p *fakeClientProvider) ClientFor(identity string) (dynamic.Interface, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, identity)
+	if err, ok := p.errFor[identity]; ok {
+		return nil, err
+	}
+	cli, ok := p.clients[identity]
+	if !ok {
+		cli = newFakeDynamicClient()
+		p.clients[identity] = cli
+	}
+	return cli, nil
 }
 
 func noopCallback() EventCallback {
@@ -864,6 +901,243 @@ func TestEnsureWatchSet_EmptySliceUnknownConsumer(t *testing.T) {
 	}
 	if len(registry.consumerKeys) != 0 {
 		t.Errorf("expected 0 consumer keys, got %d", len(registry.consumerKeys))
+	}
+}
+
+// --- Identity tests ---
+
+func TestEnsureWatchSet_DifferentIdentitiesDifferentInformers(t *testing.T) {
+	provider := newFakeClientProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watches := []WatchRequest{
+		{
+			Key:      WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"},
+			Callback: noopCallback(),
+		},
+		{
+			Key:      WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-b/reader"},
+			Callback: noopCallback(),
+		},
+	}
+
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", watches)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(regs) != 2 {
+		t.Fatalf("expected 2 registrations, got %d", len(regs))
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+
+	// Same GVR+namespace but different identities = separate informers
+	if len(registry.watches) != 2 {
+		t.Errorf("expected 2 watch entries for different identities, got %d", len(registry.watches))
+	}
+
+	// Each informer must have been built from its own identity's client
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.calls) != 2 {
+		t.Fatalf("expected 2 ClientFor calls, got %d (%v)", len(provider.calls), provider.calls)
+	}
+	seen := map[string]bool{}
+	for _, id := range provider.calls {
+		seen[id] = true
+	}
+	if !seen["team-a/reader"] || !seen["team-b/reader"] {
+		t.Errorf("expected ClientFor calls for both identities, got %v", provider.calls)
+	}
+}
+
+func TestEnsureWatchSet_SameIdentitySharesInformer(t *testing.T) {
+	provider := newFakeClientProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+
+	if len(registry.watches) != 1 {
+		t.Errorf("expected 1 shared watch entry, got %d", len(registry.watches))
+	}
+	if len(registry.watches[key].handlers) != 2 {
+		t.Errorf("expected 2 handlers on shared informer, got %d", len(registry.watches[key].handlers))
+	}
+
+	// Client resolved only once — second consumer reuses the running informer
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if len(provider.calls) != 1 {
+		t.Errorf("expected 1 ClientFor call, got %d (%v)", len(provider.calls), provider.calls)
+	}
+}
+
+func TestEnsureWatchSet_IdentityChangeSwapsWatches(t *testing.T) {
+	provider := newFakeClientProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oldKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/old-sa"}
+	newKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/new-sa"}
+
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: oldKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: newKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+
+	if _, ok := registry.watches[oldKey]; ok {
+		t.Error("expected old-identity watch to be released after identity change")
+	}
+	if _, ok := registry.watches[newKey]; !ok {
+		t.Error("expected new-identity watch to exist")
+	}
+	if len(registry.consumerKeys["consumer-1"]) != 1 {
+		t.Errorf("expected 1 consumer key, got %d", len(registry.consumerKeys["consumer-1"]))
+	}
+}
+
+func TestEnsureWatchSet_ProviderErrorRollsBack(t *testing.T) {
+	provider := newFakeClientProvider()
+	provider.errFor["team-b/broken"] = context.DeadlineExceeded // any error
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	goodKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	badKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-b/broken"}
+
+	// Fresh consumer: the good watch is added, then the bad one fails —
+	// the good one must be rolled back so the consumer stays unregistered.
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: goodKey, Callback: noopCallback()},
+		{Key: badKey, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error from failing provider")
+	}
+
+	registry.mu.Lock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected all watches rolled back, got %d", len(registry.watches))
+	}
+	if len(registry.consumerKeys) != 0 {
+		t.Errorf("expected no consumer keys after rollback, got %d", len(registry.consumerKeys))
+	}
+	registry.mu.Unlock()
+
+	// Consumer with an existing set keeps it when a later ensure fails.
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: goodKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, err = registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: goodKey, Callback: noopCallback()},
+		{Key: badKey, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error from failing provider")
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, ok := registry.watches[goodKey]; !ok {
+		t.Error("expected pre-existing watch to survive a failed ensure")
+	}
+	if len(registry.consumerKeys["consumer-1"]) != 1 {
+		t.Errorf("expected consumer to keep its previous 1-key set, got %d", len(registry.consumerKeys["consumer-1"]))
+	}
+}
+
+// nilClientProvider returns (nil, nil) — an invalid implementation the
+// registry must reject instead of panicking inside the informer.
+type nilClientProvider struct{}
+
+func (nilClientProvider) ClientFor(string) (dynamic.Interface, error) { return nil, nil }
+
+func TestEnsureWatchSet_NilClientFromProviderIsRejected(t *testing.T) {
+	registry := NewWatchRegistryWithProvider(nilClientProvider{}, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: WatchKey{GVR: deploymentsGVR, Namespace: "default"}, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error for provider returning nil client")
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected no watches after nil-client rejection, got %d", len(registry.watches))
+	}
+}
+
+func TestNewWatchRegistry_NilClientIsRejected(t *testing.T) {
+	registry := NewWatchRegistry(nil, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: WatchKey{GVR: deploymentsGVR, Namespace: "default"}, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error for registry created with nil client")
+	}
+}
+
+func TestNewWatchRegistry_RejectsNonEmptyIdentity(t *testing.T) {
+	registry, ctx, cancel := newFakeRegistry(t) // legacy single-client constructor
+	defer cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{
+			Key:      WatchKey{GVR: deploymentsGVR, Namespace: "default", Identity: "some/identity"},
+			Callback: noopCallback(),
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for non-empty identity on single-client registry")
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected no watches, got %d", len(registry.watches))
+	}
+}
+
+func TestWatchKey_IdentityDifferentiatesKeys(t *testing.T) {
+	base := WatchKey{GVR: deploymentsGVR, Namespace: "default"}
+	withID := WatchKey{GVR: deploymentsGVR, Namespace: "default", Identity: "team-a/reader"}
+
+	m := map[WatchKey]int{base: 1}
+	if _, ok := m[withID]; ok {
+		t.Error("expected identity to differentiate otherwise-equal keys")
+	}
+	m[withID] = 2
+	if m[base] != 1 || m[withID] != 2 {
+		t.Error("expected both keys to coexist in the map")
 	}
 }
 
