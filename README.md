@@ -35,6 +35,33 @@ regs, err := registry.EnsureWatchSet(ctx, "my-controller", []dynamicinformer.Wat
 
 See [dynamicinformer/example/main.go](dynamicinformer/example/main.go) for a full interactive demo.
 
+### `observability` — OpenTelemetry Metrics Publisher
+
+A standalone Go module ([`observability/`](observability/README.md)) that wires up an OTel `MeterProvider` for operators built on controller-runtime. Custom and Go-runtime metrics are pushed over OTLP; controller-runtime's existing Prometheus `/metrics` endpoint is left untouched, with a one-directional bridge feeding its metrics into the same OTLP path.
+
+**Key features:**
+
+- **One call to construct** — `publisher.New(ctx, publisher.Config{...})` sets up the MeterProvider, OTLP and/or stdout readers, controller-runtime bridge, and Go-runtime instrumentation.
+- **Graceful degradation** — collector unreachable at startup or shutdown is logged, never returned as an error.
+- **Env-var overrides** — standard OTel env vars (`OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`, etc.) override the Go config so ops can flip OTLP on without a rebuild.
+- **Custom metric registry** — `pub.Custom().MustCounter/Gauge/Histogram(name, description)` with strict naming validation and duplicate-name guards.
+
+```go
+pub, err := publisher.New(ctx, publisher.Config{
+    OperatorName: "my-operator",
+    OTLP:         &publisher.OTLPConfig{Endpoint: "collector:4317", Insecure: true},
+})
+if err != nil {
+    panic(err)
+}
+defer pub.Shutdown(context.Background())
+
+reconcileTotal := pub.Custom().MustCounter("reconcile_total", "...")
+reconcileTotal.Inc(ctx, attribute.String("result", "success"))
+```
+
+See [observability/README.md](observability/README.md) for the quickstart, [observability/docs/](observability/docs/README.md) for reference docs, and [observability/example/](observability/example/) for a runnable program.
+
 ### `util/reconciler` — Reconcile Result Helpers
 
 Standardizes reconcile outcomes and status condition management.
