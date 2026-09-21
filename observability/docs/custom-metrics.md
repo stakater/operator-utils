@@ -45,7 +45,9 @@ Reserved prefixes match metrics that come from the Go runtime,
 controller-runtime, or other OTel-internal sources. Allowing custom
 metrics with these prefixes would create ambiguous time series
 downstream, and would now genuinely collide: the Prometheus reader
-exposes custom metrics on the same registry those sources use.
+exposes custom metrics on the same registry those sources use. The same
+prefixes also keep the OTLP bridge able to tell our families apart from
+controller-runtime's by name alone.
 
 Counter names may end in `_total` or not, as you prefer: the Prometheus
 exporter appends that suffix only when it is missing, so `reconcile` and

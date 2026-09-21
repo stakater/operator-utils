@@ -15,43 +15,36 @@ see [`example/`](example/).
 ## Architecture
 
 ```
-                ┌──────────────────────────────────────────┐
-                │           OTel MeterProvider             │
-                │   custom metrics + Go runtime metrics    │
-                │        │                      │          │
-                │        ▼                      ▼          │
-                │  Prometheus reader      PeriodicReader   │
-                │        │                      │          │
-                └────────┼──────────────────────┼──────────┘
-                         │                      ▼
-                         │                 OTLP exporter
-                         │                      │
-                         ▼                      ▼
-              ┌─────────────────────────┐  [collector]
-              │ controller-runtime Prom │
-              │ Registry, served at     │
-              │ /metrics by the manager │
-              └─────────────────────────┘
+            ┌──────────────────────────────────────┐
+            │      instruments (OTel Meter API)    │
+            └───────────┬──────────────┬───────────┘
+                        │              │ native
+       Prometheus exporter             │
+                        ▼              ▼
+   ┌──────────────────────────┐    OTLP exporter ──► [collector]
+   │ controller-runtime Prom  │        ▲
+   │ Registry  ──► /metrics   │────────┘
+   └──────────────────────────┘   bridge, minus our own families
 ```
 
 | Metric source | `/metrics` | OTLP |
 |---|---|---|
-| Custom (operator-defined) | yes | yes (native OTel SDK) |
-| Go runtime | yes | yes (via `otel/contrib/instrumentation/runtime`) |
-| Controller-runtime native | yes (existing) | only when the Prometheus reader is off |
+| Custom (operator-defined) | yes | yes, natively |
+| Go runtime | yes | yes, natively |
+| Controller-runtime native | yes | yes, via the bridge |
 
-### Why the bridge switches off
+### Why nothing is suppressed
 
-`pkg/bridge` feeds controller-runtime's registry into OTLP. That is the
-same registry the Prometheus reader writes into, so running both would
-send every SDK metric to OTLP twice under one name — once natively from
-the SDK, once round-tripped through the registry.
+The Prometheus exporter and the bridge share one registry, so a naive
+bridge would re-export every SDK metric that the exporter just wrote, and
+each custom metric would reach OTLP twice under one name.
 
-An active Prometheus reader therefore suppresses the bridge, and `New`
-logs when it does. With both transports on, controller-runtime metrics
-are served on `/metrics` for a collector to scrape rather than pushed
-over OTLP. Set `DisablePrometheus: true` for the OTLP-only topology, in
-which the bridge stays on.
+Rather than switch a route off, the bridge is given a filtered view: it
+exports only the families this module did not write. Every transport
+therefore carries every metric class exactly once, in every
+configuration, and custom metrics keep their native OTel form on the push
+path, including exponential histograms and the operator's own
+instrumentation scope.
 
 ## Package layout
 
@@ -137,7 +130,6 @@ reconcileTotal.Inc(ctx, attribute.String("result", "success"))
 | `Prometheus` | `*PrometheusConfig` | nil | Tunes the `/metrics` reader; nil means defaults, not disabled |
 | `DisablePrometheus` | bool | false | When true, nothing is exposed on `/metrics` and the bridge stays on |
 | `Stdout` | bool | false | Enables stdout exporter (dev only) |
-| `DisableControllerRuntimeBridge` | bool | false | When true, ctrl-runtime metrics do not flow into OTLP |
 | `DisableGoRuntime` | bool | false | When true, Go runtime metrics are not collected |
 | `Logger` | logr.Logger | discard | Logger for warnings |
 

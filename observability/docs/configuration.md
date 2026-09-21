@@ -7,15 +7,14 @@ enables Go-runtime instrumentation.
 
 ```go
 type Config struct {
-    OperatorName                   string
-    Version                        string
-    OTLP                           *OTLPConfig
-    Prometheus                     *PrometheusConfig
-    DisablePrometheus              bool
-    Stdout                         bool
-    DisableControllerRuntimeBridge bool
-    DisableGoRuntime               bool
-    Logger                         logr.Logger
+    OperatorName      string
+    Version           string
+    OTLP              *OTLPConfig
+    Prometheus        *PrometheusConfig
+    DisablePrometheus bool
+    Stdout            bool
+    DisableGoRuntime  bool
+    Logger            logr.Logger
 }
 ```
 
@@ -60,10 +59,9 @@ When true, no reader is registered on any Prometheus registry and
 `/metrics` shows only what controller-runtime puts there itself. Default
 `false`.
 
-Setting this also restores the controller-runtime bridge, so an
-OTLP-only operator still pushes controller-runtime metrics to its
-collector. See
-[DisableControllerRuntimeBridge](#disablecontrollerruntimebridge-bool-optional).
+The bridge is unaffected by this field: it is always attached to the
+OTLP reader and reads the whole controller-runtime registry once nothing
+of ours is written into it.
 
 ### `Stdout bool` (optional)
 
@@ -74,23 +72,6 @@ running collector. Default `false`.
 The stdout exporter uses the OTel SDK's default periodic interval
 (60 seconds). There is no separate configuration knob for the stdout
 push cadence in this module.
-
-### `DisableControllerRuntimeBridge bool` (optional)
-
-When true, the Prometheus bridge producer that reads from
-controller-runtime's `prometheus.Registry` is **not** attached to the OTLP
-reader. Default `false`, meaning the bridge is enabled and
-controller-runtime metrics flow into the OTLP push path.
-
-**The bridge is suppressed whenever the Prometheus reader is active**,
-regardless of this field, and `publisher.New` logs when that happens. The
-bridge gathers controller-runtime's registry, which is the same registry
-the Prometheus reader writes into, so keeping both would push every SDK
-metric to OTLP twice under one name. With both transports enabled,
-controller-runtime metrics are served on `/metrics` for a collector to
-scrape rather than pushed over OTLP.
-
-This field therefore only takes effect when `DisablePrometheus` is true.
 
 ### `DisableGoRuntime bool` (optional)
 
@@ -120,6 +101,12 @@ The registry to expose metrics on. Defaults to
 `sigs.k8s.io/controller-runtime/pkg/metrics.Registry`, which the manager
 already serves at `/metrics`. Override it to serve metrics on a registry
 of your own, or to isolate a registry in tests.
+
+Internally, `Registerer` is wrapped so the publisher can record which
+families it registered; that is how the OTLP bridge later tells our
+metrics apart from controller-runtime's on the same registry. If you
+supply a custom `Registerer`, it must also implement
+`prometheus.Gatherer`, or `/metrics` will have nothing to scrape.
 
 ### `DisableTargetInfo bool` (optional)
 

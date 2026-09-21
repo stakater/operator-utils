@@ -175,16 +175,14 @@ unless `DisableTargetInfo` is set.
 
 ## Controller-runtime bridge producer
 
-When `Config.OTLP` is set and `Config.DisableControllerRuntimeBridge` is
-false (default), a Prometheus bridge producer is attached to the OTLP
-reader. The producer reads from `sigs.k8s.io/controller-runtime/pkg/metrics.Registry`
-on every OTLP flush and includes those metrics in the OTLP payload.
+The bridge is always attached to the OTLP reader. It reads
+controller-runtime's registry through a filter that removes the families
+this module exported, so SDK metrics take the native OTel path to OTLP
+and controller-runtime's take the bridge, with no overlap.
 
-**An active Prometheus reader suppresses the bridge.** Both touch the
-same registry — the reader writes to it, the bridge gathers it — so
-keeping both would send every SDK metric to OTLP twice under one name.
-`publisher.New` logs when it suppresses the bridge. To get the bridge in
-an OTLP-only operator, set `DisablePrometheus: true`.
+`bridge.ProducerFor(g)` takes any gatherer if you are wiring your own
+reader. Attaching an unfiltered producer to a reader whose provider also
+exports those metrics natively yields two copies of each.
 
 The bridge is attached **only** to the OTLP reader, never to the stdout
 or Prometheus readers. Controller-runtime metrics never flow through
