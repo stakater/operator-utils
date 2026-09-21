@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/otlptranslator"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -90,6 +91,7 @@ func buildPrometheusReader(cfg Config) (sdkmetric.Reader, *capturingRegisterer, 
 	opts := []prometheusexporter.Option{
 		prometheusexporter.WithRegisterer(capreg),
 		prometheusexporter.WithoutScopeInfo(),
+		prometheusexporter.WithTranslationStrategy(otlptranslator.UnderscoreEscapingWithSuffixes),
 	}
 	if p.DisableTargetInfo {
 		opts = append(opts, prometheusexporter.WithoutTargetInfo())
