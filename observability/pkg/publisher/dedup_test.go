@@ -336,3 +336,68 @@ func TestBridgeGathererFor(t *testing.T) {
 		})
 	}
 }
+
+// OTLP-only: nothing of ours may touch the registry controller-runtime
+// serves, but its own metrics must still reach the collector.
+func TestOTLPOnly_LeavesSharedRegistryAloneAndStillBridges(t *testing.T) {
+	shared := prometheus.NewRegistry()
+	newCounterIn(t, shared, "controller_runtime_reconcile_total")
+
+	cfg := Config{
+		OperatorName:      "my-operator",
+		DisableGoRuntime:  true,
+		DisablePrometheus: true,
+		OTLP: &OTLPConfig{Endpoint: "localhost:1", Insecure: true,
+			Timeout: time.Second, Interval: time.Hour},
+	}
+	applyDefaults(&cfg)
+
+	otlpReader, err := buildOTLPReader(context.Background(), cfg, shared)
+	if err != nil {
+		t.Fatalf("buildOTLPReader: %v", err)
+	}
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(otlpReader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	c, err := mp.Meter("my-operator").Int64Counter("reconcile_total")
+	if err != nil {
+		t.Fatalf("Int64Counter: %v", err)
+	}
+	c.Add(context.Background(), 1)
+
+	var rm metricdata.ResourceMetrics
+	if err := otlpReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	var sawCustom, sawCtrl bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case "reconcile_total":
+				sawCustom = true
+			case "controller_runtime_reconcile_total":
+				sawCtrl = true
+			}
+		}
+	}
+	if !sawCustom {
+		t.Error("custom metric did not reach OTLP natively")
+	}
+	if !sawCtrl {
+		t.Error("controller-runtime metric did not reach OTLP via the bridge")
+	}
+	if hasName(namesFrom(t, shared), "reconcile_total") {
+		t.Error("OTLP-only mode wrote an SDK metric into the shared registry")
+	}
+}
+
+// target_info belongs on /metrics. Its absence from OTLP is asserted in
+// TestBothTransports_EachMetricExactlyOnce.
+func TestTargetInfo_PresentOnMetrics(t *testing.T) {
+	p, reg := newPromPublisher(t, Config{DisableGoRuntime: true})
+	p.Custom().MustCounter("reconcile_total", "d").Inc(context.Background())
+
+	if !hasName(gatheredNames(t, reg), "target_info") {
+		t.Error("target_info should be on /metrics by default")
+	}
+}
