@@ -1,9 +1,16 @@
 package publisher
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func newCounterIn(t *testing.T, reg prometheus.Registerer, name string) {
@@ -95,5 +102,178 @@ func TestCapturingRegisterer_DoesNotCaptureOnError(t *testing.T) {
 
 	if len(cap.captured) != 1 {
 		t.Fatalf("captured %d collectors, want 1", len(cap.captured))
+	}
+}
+
+// Both transports on: the custom metric must reach OTLP once, natively,
+// with the operator's own scope, and controller-runtime's must reach it
+// once via the bridge.
+func TestBothTransports_EachMetricExactlyOnce(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	newCounterIn(t, reg, "controller_runtime_reconcile_total")
+
+	cfg := Config{
+		OperatorName:     "my-operator",
+		DisableGoRuntime: true,
+		Prometheus:       &PrometheusConfig{Registerer: reg},
+		OTLP: &OTLPConfig{Endpoint: "localhost:1", Insecure: true,
+			Timeout: time.Second, Interval: time.Hour},
+	}
+	applyDefaults(&cfg)
+
+	promReader, capreg, err := buildPrometheusReader(cfg)
+	if err != nil {
+		t.Fatalf("buildPrometheusReader: %v", err)
+	}
+	own := prometheus.NewRegistry()
+	for _, c := range capreg.captured {
+		if err := own.Register(c); err != nil {
+			t.Fatalf("own registry: %v", err)
+		}
+	}
+
+	otlpReader, err := buildOTLPReader(context.Background(), cfg,
+		exceptGatherer{base: reg, own: own})
+	if err != nil {
+		t.Fatalf("buildOTLPReader: %v", err)
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(promReader), sdkmetric.WithReader(otlpReader))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	c, err := mp.Meter("my-operator").Int64Counter("reconcile_total")
+	if err != nil {
+		t.Fatalf("Int64Counter: %v", err)
+	}
+	c.Add(context.Background(), 7)
+
+	var rm metricdata.ResourceMetrics
+	if err := otlpReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	counts := map[string]int{}
+	scopes := map[string]string{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			counts[m.Name]++
+			scopes[m.Name] = sm.Scope.Name
+		}
+	}
+
+	if counts["reconcile_total"] != 1 {
+		t.Errorf("reconcile_total appeared %d times in OTLP, want 1", counts["reconcile_total"])
+	}
+	if scopes["reconcile_total"] != "my-operator" {
+		t.Errorf("reconcile_total scope = %q, want the operator's own scope (it must take the native path)", scopes["reconcile_total"])
+	}
+	if counts["controller_runtime_reconcile_total"] != 1 {
+		t.Errorf("controller_runtime_reconcile_total appeared %d times in OTLP, want 1",
+			counts["controller_runtime_reconcile_total"])
+	}
+	if counts["target_info"] != 0 {
+		t.Errorf("target_info reached OTLP as a metric; it is ours and should be excluded")
+	}
+}
+
+// A View must not resurrect a second copy on the OTLP path. This is the
+// failure mode that ruled out reader-level AggregationDrop.
+func TestBothTransports_ViewedHistogramNotDuplicated(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	cfg := Config{
+		OperatorName:     "my-operator",
+		DisableGoRuntime: true,
+		Prometheus:       &PrometheusConfig{Registerer: reg},
+		OTLP: &OTLPConfig{Endpoint: "localhost:1", Insecure: true,
+			Timeout: time.Second, Interval: time.Hour},
+	}
+	applyDefaults(&cfg)
+
+	promReader, capreg, err := buildPrometheusReader(cfg)
+	if err != nil {
+		t.Fatalf("buildPrometheusReader: %v", err)
+	}
+	own := prometheus.NewRegistry()
+	for _, c := range capreg.captured {
+		if err := own.Register(c); err != nil {
+			t.Fatalf("own registry: %v", err)
+		}
+	}
+	otlpReader, err := buildOTLPReader(context.Background(), cfg,
+		exceptGatherer{base: reg, own: own})
+	if err != nil {
+		t.Fatalf("buildOTLPReader: %v", err)
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(promReader), sdkmetric.WithReader(otlpReader),
+		sdkmetric.WithView(sdkmetric.NewView(
+			sdkmetric.Instrument{Name: "latency"},
+			sdkmetric.Stream{Aggregation: sdkmetric.AggregationBase2ExponentialHistogram{
+				MaxSize: 160, MaxScale: 20}})))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	h, err := mp.Meter("my-operator").Float64Histogram("latency", otelmetric.WithUnit("s"))
+	if err != nil {
+		t.Fatalf("Float64Histogram: %v", err)
+	}
+	h.Record(context.Background(), 0.03)
+
+	var rm metricdata.ResourceMetrics
+	if err := otlpReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	var total int
+	var exponential bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "latency" || m.Name == "latency_seconds" {
+				total++
+				if _, ok := m.Data.(metricdata.ExponentialHistogram[float64]); ok {
+					exponential = true
+				}
+			}
+		}
+	}
+	if total != 1 {
+		t.Errorf("the viewed histogram appeared %d times in OTLP, want 1", total)
+	}
+	if !exponential {
+		t.Error("the viewed histogram lost its exponential aggregation, so it did not take the native path")
+	}
+}
+
+func TestCapturingRegisterer_MustRegisterAlsoCaptures(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cap := &capturingRegisterer{Registerer: reg}
+
+	c := prometheus.NewCounter(prometheus.CounterOpts{Name: "reconcile_total", Help: "h"})
+	c.Inc()
+	cap.MustRegister(c)
+
+	if !hasName(namesFrom(t, reg), "reconcile_total") {
+		t.Error("MustRegister did not reach the wrapped registry")
+	}
+	if len(cap.captured) != 1 {
+		t.Fatalf("captured %d collectors, want 1: the embedded MustRegister bypassed capture", len(cap.captured))
+	}
+}
+
+type failingGatherer struct{ err error }
+
+func (f failingGatherer) Gather() ([]*dto.MetricFamily, error) { return nil, f.err }
+
+func TestExceptGatherer_PropagatesGatherErrors(t *testing.T) {
+	boom := errors.New("boom")
+	ok := prometheus.NewRegistry()
+
+	if _, err := (exceptGatherer{base: failingGatherer{boom}, own: ok}).Gather(); !errors.Is(err, boom) {
+		t.Errorf("base error not propagated, got %v", err)
+	}
+	if _, err := (exceptGatherer{base: ok, own: failingGatherer{boom}}).Gather(); !errors.Is(err, boom) {
+		t.Errorf("own error not propagated, got %v", err)
 	}
 }

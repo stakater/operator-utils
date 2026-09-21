@@ -15,9 +15,6 @@ func TestApplyDefaults_ZeroValueGetsDefaults(t *testing.T) {
 	if cfg.Version != "unknown" {
 		t.Errorf("Version = %q, want %q", cfg.Version, "unknown")
 	}
-	if cfg.DisableControllerRuntimeBridge {
-		t.Errorf("DisableControllerRuntimeBridge = true, want false")
-	}
 	if cfg.DisableGoRuntime {
 		t.Errorf("DisableGoRuntime = true, want false")
 	}
@@ -54,15 +51,11 @@ func TestApplyDefaults_KeepsExplicitRegisterer(t *testing.T) {
 
 func TestApplyDefaults_RespectsExplicitDisables(t *testing.T) {
 	cfg := Config{
-		OperatorName:                   "my-op",
-		DisableControllerRuntimeBridge: true,
-		DisableGoRuntime:               true,
+		OperatorName:     "my-op",
+		DisableGoRuntime: true,
 	}
 	applyDefaults(&cfg)
 
-	if !cfg.DisableControllerRuntimeBridge {
-		t.Errorf("DisableControllerRuntimeBridge flipped back to false")
-	}
 	if !cfg.DisableGoRuntime {
 		t.Errorf("DisableGoRuntime flipped back to false")
 	}

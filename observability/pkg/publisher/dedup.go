@@ -21,6 +21,11 @@ func (r *capturingRegisterer) Register(c prometheus.Collector) error {
 	return nil
 }
 
+// MustRegister must be overridden too. The embedded Registerer would
+// otherwise register without capturing, and the bridge would re-export
+// those families. Unregister is deliberately left promoted: the OTel
+// exporter never unregisters, and a stale entry in captured would only
+// over-exclude.
 func (r *capturingRegisterer) MustRegister(cs ...prometheus.Collector) {
 	for _, c := range cs {
 		if err := r.Register(c); err != nil {

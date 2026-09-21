@@ -3,7 +3,7 @@ package publisher
 import (
 	"context"
 
-	"github.com/prometheus/otlptranslator"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -13,7 +13,7 @@ import (
 	"github.com/stakater/operator-utils/observability/pkg/bridge"
 )
 
-func buildOTLPReader(ctx context.Context, cfg Config, withBridge bool) (sdkmetric.Reader, error) {
+func buildOTLPReader(ctx context.Context, cfg Config, g prometheus.Gatherer) (sdkmetric.Reader, error) {
 	var exp sdkmetric.Exporter
 	var err error
 	switch cfg.OTLP.Protocol {
@@ -30,8 +30,8 @@ func buildOTLPReader(ctx context.Context, cfg Config, withBridge bool) (sdkmetri
 		sdkmetric.WithInterval(cfg.OTLP.Interval),
 		sdkmetric.WithTimeout(cfg.OTLP.Timeout),
 	}
-	if withBridge {
-		readerOpts = append(readerOpts, sdkmetric.WithProducer(bridge.ControllerRuntimeProducer()))
+	if g != nil {
+		readerOpts = append(readerOpts, sdkmetric.WithProducer(bridge.ProducerFor(g)))
 	}
 	return sdkmetric.NewPeriodicReader(exp, readerOpts...), nil
 }
@@ -81,15 +81,22 @@ func newOTLPHTTP(ctx context.Context, o *OTLPConfig) (sdkmetric.Exporter, error)
 // Scope labels are always suppressed: otel_scope_name / otel_scope_version
 // would otherwise land on every series without telling an operator
 // anything it does not already know.
-func buildPrometheusReader(cfg Config) (sdkmetric.Reader, error) {
+//
+// The returned capturingRegisterer names the families this module wrote,
+// so the OTLP bridge can skip them.
+func buildPrometheusReader(cfg Config) (sdkmetric.Reader, *capturingRegisterer, error) {
 	p := cfg.Prometheus
+	capreg := &capturingRegisterer{Registerer: p.Registerer}
 	opts := []prometheusexporter.Option{
-		prometheusexporter.WithRegisterer(p.Registerer),
+		prometheusexporter.WithRegisterer(capreg),
 		prometheusexporter.WithoutScopeInfo(),
-		prometheusexporter.WithTranslationStrategy(otlptranslator.UnderscoreEscapingWithSuffixes),
 	}
 	if p.DisableTargetInfo {
 		opts = append(opts, prometheusexporter.WithoutTargetInfo())
 	}
-	return prometheusexporter.New(opts...)
+	reader, err := prometheusexporter.New(opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reader, capreg, nil
 }

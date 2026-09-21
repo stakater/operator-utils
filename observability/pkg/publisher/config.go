@@ -12,8 +12,8 @@ import (
 )
 
 // Config configures a Publisher. The zero value with only OperatorName set
-// is a valid configuration that enables both default instrumentations
-// (controller-runtime bridge and Go runtime).
+// is a valid configuration. The controller-runtime bridge is always on;
+// Go runtime instrumentation is on by default and can be disabled.
 type Config struct {
 	// OperatorName is required. Used for the service.name resource attribute.
 	OperatorName string
@@ -37,10 +37,6 @@ type Config struct {
 
 	// Stdout enables a stdout metric exporter for local development. Default false.
 	Stdout bool
-
-	// DisableControllerRuntimeBridge disables the bridge producer that feeds
-	// controller-runtime metrics into OTLP. Zero value means bridge enabled.
-	DisableControllerRuntimeBridge bool
 
 	// DisableGoRuntime disables Go runtime instrumentation. Zero value means
 	// runtime metrics enabled.

@@ -69,30 +69,6 @@ func TestPrometheus_CustomCounterKeepsRegisteredName(t *testing.T) {
 	}
 }
 
-// The bridge gathers controller-runtime's registry, which the Prometheus
-// reader now writes into. Leaving both on would send every SDK metric to
-// OTLP twice under the same name, so the Prometheus reader wins.
-func TestUseControllerRuntimeBridge(t *testing.T) {
-	cases := []struct {
-		name       string
-		cfg        Config
-		promActive bool
-		want       bool
-	}{
-		{"otlp only", Config{}, false, true},
-		{"prometheus active", Config{}, true, false},
-		{"explicitly disabled", Config{DisableControllerRuntimeBridge: true}, false, false},
-		{"disabled and prometheus active", Config{DisableControllerRuntimeBridge: true}, true, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := useControllerRuntimeBridge(tc.cfg, tc.promActive); got != tc.want {
-				t.Fatalf("useControllerRuntimeBridge = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // Scope labels name the instrumentation library, which is always this
 // module. They add a label to every series and tell an operator nothing.
 func TestPrometheus_NoScopeLabelsOnSeries(t *testing.T) {
