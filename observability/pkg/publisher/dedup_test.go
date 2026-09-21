@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	otelmetric "go.opentelemetry.io/otel/metric"
@@ -280,9 +279,8 @@ func TestExceptGatherer_PropagatesGatherErrors(t *testing.T) {
 	}
 }
 
-// The three branches New relies on to decide what the bridge reads:
-// no Prometheus reader running, mirroring the captured collectors
-// succeeded, and mirroring failed.
+// The two branches New relies on to decide what the bridge reads: no
+// Prometheus reader running, and mirroring the captured collectors.
 func TestBridgeGathererFor(t *testing.T) {
 	dupCounter := func() prometheus.Collector {
 		return prometheus.NewCounter(prometheus.CounterOpts{Name: "reconcile_total", Help: "h"})
@@ -314,24 +312,10 @@ func TestBridgeGathererFor(t *testing.T) {
 				}
 			},
 		},
-		{
-			// Two collectors describing the same metric: the first
-			// Register into the fresh mirror registry succeeds, the
-			// second fails as a duplicate.
-			name: "mirroring fails: bridge is skipped entirely",
-			capreg: &capturingRegisterer{captured: []prometheus.Collector{
-				dupCounter(), dupCounter(),
-			}},
-			check: func(t *testing.T, g prometheus.Gatherer) {
-				if g != nil {
-					t.Errorf("got %v, want nil", g)
-				}
-			},
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := bridgeGathererFor(tc.capreg, logr.Discard())
+			got := bridgeGathererFor(tc.capreg)
 			tc.check(t, got)
 		})
 	}

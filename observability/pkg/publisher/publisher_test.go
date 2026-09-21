@@ -5,7 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 func TestNew_EmptyOperatorNameFails(t *testing.T) {
@@ -94,9 +98,11 @@ func TestNew_CustomMetricSurvivesShutdown(t *testing.T) {
 
 // Every other New test disables Prometheus, so none of them exercise the
 // branches inside New that build bridgeGatherer when the Prometheus reader
-// is actually on alongside OTLP. This covers that happy path end to end,
-// even though the OTLP payload itself is not reachable from outside.
-func TestNew_BothTransportsWireUpWithoutDuplication(t *testing.T) {
+// is actually on alongside OTLP. This is a construction smoke test: it only
+// proves /metrics still carries the counter once when both transports are
+// wired up. It does not inspect OTLP; TestBuildReaders_BridgeExcludesOwnFamilies
+// covers the dedup guarantee end to end.
+func TestNew_BothTransportsConstructWithPrometheusUnaffected(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	cfg := Config{
 		OperatorName:     "op",
@@ -133,5 +139,70 @@ func TestNew_BothTransportsWireUpWithoutDuplication(t *testing.T) {
 	}
 	if series != 1 {
 		t.Fatalf("reconcile_total has %d series on /metrics, want exactly 1", series)
+	}
+}
+
+// buildReaders is the line New relies on to keep OTLP from re-exporting
+// what the Prometheus reader already wrote. This test drives buildReaders
+// directly, the way New does, and Collects from the OTLP reader it returns
+// rather than hand-building exceptGatherer as the dedup tests do. bridgeGathererFor
+// hardcodes controller-runtime's registry as the base it dedupes against,
+// so this test uses that same registry as the Prometheus target, with a
+// stand-in controller-runtime metric registered and cleaned up alongside it.
+func TestBuildReaders_BridgeExcludesOwnFamilies(t *testing.T) {
+	ctrlCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "buildreaders_test_ctrl_total", Help: "stand-in for a controller-runtime metric",
+	})
+	ctrlCounter.Inc()
+	if err := ctrlmetrics.Registry.Register(ctrlCounter); err != nil {
+		t.Fatalf("register stand-in controller-runtime metric: %v", err)
+	}
+	t.Cleanup(func() { ctrlmetrics.Registry.Unregister(ctrlCounter) })
+
+	cfg := Config{
+		OperatorName: "op",
+		Prometheus:   &PrometheusConfig{Registerer: ctrlmetrics.Registry},
+		OTLP: &OTLPConfig{
+			Endpoint: "localhost:1", Insecure: true,
+			Timeout: time.Second, Interval: time.Hour,
+		},
+	}
+	applyDefaults(&cfg)
+
+	rs := buildReaders(context.Background(), cfg, logr.Discard())
+	if rs.prometheus == nil {
+		t.Fatal("buildReaders did not build a Prometheus reader")
+	}
+	if rs.otlp == nil {
+		t.Fatal("buildReaders did not build an OTLP reader")
+	}
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(rs.prometheus), sdkmetric.WithReader(rs.otlp))
+	defer func() { _ = mp.Shutdown(context.Background()) }()
+
+	c, err := mp.Meter("op").Int64Counter("reconcile_total")
+	if err != nil {
+		t.Fatalf("Int64Counter: %v", err)
+	}
+	c.Add(context.Background(), 1)
+
+	var rm metricdata.ResourceMetrics
+	if err := rs.otlp.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	counts := map[string]int{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			counts[m.Name]++
+		}
+	}
+	if counts["reconcile_total"] != 1 {
+		t.Errorf("reconcile_total appeared %d times in OTLP, want exactly 1", counts["reconcile_total"])
+	}
+	if counts["buildreaders_test_ctrl_total"] != 1 {
+		t.Errorf("controller-runtime stand-in appeared %d times in OTLP, want exactly 1",
+			counts["buildreaders_test_ctrl_total"])
 	}
 }

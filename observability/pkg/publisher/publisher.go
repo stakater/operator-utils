@@ -47,6 +47,58 @@ type Publisher struct {
 	log      logr.Logger
 }
 
+// readers holds the readers New attaches, kept separable so tests can
+// collect from the OTLP reader and prove the bridge is filtered.
+type readers struct {
+	prometheus sdkmetric.Reader
+	otlp       sdkmetric.Reader
+	stdout     sdkmetric.Reader
+}
+
+// buildReaders constructs each configured reader, logging and skipping on
+// failure exactly as New does. A field is nil when its transport is
+// disabled or failed to construct.
+func buildReaders(ctx context.Context, cfg Config, log logr.Logger) readers {
+	var rs readers
+
+	// The bridge reads the registry the Prometheus exporter writes to, so
+	// it must skip our own families or every SDK metric reaches OTLP twice.
+	var capreg *capturingRegisterer
+	if !cfg.DisablePrometheus {
+		reader, cr, err := buildPrometheusReader(cfg)
+		if err != nil {
+			log.Info("Prometheus exporter construction failed; continuing without /metrics",
+				"err", err.Error())
+		} else {
+			rs.prometheus = reader
+			capreg = cr
+		}
+	}
+	bridgeGatherer := bridgeGathererFor(capreg)
+
+	if cfg.OTLP != nil {
+		reader, err := buildOTLPReader(ctx, cfg, bridgeGatherer)
+		if err != nil {
+			log.Info("OTLP exporter construction failed; continuing without OTLP",
+				"err", err.Error(), "endpoint", cfg.OTLP.Endpoint)
+		} else {
+			rs.otlp = reader
+		}
+	}
+
+	if cfg.Stdout {
+		exp, err := stdoutmetric.New()
+		if err != nil {
+			log.Info("stdout exporter construction failed; continuing without stdout",
+				"err", err.Error())
+		} else {
+			rs.stdout = sdkmetric.NewPeriodicReader(exp)
+		}
+	}
+
+	return rs
+}
+
 // New constructs the publisher. It is safe to call once per process. It
 // does not block on network I/O; OTLP graceful degradation is implicit
 // because the exporter lazily dials on first export.
@@ -75,49 +127,24 @@ func New(ctx context.Context, cfg Config) (*Publisher, error) {
 		return nil, fmt.Errorf("build resource: %w", err)
 	}
 
-	var readers []sdkmetric.Reader
-
-	// The bridge reads the registry the Prometheus exporter writes to, so
-	// it must skip our own families or every SDK metric reaches OTLP twice.
-	var capreg *capturingRegisterer
-	if !cfg.DisablePrometheus {
-		reader, cr, err := buildPrometheusReader(cfg)
-		if err != nil {
-			log.Info("Prometheus exporter construction failed; continuing without /metrics",
-				"err", err.Error())
-		} else {
-			readers = append(readers, reader)
-			capreg = cr
-		}
+	rs := buildReaders(ctx, cfg, log)
+	var readerList []sdkmetric.Reader
+	if rs.prometheus != nil {
+		readerList = append(readerList, rs.prometheus)
 	}
-	bridgeGatherer := bridgeGathererFor(capreg, log)
-
-	if cfg.OTLP != nil {
-		reader, err := buildOTLPReader(ctx, cfg, bridgeGatherer)
-		if err != nil {
-			log.Info("OTLP exporter construction failed; continuing without OTLP",
-				"err", err.Error(), "endpoint", cfg.OTLP.Endpoint)
-		} else {
-			readers = append(readers, reader)
-		}
+	if rs.otlp != nil {
+		readerList = append(readerList, rs.otlp)
+	}
+	if rs.stdout != nil {
+		readerList = append(readerList, rs.stdout)
 	}
 
-	if cfg.Stdout {
-		exp, err := stdoutmetric.New()
-		if err != nil {
-			log.Info("stdout exporter construction failed; continuing without stdout",
-				"err", err.Error())
-		} else {
-			readers = append(readers, sdkmetric.NewPeriodicReader(exp))
-		}
-	}
-
-	if len(readers) == 0 {
+	if len(readerList) == 0 {
 		log.Info("no metric readers configured; custom metrics will not be exported")
 	}
 
 	opts := []sdkmetric.Option{sdkmetric.WithResource(res)}
-	for _, r := range readers {
+	for _, r := range readerList {
 		opts = append(opts, sdkmetric.WithReader(r))
 	}
 	provider := sdkmetric.NewMeterProvider(opts...)

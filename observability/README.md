@@ -128,7 +128,7 @@ reconcileTotal.Inc(ctx, attribute.String("result", "success"))
 | `Version` | string | `"unknown"` | `service.version` resource attribute |
 | `OTLP` | `*OTLPConfig` | nil | OTLP exporter; if nil, OTLP disabled unless env enables it |
 | `Prometheus` | `*PrometheusConfig` | nil | Tunes the `/metrics` reader; nil means defaults, not disabled |
-| `DisablePrometheus` | bool | false | When true, nothing is exposed on `/metrics` and the bridge stays on |
+| `DisablePrometheus` | bool | false | When true, this module's metrics are no longer exposed on `/metrics`, though controller-runtime's own metrics still are, and the bridge stays on |
 | `Stdout` | bool | false | Enables stdout exporter (dev only) |
 | `DisableGoRuntime` | bool | false | When true, Go runtime metrics are not collected |
 | `Logger` | logr.Logger | discard | Logger for warnings |

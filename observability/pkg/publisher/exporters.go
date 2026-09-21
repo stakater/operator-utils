@@ -30,9 +30,7 @@ func buildOTLPReader(ctx context.Context, cfg Config, g prometheus.Gatherer) (sd
 	readerOpts := []sdkmetric.PeriodicReaderOption{
 		sdkmetric.WithInterval(cfg.OTLP.Interval),
 		sdkmetric.WithTimeout(cfg.OTLP.Timeout),
-	}
-	if g != nil {
-		readerOpts = append(readerOpts, sdkmetric.WithProducer(bridge.ProducerFor(g)))
+		sdkmetric.WithProducer(bridge.ProducerFor(g)),
 	}
 	return sdkmetric.NewPeriodicReader(exp, readerOpts...), nil
 }

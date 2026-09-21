@@ -48,8 +48,8 @@ before the process exits.
 
 Drop `Stdout: true`, add an `OTLP` block, and remove `DisableGoRuntime` so
 Go-runtime metrics are exported too. `/metrics` keeps working alongside it;
-note that with the Prometheus reader active, controller-runtime metrics are
-served for scraping rather than pushed over OTLP:
+controller-runtime metrics are served there for scraping and, via the
+bridge, also pushed over OTLP:
 
 ```go
 pub, err := publisher.New(ctx, publisher.Config{

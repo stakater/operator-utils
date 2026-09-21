@@ -1,7 +1,6 @@
 package publisher
 
 import (
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -70,20 +69,16 @@ func (g exceptGatherer) Gather() ([]*dto.MetricFamily, error) {
 
 // bridgeGathererFor returns what the OTLP bridge should read. capreg is
 // nil when no Prometheus exporter is running, in which case nothing of
-// ours is in the registry and the bridge can read all of it. A nil return
-// means the bridge must be skipped entirely, because we could not work out
-// which families are ours and bridging them would double every metric.
-func bridgeGathererFor(capreg *capturingRegisterer, log logr.Logger) prometheus.Gatherer {
+// ours is in the registry and the bridge can read all of it. Otherwise it
+// mirrors the captured collectors into a private registry so their
+// families can be excluded from the shared one.
+func bridgeGathererFor(capreg *capturingRegisterer) prometheus.Gatherer {
 	if capreg == nil {
 		return ctrlmetrics.Registry
 	}
 	own := prometheus.NewRegistry()
 	for _, c := range capreg.captured {
-		if err := own.Register(c); err != nil {
-			log.Info("could not mirror the Prometheus collector for bridge dedup; "+
-				"skipping the bridge to avoid duplicate OTLP metrics", "err", err.Error())
-			return nil
-		}
+		own.MustRegister(c)
 	}
 	return exceptGatherer{base: ctrlmetrics.Registry, own: own}
 }
