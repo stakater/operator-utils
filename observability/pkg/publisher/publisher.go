@@ -27,12 +27,10 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/stakater/operator-utils/observability/pkg/bridge"
 	"github.com/stakater/operator-utils/observability/pkg/resource"
@@ -81,30 +79,18 @@ func New(ctx context.Context, cfg Config) (*Publisher, error) {
 
 	// The bridge reads the registry the Prometheus exporter writes to, so
 	// it must skip our own families or every SDK metric reaches OTLP twice.
-	bridgeGatherer := prometheus.Gatherer(ctrlmetrics.Registry)
+	var capreg *capturingRegisterer
 	if !cfg.DisablePrometheus {
-		reader, capreg, err := buildPrometheusReader(cfg)
+		reader, cr, err := buildPrometheusReader(cfg)
 		if err != nil {
 			log.Info("Prometheus exporter construction failed; continuing without /metrics",
 				"err", err.Error())
 		} else {
 			readers = append(readers, reader)
-			own := prometheus.NewRegistry()
-			for _, c := range capreg.captured {
-				if err := own.Register(c); err != nil {
-					log.Info("could not mirror the Prometheus collector for bridge dedup; "+
-						"skipping the bridge to avoid duplicate OTLP metrics", "err", err.Error())
-					own = nil
-					break
-				}
-			}
-			if own != nil {
-				bridgeGatherer = exceptGatherer{base: ctrlmetrics.Registry, own: own}
-			} else {
-				bridgeGatherer = nil
-			}
+			capreg = cr
 		}
 	}
+	bridgeGatherer := bridgeGathererFor(capreg, log)
 
 	if cfg.OTLP != nil {
 		reader, err := buildOTLPReader(ctx, cfg, bridgeGatherer)

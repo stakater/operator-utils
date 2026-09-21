@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestNew_EmptyOperatorNameFails(t *testing.T) {
@@ -87,5 +89,49 @@ func TestNew_CustomMetricSurvivesShutdown(t *testing.T) {
 	defer cancel()
 	if err := p.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// Every other New test disables Prometheus, so none of them exercise the
+// branches inside New that build bridgeGatherer when the Prometheus reader
+// is actually on alongside OTLP. This covers that happy path end to end,
+// even though the OTLP payload itself is not reachable from outside.
+func TestNew_BothTransportsWireUpWithoutDuplication(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cfg := Config{
+		OperatorName:     "op",
+		DisableGoRuntime: true,
+		Prometheus:       &PrometheusConfig{Registerer: reg},
+		OTLP: &OTLPConfig{
+			Endpoint: "localhost:1",
+			Insecure: true,
+			Timeout:  100 * time.Millisecond,
+			Interval: time.Hour,
+		},
+	}
+	p, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Shutdown(context.Background())
+
+	ctr, err := p.Custom().Counter("reconcile_total", "total reconciliations")
+	if err != nil {
+		t.Fatalf("Counter: %v", err)
+	}
+	ctr.Inc(context.Background())
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	var series int
+	for _, f := range families {
+		if f.GetName() == "reconcile_total" {
+			series += len(f.GetMetric())
+		}
+	}
+	if series != 1 {
+		t.Fatalf("reconcile_total has %d series on /metrics, want exactly 1", series)
 	}
 }

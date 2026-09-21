@@ -6,11 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 func newCounterIn(t *testing.T, reg prometheus.Registerer, name string) {
@@ -275,5 +277,62 @@ func TestExceptGatherer_PropagatesGatherErrors(t *testing.T) {
 	}
 	if _, err := (exceptGatherer{base: ok, own: failingGatherer{boom}}).Gather(); !errors.Is(err, boom) {
 		t.Errorf("own error not propagated, got %v", err)
+	}
+}
+
+// The three branches New relies on to decide what the bridge reads:
+// no Prometheus reader running, mirroring the captured collectors
+// succeeded, and mirroring failed.
+func TestBridgeGathererFor(t *testing.T) {
+	dupCounter := func() prometheus.Collector {
+		return prometheus.NewCounter(prometheus.CounterOpts{Name: "reconcile_total", Help: "h"})
+	}
+
+	cases := []struct {
+		name   string
+		capreg *capturingRegisterer
+		check  func(t *testing.T, g prometheus.Gatherer)
+	}{
+		{
+			name:   "no Prometheus reader: bridge reads the registry unfiltered",
+			capreg: nil,
+			check: func(t *testing.T, g prometheus.Gatherer) {
+				if g != prometheus.Gatherer(ctrlmetrics.Registry) {
+					t.Errorf("got %v, want ctrlmetrics.Registry", g)
+				}
+			},
+		},
+		{
+			name:   "mirroring succeeds: bridge excludes our families",
+			capreg: &capturingRegisterer{captured: []prometheus.Collector{dupCounter()}},
+			check: func(t *testing.T, g prometheus.Gatherer) {
+				if g == nil {
+					t.Fatal("got nil, want a non-nil exceptGatherer")
+				}
+				if _, ok := g.(exceptGatherer); !ok {
+					t.Fatalf("got %T, want exceptGatherer", g)
+				}
+			},
+		},
+		{
+			// Two collectors describing the same metric: the first
+			// Register into the fresh mirror registry succeeds, the
+			// second fails as a duplicate.
+			name: "mirroring fails: bridge is skipped entirely",
+			capreg: &capturingRegisterer{captured: []prometheus.Collector{
+				dupCounter(), dupCounter(),
+			}},
+			check: func(t *testing.T, g prometheus.Gatherer) {
+				if g != nil {
+					t.Errorf("got %v, want nil", g)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := bridgeGathererFor(tc.capreg, logr.Discard())
+			tc.check(t, got)
+		})
 	}
 }
