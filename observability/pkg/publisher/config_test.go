@@ -3,6 +3,9 @@ package publisher
 import (
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 func TestApplyDefaults_ZeroValueGetsDefaults(t *testing.T) {
@@ -17,6 +20,35 @@ func TestApplyDefaults_ZeroValueGetsDefaults(t *testing.T) {
 	}
 	if cfg.DisableGoRuntime {
 		t.Errorf("DisableGoRuntime = true, want false")
+	}
+	if cfg.Prometheus == nil {
+		t.Fatal("Prometheus = nil, want a default config: the reader is on by default")
+	}
+	if cfg.Prometheus.Registerer != ctrlmetrics.Registry {
+		t.Errorf("Registerer = %v, want controller-runtime's registry", cfg.Prometheus.Registerer)
+	}
+}
+
+// A disabled reader must not be materialised into a default config, since
+// New() keys the bridge decision off whether one was built.
+func TestApplyDefaults_DisabledPrometheusStaysNil(t *testing.T) {
+	cfg := Config{OperatorName: "my-op", DisablePrometheus: true}
+	applyDefaults(&cfg)
+
+	if cfg.Prometheus != nil {
+		t.Errorf("Prometheus = %+v, want nil", cfg.Prometheus)
+	}
+}
+
+// An explicit registry must survive defaulting, otherwise an operator
+// cannot serve metrics anywhere but controller-runtime's endpoint.
+func TestApplyDefaults_KeepsExplicitRegisterer(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cfg := Config{OperatorName: "my-op", Prometheus: &PrometheusConfig{Registerer: reg}}
+	applyDefaults(&cfg)
+
+	if cfg.Prometheus.Registerer != reg {
+		t.Errorf("Registerer was overwritten by the default")
 	}
 }
 

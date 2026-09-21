@@ -1,11 +1,13 @@
 // Command example is a tiny standalone program demonstrating how an
 // operator wires up the observability module. It does not require a
-// running Kubernetes cluster or an OTel collector — metrics are printed
-// to stdout via the stdoutmetric exporter so you can see them locally.
+// running Kubernetes cluster or an OTel collector: metrics are served on
+// http://localhost:8080/metrics and also printed to stdout via the
+// stdoutmetric exporter.
 //
 // Run:
 //
 //	go run .
+//	curl -s localhost:8080/metrics | grep reconcile_total
 //
 // Watch stdout for periodic metric exports (default interval 60 seconds;
 // a final flush prints on Ctrl+C).
@@ -15,12 +17,15 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel/attribute"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/stakater/operator-utils/observability/pkg/instrument"
 	"github.com/stakater/operator-utils/observability/pkg/publisher"
@@ -33,19 +38,18 @@ func main() {
 	defer cancel()
 
 	// Construct the publisher BEFORE any controller-runtime manager would
-	// be created. Stdout: true sends metrics to stdout instead of OTLP,
-	// which is convenient for a local demo. In a real operator you would
-	// set OTLP and leave Stdout off.
+	// be created. The Prometheus reader is on by default, so the metrics
+	// land on controller-runtime's registry with no extra config.
+	// Stdout: true additionally dumps them locally, which a real operator
+	// would leave off.
 	pub, err := publisher.New(ctx, publisher.Config{
 		OperatorName: "demo-operator",
 		Version:      "0.1.0",
 		Stdout:       true,
 
-		// Keep the demo output small. A real operator would leave these
-		// at their defaults so controller-runtime and Go-runtime metrics
-		// also flow into OTLP.
-		DisableControllerRuntimeBridge: true,
-		DisableGoRuntime:               true,
+		// Keep the stdout dump small. A real operator would leave this at
+		// its default so Go-runtime metrics are exposed too.
+		DisableGoRuntime: true,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "publisher init: %v\n", err)
@@ -74,8 +78,28 @@ func main() {
 		"Wall-clock duration of a reconcile call, in seconds",
 	)
 
+	// A real operator gets this endpoint from the controller-runtime
+	// manager. Serving ctrlmetrics.Registry by hand is what the manager
+	// does internally, and lets the demo run without a cluster.
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           promhttp.HandlerFor(ctrlmetrics.Registry, promhttp.HandlerOpts{}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "metrics server: %v\n", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
 	fmt.Println("demo-operator running. Ctrl+C to stop.")
-	fmt.Println("  metrics: printed to stdout every 60 seconds (and once on shutdown)")
+	fmt.Println("  metrics: http://localhost:8080/metrics")
+	fmt.Println("  metrics: also printed to stdout every 60 seconds (and once on shutdown)")
 
 	// Simulate one fake reconcile call per second. Each call updates
 	// every metric so the periodic stdout export has interesting data.

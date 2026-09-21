@@ -1,14 +1,22 @@
 // Package publisher constructs and owns an OpenTelemetry MeterProvider for
-// Kubernetes operators. Custom and Go-runtime metrics are exported via
-// OTLP only; controller-runtime's existing Prometheus /metrics endpoint
-// is left untouched. A Prometheus bridge producer optionally reads from
-// controller-runtime's registry and feeds the same metrics into OTLP.
+// Kubernetes operators.
+//
+// By default, custom and Go-runtime metrics are exposed on the Prometheus
+// registry that controller-runtime already serves at /metrics, so a
+// zero-config Publisher needs no collector and no extra port. Setting
+// OTLP additionally pushes those metrics to a collector.
+//
+// The two paths are kept non-overlapping. The bridge producer feeds
+// controller-runtime's registry into OTLP, but that same registry is
+// where the Prometheus reader writes, so an active Prometheus reader
+// suppresses the bridge; otherwise every SDK metric would reach OTLP
+// twice under one name. With both enabled, controller-runtime metrics
+// are served on /metrics for a collector to scrape rather than pushed.
 //
 // Typical usage in an operator's main.go:
 //
 //	pub, err := publisher.New(ctx, publisher.Config{
 //	    OperatorName: "my-operator",
-//	    OTLP:         &publisher.OTLPConfig{Endpoint: "collector:4317", Insecure: true},
 //	})
 //	if err != nil { ... }
 //	defer pub.Shutdown(context.Background())
@@ -69,8 +77,30 @@ func New(ctx context.Context, cfg Config) (*Publisher, error) {
 
 	var readers []sdkmetric.Reader
 
+	// Built before OTLP: once SDK metrics are on controller-runtime's
+	// registry, the bridge producer would round-trip them back into OTLP
+	// under the same names, so the OTLP reader needs to know.
+	promActive := false
+	if !cfg.DisablePrometheus {
+		reader, err := buildPrometheusReader(cfg)
+		if err != nil {
+			log.Info("Prometheus exporter construction failed; continuing without /metrics",
+				"err", err.Error())
+		} else {
+			readers = append(readers, reader)
+			promActive = true
+		}
+	}
+
+	withBridge := useControllerRuntimeBridge(cfg, promActive)
+	if promActive && !cfg.DisableControllerRuntimeBridge {
+		log.Info("controller-runtime bridge disabled: the Prometheus reader " +
+			"already exposes those metrics on /metrics, and bridging them " +
+			"would duplicate every SDK metric on the OTLP path")
+	}
+
 	if cfg.OTLP != nil {
-		reader, err := buildOTLPReader(ctx, cfg)
+		reader, err := buildOTLPReader(ctx, cfg, withBridge)
 		if err != nil {
 			log.Info("OTLP exporter construction failed; continuing without OTLP",
 				"err", err.Error(), "endpoint", cfg.OTLP.Endpoint)
@@ -145,4 +175,12 @@ func namedLogger(l logr.Logger) logr.Logger {
 		return logr.Discard()
 	}
 	return l.WithName("observability")
+}
+
+// useControllerRuntimeBridge reports whether the OTLP reader should carry
+// the controller-runtime bridge producer. The bridge gathers the same
+// registry the Prometheus reader writes to, so an active Prometheus
+// reader suppresses it to keep the two flows non-overlapping.
+func useControllerRuntimeBridge(cfg Config, promActive bool) bool {
+	return !cfg.DisableControllerRuntimeBridge && !promActive
 }

@@ -3,14 +3,17 @@ package publisher
 import (
 	"context"
 
+	"github.com/prometheus/otlptranslator"
+
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	prometheusexporter "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/stakater/operator-utils/observability/pkg/bridge"
 )
 
-func buildOTLPReader(ctx context.Context, cfg Config) (sdkmetric.Reader, error) {
+func buildOTLPReader(ctx context.Context, cfg Config, withBridge bool) (sdkmetric.Reader, error) {
 	var exp sdkmetric.Exporter
 	var err error
 	switch cfg.OTLP.Protocol {
@@ -27,7 +30,7 @@ func buildOTLPReader(ctx context.Context, cfg Config) (sdkmetric.Reader, error) 
 		sdkmetric.WithInterval(cfg.OTLP.Interval),
 		sdkmetric.WithTimeout(cfg.OTLP.Timeout),
 	}
-	if !cfg.DisableControllerRuntimeBridge {
+	if withBridge {
 		readerOpts = append(readerOpts, sdkmetric.WithProducer(bridge.ControllerRuntimeProducer()))
 	}
 	return sdkmetric.NewPeriodicReader(exp, readerOpts...), nil
@@ -65,4 +68,28 @@ func newOTLPHTTP(ctx context.Context, o *OTLPConfig) (sdkmetric.Exporter, error)
 		opts = append(opts, otlpmetrichttp.WithHeaders(o.Headers))
 	}
 	return otlpmetrichttp.New(ctx, opts...)
+}
+
+// buildPrometheusReader returns a reader that exposes SDK metrics on the
+// configured Prometheus registry.
+//
+// UnderscoreEscapingWithSuffixes is the full Prometheus-style translation:
+// dotted OTel names are escaped and unit and counter suffixes appended.
+// The _total suffix is idempotent, so a counter registered as either
+// "reconcile" or "reconcile_total" is exposed as reconcile_total.
+//
+// Scope labels are always suppressed: otel_scope_name / otel_scope_version
+// would otherwise land on every series without telling an operator
+// anything it does not already know.
+func buildPrometheusReader(cfg Config) (sdkmetric.Reader, error) {
+	p := cfg.Prometheus
+	opts := []prometheusexporter.Option{
+		prometheusexporter.WithRegisterer(p.Registerer),
+		prometheusexporter.WithoutScopeInfo(),
+		prometheusexporter.WithTranslationStrategy(otlptranslator.UnderscoreEscapingWithSuffixes),
+	}
+	if p.DisableTargetInfo {
+		opts = append(opts, prometheusexporter.WithoutTargetInfo())
+	}
+	return prometheusexporter.New(opts...)
 }

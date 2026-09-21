@@ -44,7 +44,12 @@ Must satisfy `naming.ValidateMetricName`:
 Reserved prefixes match metrics that come from the Go runtime,
 controller-runtime, or other OTel-internal sources. Allowing custom
 metrics with these prefixes would create ambiguous time series
-downstream.
+downstream, and would now genuinely collide: the Prometheus reader
+exposes custom metrics on the same registry those sources use.
+
+Counter names may end in `_total` or not, as you prefer: the Prometheus
+exporter appends that suffix only when it is missing, so `reconcile` and
+`reconcile_total` are both served as `reconcile_total`.
 
 Names are tracked across instrument types. Registering a Counter named
 `"reconcile_total"` makes a subsequent Gauge or Histogram registration

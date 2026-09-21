@@ -14,11 +14,12 @@ func TestNew_EmptyOperatorNameFails(t *testing.T) {
 }
 
 func TestNew_NoReadersSucceedsWithWarn(t *testing.T) {
-	// No OTLP, no Stdout, no env vars.
+	// No OTLP, no Stdout, no env vars, and the default Prometheus reader
+	// turned off, so the provider genuinely has nothing attached.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
 
-	p, err := New(context.Background(), Config{OperatorName: "op"})
+	p, err := New(context.Background(), Config{OperatorName: "op", DisablePrometheus: true})
 	if err != nil {
 		t.Fatalf("expected success with no readers, got %v", err)
 	}
@@ -34,7 +35,8 @@ func TestNew_NoReadersSucceedsWithWarn(t *testing.T) {
 // the PeriodicReader's background goroutine and is not exercised here.
 func TestNew_UnreachableOTLPDoesNotBlockConstruction(t *testing.T) {
 	cfg := Config{
-		OperatorName: "op",
+		OperatorName:      "op",
+		DisablePrometheus: true,
 		OTLP: &OTLPConfig{
 			Endpoint: "localhost:1", // guaranteed-unused
 			Insecure: true,
@@ -57,7 +59,7 @@ func TestNew_EnvOnlyOTLPEnablement(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:1")
 	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
 
-	p, err := New(context.Background(), Config{OperatorName: "op"})
+	p, err := New(context.Background(), Config{OperatorName: "op", DisablePrometheus: true})
 	if err != nil {
 		t.Fatalf("expected env-only OTLP to construct, got error: %v", err)
 	}
@@ -68,8 +70,9 @@ func TestNew_EnvOnlyOTLPEnablement(t *testing.T) {
 
 func TestNew_CustomMetricSurvivesShutdown(t *testing.T) {
 	p, err := New(context.Background(), Config{
-		OperatorName: "op",
-		Stdout:       true,
+		OperatorName:      "op",
+		Stdout:            true,
+		DisablePrometheus: true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

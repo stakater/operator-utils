@@ -94,8 +94,12 @@ producer := bridge.ControllerRuntimeProducer()
 Returns a `metric.Producer` that reads from controller-runtime's existing
 `prometheus.Registry`. Attach it to a `PeriodicReader` via
 `sdkmetric.WithProducer` to push controller-runtime metrics through OTLP
-(or any other Reader) without touching the registry or the `/metrics`
-endpoint.
+(or any other Reader) without writing to the registry.
+
+Do not attach this producer to a Reader that also writes into the same
+registry, such as the Prometheus exporter: the metrics it writes would be
+gathered straight back out and exported twice. `publisher.New` avoids
+this by suppressing the bridge whenever its Prometheus reader is active.
 
 ### When to use
 

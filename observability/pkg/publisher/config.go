@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // Config configures a Publisher. The zero value with only OperatorName set
@@ -24,6 +26,15 @@ type Config struct {
 	// constructed from env-derived defaults.
 	OTLP *OTLPConfig
 
+	// Prometheus, if non-nil, tunes the Prometheus reader. A nil value means
+	// the reader runs with defaults; use DisablePrometheus to turn it off.
+	Prometheus *PrometheusConfig
+
+	// DisablePrometheus disables the Prometheus reader that exposes SDK
+	// metrics on controller-runtime's /metrics endpoint. Zero value means
+	// the reader is enabled.
+	DisablePrometheus bool
+
 	// Stdout enables a stdout metric exporter for local development. Default false.
 	Stdout bool
 
@@ -37,6 +48,18 @@ type Config struct {
 
 	// Logger is optional. Defaults to logr.Discard().
 	Logger logr.Logger
+}
+
+// PrometheusConfig tunes the Prometheus reader, which exposes SDK metrics
+// on the Prometheus registry controller-runtime already serves at /metrics.
+type PrometheusConfig struct {
+	// Registerer is the registry to expose metrics on. Defaults to
+	// controller-runtime's global registry, i.e. the manager's /metrics.
+	Registerer prometheus.Registerer
+
+	// DisableTargetInfo drops the target_info metric carrying the resource
+	// attributes (service.name, service.version, ...). Zero value keeps it.
+	DisableTargetInfo bool
 }
 
 // OTLPConfig configures the OTLP exporter.
@@ -70,6 +93,14 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.OTLP != nil {
 		applyOTLPDefaults(cfg.OTLP)
+	}
+	if !cfg.DisablePrometheus {
+		if cfg.Prometheus == nil {
+			cfg.Prometheus = &PrometheusConfig{}
+		}
+		if cfg.Prometheus.Registerer == nil {
+			cfg.Prometheus.Registerer = ctrlmetrics.Registry
+		}
 	}
 }
 
