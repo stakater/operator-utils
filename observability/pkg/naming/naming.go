@@ -15,6 +15,11 @@ var (
 	attributeKeyRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 )
 
+// reservedPrefixes are the namespaces owned by controller-runtime, the Go
+// runtime and OTel itself. Custom metrics must avoid them for two reasons:
+// they share one Prometheus registry, so a collision would be a genuine
+// clash, and the OTLP bridge tells our families apart from everyone else's
+// by name. These rules are load-bearing, not advisory.
 var reservedPrefixes = []string{
 	"otel_",
 	"go_",

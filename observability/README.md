@@ -1,11 +1,11 @@
 # observability
 
 OpenTelemetry metrics publisher for Kubernetes operators built on
-`controller-runtime`. Custom and Go-runtime metrics are exported over OTLP
-only. Controller-runtime's existing Prometheus `/metrics` endpoint is
-**not touched** by this module; instead a one-directional bridge producer
-reads from that registry and feeds the same metrics into the OTLP push
-path.
+`controller-runtime`. Custom and Go-runtime metrics are exposed on the
+Prometheus registry the manager already serves at `/metrics`, so a
+zero-config `Publisher` works with your existing `ServiceMonitor` and
+needs no collector, no extra port and no RBAC change. Setting `OTLP`
+additionally pushes the same metrics to a collector.
 
 This README is the quickstart. For per-package reference docs (every
 config field, every instrument method, exporter behaviour,
@@ -15,54 +15,42 @@ see [`example/`](example/).
 ## Architecture
 
 ```
-                ┌──────────────────────────────────────────┐
-                │           OTel MeterProvider             │
-                │   custom metrics + Go runtime metrics    │
-                │              │                            │
-                │              ▼                            │
-                │      PeriodicReader                       │
-                │       │                ▲                  │
-                │       │ (also pulls    │                  │
-                │       │  from) ────────┘                  │
-                │       │      Prometheus bridge producer   │
-                │       ▼                ▲                  │
-                │   OTLP exporter        │                  │
-                └────────┼───────────────┼──────────────────┘
-                         │               │
-                         ▼               │
-                    [collector]          │
-                                         │
-              ┌──────────────────────────┴──────┐
-              │ controller-runtime Prom Registry │
-              │ (populated by client_golang,     │
-              │  served at /metrics — UNTOUCHED) │
-              └─────────────────────────────────┘
+            ┌──────────────────────────────────────┐
+            │      instruments (OTel Meter API)    │
+            └───────────┬──────────────┬───────────┘
+                        │              │ native
+       Prometheus exporter             │
+                        ▼              ▼
+   ┌──────────────────────────┐    OTLP exporter ──► [collector]
+   │ controller-runtime Prom  │        ▲
+   │ Registry  ──► /metrics   │────────┘
+   └──────────────────────────┘   bridge, minus our own families
 ```
 
 | Metric source | `/metrics` | OTLP |
 |---|---|---|
-| Custom (operator-defined) | no | yes (native OTel SDK) |
-| Go runtime | no | yes (via `otel/contrib/instrumentation/runtime`) |
-| Controller-runtime native | yes (existing) | yes (via bridge producer) |
+| Custom (operator-defined) | yes | yes, natively |
+| Go runtime | yes | yes, natively |
+| Controller-runtime native | yes | yes, via the bridge |
 
-### Design rationale
+### Why nothing is suppressed
 
-Earlier designs considered writing OTel-instrumented metrics into
-controller-runtime's Prometheus registry (via the OTel Prometheus
-exporter) so they would appear on `/metrics` alongside controller-runtime
-metrics. This was rejected because the Prometheus bridge producer also
-reads from that registry to feed OTLP, which would cause every custom
-metric to reach OTLP twice — once natively from the SDK, once
-round-tripped through the registry. The current design uses
-one-directional, non-overlapping flows: OTel SDK metrics go to OTLP only;
-Prometheus registry metrics stay on `/metrics` (untouched) and reach OTLP
-only via the bridge.
+The Prometheus exporter and the bridge share one registry, so a naive
+bridge would re-export every SDK metric that the exporter just wrote, and
+each custom metric would reach OTLP twice under one name.
+
+Rather than switch a route off, the bridge is given a filtered view: it
+exports only the families this module did not write. Every transport
+therefore carries every metric class exactly once, in every
+configuration, and custom metrics keep their native OTel form on the push
+path, including exponential histograms and the operator's own
+instrumentation scope.
 
 ## Package layout
 
 | Import path | What's there |
 |---|---|
-| `.../observability/pkg/publisher` | `Publisher`, `Config`, `OTLPConfig`, `CustomMetrics`. The default entry point. |
+| `.../observability/pkg/publisher` | `Publisher`, `Config`, `OTLPConfig`, `PrometheusConfig`, `CustomMetrics`. The default entry point. |
 | `.../observability/pkg/instrument` | `Counter`, `Gauge`, `Histogram` interfaces. Import this when type-annotating helper signatures. |
 | `.../observability/pkg/naming` | `ValidateMetricName`, `ValidateAttributeKey`. Useful at operator startup. |
 | `.../observability/pkg/resource` | `Build(operatorName, version)` — exposes the module's k8s pod resource conventions for callers wiring a custom MeterProvider. |
@@ -88,14 +76,11 @@ func main() {
     ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     defer cancel()
 
-    // 1. Construct publisher BEFORE the manager.
+    // 1. Construct publisher BEFORE the manager. With no OTLP block,
+    //    metrics are served on the manager's /metrics endpoint only.
     pub, err := publisher.New(ctx, publisher.Config{
         OperatorName: "my-operator",
         Version:      "1.2.3",
-        OTLP: &publisher.OTLPConfig{
-            Endpoint: "otel-collector.observability.svc:4317",
-            Insecure: true,
-        },
     })
     if err != nil {
         // Only fatal on misconfiguration (e.g., empty OperatorName).
@@ -142,10 +127,18 @@ reconcileTotal.Inc(ctx, attribute.String("result", "success"))
 | `OperatorName` | string | (required) | `service.name` resource attribute |
 | `Version` | string | `"unknown"` | `service.version` resource attribute |
 | `OTLP` | `*OTLPConfig` | nil | OTLP exporter; if nil, OTLP disabled unless env enables it |
+| `Prometheus` | `*PrometheusConfig` | nil | Tunes the `/metrics` reader; nil means defaults, not disabled |
+| `DisablePrometheus` | bool | false | When true, this module's metrics are no longer exposed on `/metrics`, though controller-runtime's own metrics still are, and the bridge stays on |
 | `Stdout` | bool | false | Enables stdout exporter (dev only) |
-| `DisableControllerRuntimeBridge` | bool | false | When true, ctrl-runtime metrics do not flow into OTLP |
 | `DisableGoRuntime` | bool | false | When true, Go runtime metrics are not collected |
 | `Logger` | logr.Logger | discard | Logger for warnings |
+
+### `publisher.PrometheusConfig`
+
+| Field | Default | Purpose |
+|---|---|---|
+| `Registerer` | controller-runtime's registry | Where to expose metrics; override to serve them elsewhere |
+| `DisableTargetInfo` | false | Drop the `target_info` series carrying `service.name` / `service.version` |
 
 ### `publisher.OTLPConfig`
 
@@ -171,13 +164,17 @@ These standard OTel SDK env vars override the Go config:
 ## Verification
 
 ```bash
-# Controller-runtime metrics still on /metrics (unchanged behavior)
+# Controller-runtime metrics, as before
 curl -s localhost:8080/metrics | grep controller_runtime_reconcile_total
 
-# Custom metrics are NOT on /metrics — they are OTLP-only
-curl -s localhost:8080/metrics | grep my_custom_metric  # should be empty
+# Custom metrics, under the exact name you registered
+curl -s localhost:8080/metrics | grep reconcile_total
 
-# To see custom metrics during local dev, set Stdout: true and check the operator's stdout.
+# Go runtime metrics, dotted OTel names escaped to Prometheus form
+curl -s localhost:8080/metrics | grep go_memory_used_bytes
+
+# Resource attributes
+curl -s localhost:8080/metrics | grep target_info
 ```
 
 ## Caveats
@@ -188,6 +185,17 @@ curl -s localhost:8080/metrics | grep my_custom_metric  # should be empty
 - **OTLP graceful degradation.** If the collector is unreachable, exports
   fail in the background and the operator keeps running. `/metrics` is
   unaffected.
-- **Custom metrics do not appear on `/metrics`.** This is intentional.
-  Use Prometheus's native OTLP ingestion (v2.47+) or scrape the
-  collector if you need them in Prometheus.
+- **Counter naming.** Names are translated to Prometheus style on
+  export, and the `_total` suffix is appended only when missing.
+  Registering `reconcile` or `reconcile_total` yields the same
+  `reconcile_total` series, so registering both on one publisher is
+  rejected rather than silently breaking `/metrics`.
+- **Histogram buckets.** The SDK default bucket boundaries are
+  millisecond-oriented (`0, 5, 10, ... 10000`), so a histogram recorded
+  in seconds lands in the first bucket every time. Record milliseconds
+  (as [`example/`](example/) does), or wire a custom View through
+  `pkg/bridge` and your own Reader.
+- **One publisher per process.** The Prometheus reader can only be
+  installed on controller-runtime's registry once. A second
+  `publisher.New` logs and continues without a `/metrics` reader rather
+  than double-registering, which would 500 the endpoint.

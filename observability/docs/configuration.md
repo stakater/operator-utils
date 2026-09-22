@@ -1,18 +1,20 @@
 # Configuration
 
 `publisher.New` takes a `publisher.Config` value. The zero value with only
-`OperatorName` set is a valid configuration that enables both default
-instrumentations (controller-runtime bridge and Go-runtime metrics).
+`OperatorName` set is a valid configuration: it exposes custom and
+Go-runtime metrics on controller-runtime's `/metrics` endpoint and
+enables Go-runtime instrumentation.
 
 ```go
 type Config struct {
-    OperatorName                   string
-    Version                        string
-    OTLP                           *OTLPConfig
-    Stdout                         bool
-    DisableControllerRuntimeBridge bool
-    DisableGoRuntime               bool
-    Logger                         logr.Logger
+    OperatorName      string
+    Version           string
+    OTLP              *OTLPConfig
+    Prometheus        *PrometheusConfig
+    DisablePrometheus bool
+    Stdout            bool
+    DisableGoRuntime  bool
+    Logger            logr.Logger
 }
 ```
 
@@ -42,8 +44,25 @@ OTLP exporter is still constructed from env-derived defaults — see
 [Environment-variable overrides](#environment-variable-overrides).
 
 If nil and no OTLP env vars are set, OTLP export is disabled. The
-publisher logs a warning at construction time if neither OTLP nor
-`Stdout` produces a reader.
+publisher logs a warning at construction time if no reader at all is
+produced, which requires `DisablePrometheus` as well.
+
+### `Prometheus *PrometheusConfig` (optional)
+
+Tunes the Prometheus reader. A nil value means the reader runs with
+defaults — it does **not** disable it; use `DisablePrometheus` for that.
+See [PrometheusConfig fields](#prometheusconfig-fields) below.
+
+### `DisablePrometheus bool` (optional)
+
+When true, no reader is registered on any Prometheus registry and
+`/metrics` shows only what controller-runtime puts there itself. Default
+`false`. A `Prometheus` block set alongside it is ignored, and the
+publisher logs that it was.
+
+The bridge is unaffected by this field: it is always attached to the
+OTLP reader and reads the whole controller-runtime registry once nothing
+of ours is written into it.
 
 ### `Stdout bool` (optional)
 
@@ -54,16 +73,6 @@ running collector. Default `false`.
 The stdout exporter uses the OTel SDK's default periodic interval
 (60 seconds). There is no separate configuration knob for the stdout
 push cadence in this module.
-
-### `DisableControllerRuntimeBridge bool` (optional)
-
-When true, the Prometheus bridge producer that reads from
-controller-runtime's `prometheus.Registry` is **not** attached to the OTLP
-reader. Default `false`, meaning the bridge is enabled and
-controller-runtime metrics flow into the OTLP push path.
-
-The bridge has no effect on the `/metrics` endpoint either way — that
-endpoint is owned by controller-runtime and never touched by this module.
 
 ### `DisableGoRuntime bool` (optional)
 
@@ -77,6 +86,61 @@ Logger for warnings emitted by the publisher (OTLP exporter construction
 failure, "no readers configured", graceful-degradation messages). Defaults
 to `logr.Discard()` when the zero `logr.Logger` is passed. The provided
 logger is wrapped with `WithName("observability")`.
+
+## PrometheusConfig fields
+
+```go
+type PrometheusConfig struct {
+    Registerer        prometheus.Registerer
+    DisableTargetInfo bool
+}
+```
+
+### `Registerer prometheus.Registerer` (optional)
+
+The registry to expose metrics on. Defaults to
+`sigs.k8s.io/controller-runtime/pkg/metrics.Registry`, which the manager
+already serves at `/metrics`. Override it to serve metrics on a registry
+of your own, or to isolate a registry in tests.
+
+Two values are supported:
+
+| Value | Bridge behaviour |
+|---|---|
+| controller-runtime's registry (default) | The bridge reads that registry with this module's own families filtered out |
+| any registry controller-runtime does not serve | Nothing of ours is in controller-runtime's registry, so the bridge reads it unfiltered |
+
+**A wrapper around controller-runtime's registry is not supported.**
+`prometheus.WrapRegistererWithPrefix` and `WrapRegistererWith` rewrite
+metric names and labels on the way in. The bridge builds its exclusion
+set by mirroring the collectors it registered and reading their names
+back, so it never sees the rewritten names, matches nothing, and pushes
+every SDK metric to the collector twice — once natively and once through
+the bridge. Prefix your metric names at registration instead.
+
+Internally, `Registerer` is wrapped so the publisher can record which
+families it registered; that is how the OTLP bridge tells our metrics
+apart from controller-runtime's on the same registry. Nothing else wires
+up an endpoint for you: a registry of your own only gets scraped if you
+serve it.
+
+The Prometheus reader can be installed on controller-runtime's registry
+once per process. A second `publisher.New` is refused at that step, logs
+`Prometheus exporter construction failed; continuing without /metrics`,
+and constructs without a `/metrics` reader. The OTel exporter's collector
+is unchecked, so `prometheus.Registry` cannot detect the duplicate
+itself; without this guard the second registration succeeds and every
+scrape afterwards fails on a duplicate `target_info`.
+
+### `DisableTargetInfo bool` (optional)
+
+When true, the `target_info` series carrying the resource attributes
+(`service.name`, `service.version`, pod metadata) is not exported.
+Default `false`.
+
+Instrumentation-scope labels (`otel_scope_name`, `otel_scope_version`)
+are always suppressed and have no knob: they would land on every series
+while only ever naming this module.
 
 ## OTLPConfig fields
 
@@ -168,7 +232,9 @@ When `publisher.New` runs, it processes the config in this order:
 
 1. **Built-in defaults** are applied to whatever the caller passed in
    (`Version → "unknown"`, `OTLP.Protocol → "grpc"`, etc.). Fields that
-   are already set are left alone.
+   are already set are left alone. Unless `DisablePrometheus` is set,
+   this also materializes a `Prometheus` block whose `Registerer`
+   defaults to controller-runtime's registry.
 2. **Environment variables** are read and applied on top of the result.
    These always win over struct values.
 3. **OTLP defaults** are re-applied if an OTLP block now exists (e.g. env
@@ -184,7 +250,6 @@ defer cancel()
 
 pub, err := publisher.New(ctx, publisher.Config{
     OperatorName: "my-operator",
-    OTLP:         &publisher.OTLPConfig{Endpoint: "collector:4317", Insecure: true},
 })
 if err != nil {
     // Only fatal on misconfiguration (e.g., empty OperatorName).
@@ -198,7 +263,11 @@ defer func() {
 }()
 ```
 
-- Construct the publisher **before** the controller-runtime manager.
+- Construct the publisher **before** the controller-runtime manager. Not
+  for the `/metrics` path — the metrics server gathers the registry on
+  each scrape, so a reader registered later still shows up. The reason is
+  `otel.SetMeterProvider`: instruments created before it runs bind to the
+  no-op provider and record nothing.
 - `publisher.New` does not block on network I/O — OTLP exporters dial
   lazily on first export.
 - `Shutdown` honours the provided context and always returns `nil`. Final

@@ -1,14 +1,18 @@
 # Exporters
 
-The publisher can construct up to two metric readers, one per exporter:
+The publisher can construct up to three metric readers, one per exporter:
 
+- **Prometheus reader** — pull-based, exposes metrics on the registry
+  controller-runtime serves at `/metrics`. On by default; driven by
+  `Config.Prometheus` and `Config.DisablePrometheus`.
 - **OTLP reader** — periodic push to a collector over gRPC or HTTP. Driven by
   `Config.OTLP` (and OTLP environment variables).
 - **Stdout reader** — periodic dump of metrics to stdout for local
   development. Driven by `Config.Stdout`.
 
-Both are optional. If neither is configured, the publisher constructs
-successfully with no readers and logs a single warning at startup:
+All are optional, but reaching zero readers takes `DisablePrometheus`
+plus no OTLP and no `Stdout`. In that state the publisher constructs
+successfully and logs a single warning at startup:
 
 ```
 no metric readers configured; custom metrics will not be exported
@@ -135,15 +139,71 @@ if err != nil {
 }
 ```
 
+## Prometheus exporter
+
+The reader registers on `Config.Prometheus.Registerer`, which defaults to
+`sigs.k8s.io/controller-runtime/pkg/metrics.Registry`. That registry is
+already served by the manager's metrics server, so nothing else needs
+wiring: no extra port, Service, ServiceMonitor or RBAC rule.
+
+Construction failure is non-fatal, consistent with the rest of the
+module. The publisher logs and carries on without `/metrics`:
+
+```
+Prometheus exporter construction failed; continuing without /metrics
+```
+
+### Name translation
+
+OTel metric names are translated to Prometheus form on export:
+
+The strategy is `UnderscoreEscapingWithSuffixes`, full Prometheus-style
+translation:
+
+| Registered name | On `/metrics` | Why |
+|---|---|---|
+| `reconcile_total` | `reconcile_total` | The `_total` suffix is idempotent, so it is not appended twice |
+| `reconcile` | `reconcile_total` | A counter without the suffix gains the conventional one |
+| `go.memory.used` (unit `By`) | `go_memory_used_bytes` | Dots are escaped and unit suffixes added, so Go-runtime metrics stay Prometheus-legal |
+
+Both counter spellings therefore land on the same series, and there is
+no knob to get this wrong.
+
+Scope labels (`otel_scope_name`, `otel_scope_version`) are always
+suppressed. Resource attributes are exported as a `target_info` series
+unless `DisableTargetInfo` is set.
+
+Counter names gain a `_total` suffix here but not on the OTLP path, so
+the same metric can need two names in dashboards and alerting rules
+depending on how it was ingested. A counter registered as `reconcile`
+arrives at Prometheus as `reconcile_total` and at the collector as
+`reconcile`. Registering both spellings is rejected — see
+[custom-metrics.md](custom-metrics.md).
+
+Only one Prometheus reader may be installed on controller-runtime's
+registry per process. A second one is refused and logged; the publisher
+still constructs, without a `/metrics` reader.
+
 ## Controller-runtime bridge producer
 
-When `Config.OTLP` is set and `Config.DisableControllerRuntimeBridge` is
-false (default), a Prometheus bridge producer is attached to the OTLP
-reader. The producer reads from `sigs.k8s.io/controller-runtime/pkg/metrics.Registry`
-on every OTLP flush and includes those metrics in the OTLP payload.
+The bridge is always attached to the OTLP reader. It reads
+controller-runtime's registry through a filter that removes the families
+this module exported, so SDK metrics take the native OTel path to OTLP
+and controller-runtime's take the bridge, with no overlap.
+
+The filter is applied only when the Prometheus reader was pointed at
+controller-runtime's registry. Point it somewhere else and nothing of
+ours is in that registry, so the bridge reads it whole; filtering there
+would drop controller-runtime families that merely share a name with
+ours.
+
+`bridge.ProducerFor(g)` takes any gatherer if you are wiring your own
+reader. Attaching an unfiltered producer to a reader whose provider also
+exports those metrics natively yields two copies of each.
 
 The bridge is attached **only** to the OTLP reader, never to the stdout
-reader. Controller-runtime metrics never flow through stdout.
+or Prometheus readers. Controller-runtime metrics never flow through
+stdout.
 
 See [extension-points.md](extension-points.md) for using the bridge
 producer with a custom-built MeterProvider.
@@ -165,9 +225,13 @@ For more on the resource, see [extension-points.md](extension-points.md).
 
 ## Reader composition
 
-The two readers run independently. Each maintains its own collection
-state, so a custom metric recorded once will appear once in each
-configured exporter. No reader is "downstream" of another.
+The readers run independently. Each maintains its own collection state,
+so a custom metric recorded once will appear once in each configured
+exporter. No reader is "downstream" of another.
+
+The Prometheus reader is pull-based: it collects when the registry is
+gathered, i.e. on each scrape of `/metrics`, and has no push interval to
+configure.
 
 Example: a `Counter.Inc` call with both OTLP and Stdout enabled will
 result in:
