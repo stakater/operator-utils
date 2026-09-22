@@ -73,9 +73,13 @@ func main() {
 		"active_workers",
 		"Current number of active worker goroutines",
 	)
+	// Milliseconds, not seconds. The SDK's default histogram boundaries
+	// are 0, 5, 10, ... 10000, so a duration recorded in seconds lands in
+	// the first bucket every time and the histogram says nothing. Record
+	// milliseconds, or attach a View with your own boundaries.
 	reconcileDuration := custom.MustHistogram(
-		"reconcile_duration_seconds",
-		"Wall-clock duration of a reconcile call, in seconds",
+		"reconcile_duration_milliseconds",
+		"Wall-clock duration of a reconcile call, in milliseconds",
 	)
 
 	// A real operator gets this endpoint from the controller-runtime
@@ -134,7 +138,7 @@ func runFakeReconcile(
 
 	start := time.Now()
 	time.Sleep(time.Duration(rand.IntN(80)+10) * time.Millisecond)
-	duration := time.Since(start).Seconds()
+	durationMillis := float64(time.Since(start).Nanoseconds()) / float64(time.Millisecond)
 
 	outcome := "success"
 	if rand.IntN(10) == 0 {
@@ -143,5 +147,5 @@ func runFakeReconcile(
 
 	result := attribute.String("result", outcome)
 	counter.Inc(ctx, result)
-	histogram.Record(ctx, duration, result)
+	histogram.Record(ctx, durationMillis, result)
 }

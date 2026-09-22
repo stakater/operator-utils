@@ -57,7 +57,8 @@ See [PrometheusConfig fields](#prometheusconfig-fields) below.
 
 When true, no reader is registered on any Prometheus registry and
 `/metrics` shows only what controller-runtime puts there itself. Default
-`false`.
+`false`. A `Prometheus` block set alongside it is ignored, and the
+publisher logs that it was.
 
 The bridge is unaffected by this field: it is always attached to the
 OTLP reader and reads the whole controller-runtime registry once nothing
@@ -102,11 +103,34 @@ The registry to expose metrics on. Defaults to
 already serves at `/metrics`. Override it to serve metrics on a registry
 of your own, or to isolate a registry in tests.
 
+Two values are supported:
+
+| Value | Bridge behaviour |
+|---|---|
+| controller-runtime's registry (default) | The bridge reads that registry with this module's own families filtered out |
+| any registry controller-runtime does not serve | Nothing of ours is in controller-runtime's registry, so the bridge reads it unfiltered |
+
+**A wrapper around controller-runtime's registry is not supported.**
+`prometheus.WrapRegistererWithPrefix` and `WrapRegistererWith` rewrite
+metric names and labels on the way in. The bridge builds its exclusion
+set by mirroring the collectors it registered and reading their names
+back, so it never sees the rewritten names, matches nothing, and pushes
+every SDK metric to the collector twice — once natively and once through
+the bridge. Prefix your metric names at registration instead.
+
 Internally, `Registerer` is wrapped so the publisher can record which
-families it registered; that is how the OTLP bridge later tells our
-metrics apart from controller-runtime's on the same registry. If you
-supply a custom `Registerer`, it must also implement
-`prometheus.Gatherer`, or `/metrics` will have nothing to scrape.
+families it registered; that is how the OTLP bridge tells our metrics
+apart from controller-runtime's on the same registry. Nothing else wires
+up an endpoint for you: a registry of your own only gets scraped if you
+serve it.
+
+The Prometheus reader can be installed on controller-runtime's registry
+once per process. A second `publisher.New` is refused at that step, logs
+`Prometheus exporter construction failed; continuing without /metrics`,
+and constructs without a `/metrics` reader. The OTel exporter's collector
+is unchecked, so `prometheus.Registry` cannot detect the duplicate
+itself; without this guard the second registration succeeds and every
+scrape afterwards fails on a duplicate `target_info`.
 
 ### `DisableTargetInfo bool` (optional)
 

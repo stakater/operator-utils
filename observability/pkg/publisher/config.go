@@ -51,6 +51,16 @@ type Config struct {
 type PrometheusConfig struct {
 	// Registerer is the registry to expose metrics on. Defaults to
 	// controller-runtime's global registry, i.e. the manager's /metrics.
+	//
+	// Supported values are that registry, or a registry controller-runtime
+	// does not serve. A wrapper around controller-runtime's registry
+	// (prometheus.WrapRegistererWithPrefix, WrapRegistererWith) is not
+	// supported: it rewrites metric names on the way in, the OTLP bridge
+	// cannot compute the rewritten names, and every metric would reach the
+	// collector twice.
+	//
+	// Whatever you pass must be a registry something actually scrapes.
+	// Only controller-runtime's default is wired to an endpoint for you.
 	Registerer prometheus.Registerer
 
 	// DisableTargetInfo drops the target_info metric carrying the resource
@@ -91,12 +101,17 @@ func applyDefaults(cfg *Config) {
 		applyOTLPDefaults(cfg.OTLP)
 	}
 	if !cfg.DisablePrometheus {
-		if cfg.Prometheus == nil {
-			cfg.Prometheus = &PrometheusConfig{}
+		// Copy before defaulting. cfg is passed by value but Prometheus is
+		// a pointer, so writing through it would mutate the struct the
+		// caller still holds.
+		p := PrometheusConfig{}
+		if cfg.Prometheus != nil {
+			p = *cfg.Prometheus
 		}
-		if cfg.Prometheus.Registerer == nil {
-			cfg.Prometheus.Registerer = ctrlmetrics.Registry
+		if p.Registerer == nil {
+			p.Registerer = ctrlmetrics.Registry
 		}
+		cfg.Prometheus = &p
 	}
 }
 

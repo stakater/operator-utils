@@ -173,12 +173,29 @@ Scope labels (`otel_scope_name`, `otel_scope_version`) are always
 suppressed. Resource attributes are exported as a `target_info` series
 unless `DisableTargetInfo` is set.
 
+Counter names gain a `_total` suffix here but not on the OTLP path, so
+the same metric can need two names in dashboards and alerting rules
+depending on how it was ingested. A counter registered as `reconcile`
+arrives at Prometheus as `reconcile_total` and at the collector as
+`reconcile`. Registering both spellings is rejected — see
+[custom-metrics.md](custom-metrics.md).
+
+Only one Prometheus reader may be installed on controller-runtime's
+registry per process. A second one is refused and logged; the publisher
+still constructs, without a `/metrics` reader.
+
 ## Controller-runtime bridge producer
 
 The bridge is always attached to the OTLP reader. It reads
 controller-runtime's registry through a filter that removes the families
 this module exported, so SDK metrics take the native OTel path to OTLP
 and controller-runtime's take the bridge, with no overlap.
+
+The filter is applied only when the Prometheus reader was pointed at
+controller-runtime's registry. Point it somewhere else and nothing of
+ours is in that registry, so the bridge reads it whole; filtering there
+would drop controller-runtime families that merely share a name with
+ours.
 
 `bridge.ProducerFor(g)` takes any gatherer if you are wiring your own
 reader. Attaching an unfiltered producer to a reader whose provider also

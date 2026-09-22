@@ -188,8 +188,14 @@ curl -s localhost:8080/metrics | grep target_info
 - **Counter naming.** Names are translated to Prometheus style on
   export, and the `_total` suffix is appended only when missing.
   Registering `reconcile` or `reconcile_total` yields the same
-  `reconcile_total` series.
+  `reconcile_total` series, so registering both on one publisher is
+  rejected rather than silently breaking `/metrics`.
 - **Histogram buckets.** The SDK default bucket boundaries are
   millisecond-oriented (`0, 5, 10, ... 10000`), so a histogram recorded
-  in seconds buckets poorly on `/metrics`. Record milliseconds, or wire
-  a custom View through `pkg/bridge` and your own Reader.
+  in seconds lands in the first bucket every time. Record milliseconds
+  (as [`example/`](example/) does), or wire a custom View through
+  `pkg/bridge` and your own Reader.
+- **One publisher per process.** The Prometheus reader can only be
+  installed on controller-runtime's registry once. A second
+  `publisher.New` logs and continues without a `/metrics` reader rather
+  than double-registering, which would 500 the endpoint.

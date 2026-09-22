@@ -9,6 +9,10 @@ import (
 // capturingRegisterer registers collectors on the wrapped Registerer and
 // remembers them, so the bridge can be told which metric families this
 // module put into a shared registry.
+//
+// Not safe for concurrent use, unlike the prometheus.Registerer it
+// implements. Only buildPrometheusReader registers on it, once, before
+// the value escapes to anything else.
 type capturingRegisterer struct {
 	prometheus.Registerer
 	captured []prometheus.Collector
@@ -67,13 +71,24 @@ func (g exceptGatherer) Gather() ([]*dto.MetricFamily, error) {
 	return out, nil
 }
 
-// bridgeGathererFor returns what the OTLP bridge should read. capreg is
-// nil when no Prometheus exporter is running, in which case nothing of
-// ours is in the registry and the bridge can read all of it. Otherwise it
-// mirrors the captured collectors into a private registry so their
-// families can be excluded from the shared one.
-func bridgeGathererFor(capreg *capturingRegisterer) prometheus.Gatherer {
-	if capreg == nil {
+// bridgeGathererFor returns what the OTLP bridge should read. The bridge
+// always reads controller-runtime's registry; the only question is
+// whether this module's own families are in there and have to be
+// filtered out.
+//
+// Filtering happens only when the Prometheus reader was pointed at that
+// exact registry. capreg is nil when no Prometheus exporter is running,
+// and registerer is some other registry when the caller redirected the
+// reader elsewhere; in both cases nothing of ours is in the shared
+// registry and filtering would only drop controller-runtime families
+// that happen to share a name.
+//
+// Wrapping controller-runtime's registry (prometheus.WrapRegistererWith,
+// WrapRegistererWithPrefix) is not supported: the wrapper rewrites names
+// on the way in, the mirror below cannot know how, and the filter would
+// silently match nothing. See PrometheusConfig.Registerer.
+func bridgeGathererFor(registerer prometheus.Registerer, capreg *capturingRegisterer) prometheus.Gatherer {
+	if capreg == nil || registerer != prometheus.Registerer(ctrlmetrics.Registry) {
 		return ctrlmetrics.Registry
 	}
 	own := prometheus.NewRegistry()

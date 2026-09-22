@@ -9,7 +9,10 @@ real operator would.
   and the stdout exporter (no OTel collector needed)
 - Serves `/metrics` on `:8080`, which is what the controller-runtime
   manager would do for you in a real operator
-- Registers one Counter, one Gauge, one Histogram via `publisher.CustomMetrics`
+- Registers one Counter, one Gauge, one Histogram via `publisher.CustomMetrics`.
+  The histogram records **milliseconds**, because the SDK's default bucket
+  boundaries are millisecond-oriented — recording seconds would put every
+  observation in the first bucket
 - Runs a fake reconcile loop once per second that updates all three metrics,
   with `result=success` or `result=error` attributes
 

@@ -5,10 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -145,64 +143,65 @@ func TestNew_BothTransportsConstructWithPrometheusUnaffected(t *testing.T) {
 // buildReaders is the line New relies on to keep OTLP from re-exporting
 // what the Prometheus reader already wrote. This test drives buildReaders
 // directly, the way New does, and Collects from the OTLP reader it returns
-// rather than hand-building exceptGatherer as the dedup tests do. bridgeGathererFor
-// hardcodes controller-runtime's registry as the base it dedupes against,
-// so this test uses that same registry as the Prometheus target, with a
-// stand-in controller-runtime metric registered and cleaned up alongside it.
+// rather than hand-building exceptGatherer. The helper points the
+// Prometheus reader at controller-runtime's registry, which is the one
+// bridgeGathererFor dedupes against, and unregisters everything it put
+// there afterwards.
 func TestBuildReaders_BridgeExcludesOwnFamilies(t *testing.T) {
-	ctrlCounter := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "buildreaders_test_ctrl_total", Help: "stand-in for a controller-runtime metric",
-	})
-	ctrlCounter.Inc()
-	if err := ctrlmetrics.Registry.Register(ctrlCounter); err != nil {
-		t.Fatalf("register stand-in controller-runtime metric: %v", err)
-	}
-	t.Cleanup(func() { ctrlmetrics.Registry.Unregister(ctrlCounter) })
+	registerCtrlStandIn(t, "buildreaders_test_ctrl_total")
 
-	cfg := Config{
+	rs := buildReadersOnCtrlRegistry(t, Config{
 		OperatorName: "op",
-		Prometheus:   &PrometheusConfig{Registerer: ctrlmetrics.Registry},
 		OTLP: &OTLPConfig{
 			Endpoint: "localhost:1", Insecure: true,
 			Timeout: time.Second, Interval: time.Hour,
 		},
-	}
-	applyDefaults(&cfg)
-
-	rs := buildReaders(context.Background(), cfg, logr.Discard())
-	if rs.prometheus == nil {
-		t.Fatal("buildReaders did not build a Prometheus reader")
-	}
-	if rs.otlp == nil {
-		t.Fatal("buildReaders did not build an OTLP reader")
-	}
+	})
 
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(rs.prometheus), sdkmetric.WithReader(rs.otlp))
 	defer func() { _ = mp.Shutdown(context.Background()) }()
 
-	c, err := mp.Meter("op").Int64Counter("reconcile_total")
+	c, err := mp.Meter("op").Int64Counter("buildreaders_reconcile_total")
 	if err != nil {
 		t.Fatalf("Int64Counter: %v", err)
 	}
 	c.Add(context.Background(), 1)
 
-	var rm metricdata.ResourceMetrics
-	if err := rs.otlp.Collect(context.Background(), &rm); err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
+	counts, _ := otlpNames(t, rs.otlp)
 
-	counts := map[string]int{}
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			counts[m.Name]++
-		}
-	}
-	if counts["reconcile_total"] != 1 {
-		t.Errorf("reconcile_total appeared %d times in OTLP, want exactly 1", counts["reconcile_total"])
+	if counts["buildreaders_reconcile_total"] != 1 {
+		t.Errorf("custom metric appeared %d times in OTLP, want exactly 1",
+			counts["buildreaders_reconcile_total"])
 	}
 	if counts["buildreaders_test_ctrl_total"] != 1 {
-		t.Errorf("controller-runtime stand-in appeared %d times in OTLP, want exactly 1",
+		t.Errorf("controller-runtime metric appeared %d times in OTLP, want exactly 1",
 			counts["buildreaders_test_ctrl_total"])
+	}
+}
+
+// A second reader on controller-runtime's registry used to be accepted
+// silently: the OTel collector is unchecked, so Register never reports
+// the duplicate and the scrape then failed forever on a duplicate
+// target_info. It must be refused up front, and New must degrade rather
+// than take the endpoint down.
+func TestPrometheus_SecondReaderOnCtrlRegistryIsRejected(t *testing.T) {
+	registerCtrlStandIn(t, "secondreader_test_ctrl_total")
+	buildReadersOnCtrlRegistry(t, Config{OperatorName: "op", DisableGoRuntime: true})
+
+	cfg := Config{OperatorName: "op", DisableGoRuntime: true}
+	applyDefaults(&cfg)
+	if _, _, err := buildPrometheusReader(cfg); err == nil {
+		t.Fatal("a second Prometheus reader on controller-runtime's registry was accepted")
+	}
+
+	p, err := New(context.Background(), Config{OperatorName: "op", DisableGoRuntime: true})
+	if err != nil {
+		t.Fatalf("New should degrade to no /metrics reader, not fail: %v", err)
+	}
+	defer p.Shutdown(context.Background())
+
+	if _, err := ctrlmetrics.Registry.Gather(); err != nil {
+		t.Fatalf("/metrics is broken after a second New: %v", err)
 	}
 }

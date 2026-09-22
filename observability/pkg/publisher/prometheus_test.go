@@ -92,9 +92,11 @@ func TestPrometheus_NoScopeLabelsOnSeries(t *testing.T) {
 	}
 }
 
-// The translator appends _total only when the name lacks it, so both
-// spellings land on the same series. This is why the module needs no
-// counter-suffix knob and no naming rule about _total.
+// The translator appends _total only when the name lacks it, so either
+// spelling lands on the same series. Registration has to know that: both
+// spellings on one publisher would be one Prometheus family fed by two
+// SDK instruments, which fails the whole Gather and turns /metrics into
+// a 500 for controller-runtime's metrics too.
 func TestPrometheus_CounterTotalSuffixIsIdempotent(t *testing.T) {
 	for _, registered := range []string{"reconcile", "reconcile_total"} {
 		t.Run(registered, func(t *testing.T) {
@@ -111,6 +113,48 @@ func TestPrometheus_CounterTotalSuffixIsIdempotent(t *testing.T) {
 				t.Fatalf("registered %q, suffix applied twice: %v", registered, names)
 			}
 		})
+	}
+}
+
+func TestPrometheus_CollidingTranslatedNamesAreRejected(t *testing.T) {
+	for _, order := range [][2]string{
+		{"reconcile", "reconcile_total"},
+		{"reconcile_total", "reconcile"},
+	} {
+		t.Run(order[0]+"_then_"+order[1], func(t *testing.T) {
+			p, reg := newPromPublisher(t, Config{DisableGoRuntime: true})
+
+			first, err := p.Custom().Counter(order[0], "d")
+			if err != nil {
+				t.Fatalf("Counter(%q): %v", order[0], err)
+			}
+			first.Inc(context.Background())
+
+			if _, err := p.Custom().Counter(order[1], "d"); err == nil {
+				t.Fatalf("Counter(%q) was accepted; both are served as reconcile_total", order[1])
+			}
+
+			// The rejection is the point: /metrics must still gather.
+			if _, err := reg.Gather(); err != nil {
+				t.Fatalf("/metrics is broken: %v", err)
+			}
+		})
+	}
+}
+
+// A gauge and a counter can differ only by the suffix the translator
+// adds, so the collision is not counter-specific.
+func TestPrometheus_GaugeCollidingWithCounterIsRejected(t *testing.T) {
+	p, reg := newPromPublisher(t, Config{DisableGoRuntime: true})
+
+	g := p.Custom().MustGauge("widgets_total", "d")
+	g.Set(context.Background(), 1)
+
+	if _, err := p.Custom().Counter("widgets", "d"); err == nil {
+		t.Fatal("Counter(\"widgets\") was accepted; it is served as widgets_total")
+	}
+	if _, err := reg.Gather(); err != nil {
+		t.Fatalf("/metrics is broken: %v", err)
 	}
 }
 

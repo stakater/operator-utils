@@ -27,6 +27,7 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
 	"go.opentelemetry.io/otel/metric"
@@ -40,7 +41,6 @@ import (
 // active periodic readers. It is constructed once at operator startup
 // and shut down once at operator exit.
 type Publisher struct {
-	cfg      Config
 	provider *sdkmetric.MeterProvider
 	meter    metric.Meter
 	custom   *CustomMetrics
@@ -48,11 +48,14 @@ type Publisher struct {
 }
 
 // readers holds the readers New attaches, kept separable so tests can
-// collect from the OTLP reader and prove the bridge is filtered.
+// collect from the OTLP reader and prove the bridge is filtered. capreg
+// names the collectors the Prometheus reader put on the shared registry,
+// which is what tests need to take them back off again.
 type readers struct {
 	prometheus sdkmetric.Reader
 	otlp       sdkmetric.Reader
 	stdout     sdkmetric.Reader
+	capreg     *capturingRegisterer
 }
 
 // buildReaders constructs each configured reader, logging and skipping on
@@ -63,21 +66,23 @@ func buildReaders(ctx context.Context, cfg Config, log logr.Logger) readers {
 
 	// The bridge reads the registry the Prometheus exporter writes to, so
 	// it must skip our own families or every SDK metric reaches OTLP twice.
-	var capreg *capturingRegisterer
+	var registerer prometheus.Registerer
 	if !cfg.DisablePrometheus {
+		registerer = cfg.Prometheus.Registerer
 		reader, cr, err := buildPrometheusReader(cfg)
 		if err != nil {
 			log.Info("Prometheus exporter construction failed; continuing without /metrics",
 				"err", err.Error())
 		} else {
 			rs.prometheus = reader
-			capreg = cr
+			rs.capreg = cr
 		}
+	} else if cfg.Prometheus != nil {
+		log.Info("Prometheus config ignored because DisablePrometheus is set")
 	}
-	bridgeGatherer := bridgeGathererFor(capreg)
 
 	if cfg.OTLP != nil {
-		reader, err := buildOTLPReader(ctx, cfg, bridgeGatherer)
+		reader, err := buildOTLPReader(ctx, cfg, bridgeGathererFor(registerer, rs.capreg))
 		if err != nil {
 			log.Info("OTLP exporter construction failed; continuing without OTLP",
 				"err", err.Error(), "endpoint", cfg.OTLP.Endpoint)
@@ -160,7 +165,6 @@ func New(ctx context.Context, cfg Config) (*Publisher, error) {
 	}
 
 	return &Publisher{
-		cfg:      cfg,
 		provider: provider,
 		meter:    meter,
 		custom:   custom,
