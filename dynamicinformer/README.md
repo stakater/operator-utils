@@ -8,7 +8,7 @@ Kubernetes operators that manage child resources dynamically face a recurring ch
 
 ## What This Package Does
 
-- **No duplicate informers.** The same GVR + namespace combination is watched exactly once, regardless of how many consumers reference it.
+- **No duplicate informers.** The same GVR + namespace + identity combination is watched exactly once, regardless of how many consumers reference it.
 - **No duplicate registrations.** The same consumer + watch key combination produces at most one handler. Repeated calls are idempotent.
 - **Automatic stale watch cleanup.** When a consumer's required watch set changes, stale watches are released automatically.
 - **Dynamic resource support.** Resource types are not known at compile time; the registry accepts any GVR.
@@ -102,6 +102,29 @@ func (r *WatchRegistry) ReleaseAll(consumerID string) error
 ```
 
 Releases all watches for a consumer. Idempotent — calling on an unknown consumer returns nil.
+
+### `NewWatchRegistryWithProvider`
+
+```go
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry
+```
+
+Creates a registry that resolves the client for each watch from `provider`, keyed by `WatchKey.Identity`. Watches under different identities never share an informer, even for the same GVR and namespace, since they may be authorized differently. The registry treats the identity as an opaque string; what it maps to (impersonation, a token, another cluster) is the provider's concern. `NewWatchRegistry` is the single-client form: it serves the empty identity only and rejects any other.
+
+```go
+// ClientProvider supplies the dynamic client for an identity. "" is the default client.
+type ClientProvider interface {
+    ClientFor(identity string) (dynamic.Interface, error)
+}
+
+// ClientReleaser is optional. The registry calls Release exactly once for every
+// ClientFor call that returned a client, when the informer started with it stops.
+type ClientReleaser interface {
+    Release(identity string)
+}
+```
+
+`ClientFor` is called every time an informer starts, so providers should cache clients per identity. A provider that also implements `ClientReleaser` can bound that cache with a reference count: increment in `ClientFor`, decrement in `Release`, evict at zero. Both calls run while the registry holds its lock, so they must not call back into the registry. Providers that do not implement `ClientReleaser` are never notified.
 
 ## Convenience Callbacks
 
@@ -338,11 +361,13 @@ kind delete cluster --name demo
 | Expose `HasSynced` instead of waiting internally | Most consumers don't need the guarantee — resync catches missed events. Those who do can opt in. |
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
+| Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor`, so a provider can reference-count without knowing anything about informers. |
 
 ## Known Limitations
 
 - **Event gap during initial list.** Handlers registered before the informer syncs may miss events. Use `HasSynced` to wait if needed.
 - **Informer startup errors are not surfaced programmatically.** The reflector retries with backoff and logs errors. Monitor reflector logs for persistent failures (RBAC, missing GVR).
+- **Parent context cancellation is not a release.** Cancelling `parentCtx` stops every informer but leaves registry entries in place and never calls `Release`. It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running.
 - **Lock held during informer creation.** The registry mutex is held while creating the factory and launching the goroutine. The goroutine launch is cheap and list/watch happens asynchronously, but heavily customized REST configs with slow transport initialization could stall other callers.
 - **All handlers on a shared informer receive all events.** Filtering is each handler's responsibility.
 
