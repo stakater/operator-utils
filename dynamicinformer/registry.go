@@ -68,9 +68,27 @@ type WatchRegistration struct {
 // nil client defensively.
 //
 // Implementations must be safe for concurrent use and should cache clients per
-// identity, since ClientFor is called every time an informer starts.
+// identity, since ClientFor is called every time an informer starts. To learn
+// when the registry is done with a client, also implement ClientReleaser.
 type ClientProvider interface {
 	ClientFor(identity string) (dynamic.Interface, error)
+}
+
+// ClientReleaser is an optional interface a ClientProvider may implement to be
+// told when the registry no longer uses a client it obtained from ClientFor.
+//
+// The registry pairs the calls one to one: for every ClientFor call that
+// returned a client, Release is called exactly once with the same identity,
+// when the informer started with that client stops. A provider that caches
+// clients per identity can therefore keep a reference count per identity and
+// evict the client when the count reaches zero.
+//
+// Like ClientFor, Release runs while the registry holds its own lock, so it
+// must not call back into the registry. Informers stopped by cancelling the
+// parent context are not released; that path is for shutdown. Providers that
+// do not implement this interface are never notified.
+type ClientReleaser interface {
+	Release(identity string)
 }
 
 // singleClientProvider serves one fixed client for the empty identity only.
@@ -99,7 +117,9 @@ type WatchRegistry struct {
 	watches      map[WatchKey]*WatchEntry
 	consumerKeys map[string]map[WatchKey]struct{} // consumerID → set of WatchKeys
 	clients      ClientProvider
+	releaser     ClientReleaser // nil unless clients implements it
 	resyncPeriod time.Duration
+	newInformer  func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer // seam for tests
 }
 
 // NewWatchRegistry creates a new registry backed by the given dynamic client.
@@ -114,12 +134,26 @@ func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duratio
 // NewWatchRegistryWithProvider creates a registry that resolves the client for
 // each watch from the provider, keyed by WatchKey.Identity.
 func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry {
+	releaser, _ := provider.(ClientReleaser)
 	return &WatchRegistry{
 		watches:      make(map[WatchKey]*WatchEntry),
 		consumerKeys: make(map[string]map[WatchKey]struct{}),
 		clients:      provider,
+		releaser:     releaser,
 		resyncPeriod: resyncPeriod,
+		newInformer:  newDynamicInformer,
 	}
+}
+
+// newDynamicInformer builds the informer for a watch key on the given client.
+func newDynamicInformer(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
+	factory := kubedynamicinformer.NewFilteredDynamicSharedInformerFactory(
+		cli,
+		resyncPeriod,
+		key.Namespace,
+		nil,
+	)
+	return factory.ForResource(key.GVR).Informer()
 }
 
 // extractObject unwraps an object from the informer event, handling tombstones.
@@ -233,14 +267,7 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 			ctx, cancel := context.WithCancel(parentCtx)
 
-			factory := kubedynamicinformer.NewFilteredDynamicSharedInformerFactory(
-				cli,
-				r.resyncPeriod,
-				key.Namespace,
-				nil,
-			)
-
-			informer := factory.ForResource(key.GVR).Informer()
+			informer := r.newInformer(cli, key, r.resyncPeriod)
 			go informer.Run(ctx.Done())
 
 			entry = &WatchEntry{
@@ -263,6 +290,11 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		reg, err := entry.informer.AddEventHandler(callbackToHandler(w.Callback))
 		if err != nil {
+			// An informer started in this iteration has no handler yet, so the
+			// rollback below would not find it; stop it here or it lingers.
+			if len(entry.handlers) == 0 {
+				r.stopWatchLocked(key, entry)
+			}
 			return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
 				fmt.Errorf("failed to add event handler for %v: %w", key, err))
 		}
@@ -370,9 +402,20 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 	}
 
 	if len(entry.handlers) == 0 {
-		entry.cancel()
-		delete(r.watches, key)
+		r.stopWatchLocked(key, entry)
 	}
 
 	return removeErr
+}
+
+// stopWatchLocked stops the informer behind key, forgets it, and gives its
+// client back to a provider that implements ClientReleaser. It is the only
+// place an informer stops, so each Release pairs with the ClientFor that
+// started the informer. Caller must hold r.mu.
+func (r *WatchRegistry) stopWatchLocked(key WatchKey, entry *WatchEntry) {
+	entry.cancel()
+	delete(r.watches, key)
+	if r.releaser != nil {
+		r.releaser.Release(key.Identity)
+	}
 }

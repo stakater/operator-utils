@@ -2,6 +2,7 @@ package dynamicinformer
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1138,6 +1139,326 @@ func TestWatchKey_IdentityDifferentiatesKeys(t *testing.T) {
 	m[withID] = 2
 	if m[base] != 1 || m[withID] != 2 {
 		t.Error("expected both keys to coexist in the map")
+	}
+}
+
+// --- ClientReleaser tests ---
+
+// fakeReleasingProvider is a fakeClientProvider that also implements
+// ClientReleaser and records every Release call.
+type fakeReleasingProvider struct {
+	*fakeClientProvider
+	releases []string
+}
+
+func newFakeReleasingProvider() *fakeReleasingProvider {
+	return &fakeReleasingProvider{fakeClientProvider: newFakeClientProvider()}
+}
+
+func (p *fakeReleasingProvider) Release(identity string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.releases = append(p.releases, identity)
+}
+
+// acquired returns the identities passed to ClientFor so far, in order.
+func (p *fakeReleasingProvider) acquired() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.calls)
+}
+
+// released returns the identities passed to Release so far, in order.
+func (p *fakeReleasingProvider) released() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.releases)
+}
+
+func newReleasingRegistry(t *testing.T) (*WatchRegistry, *fakeReleasingProvider, context.Context) {
+	t.Helper()
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return registry, provider, ctx
+}
+
+func TestClientReleaser_ReleasedWhenInformerStops(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); len(got) != 0 {
+		t.Fatalf("expected no release while the informer runs, got %v", got)
+	}
+
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected exactly one release of team-a/reader, got %v", got)
+	}
+
+	// A repeated release of an already-released consumer must not release again.
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error on second release: %v", err)
+	}
+	if got := provider.released(); len(got) != 1 {
+		t.Errorf("expected release count to stay at 1, got %v", got)
+	}
+}
+
+func TestClientReleaser_SharedInformerReleasesOnce(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	for _, consumer := range []string{"consumer-1", "consumer-2"} {
+		if _, err := registry.EnsureWatchSet(ctx, consumer, []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+			t.Fatalf("unexpected error for %s: %v", consumer, err)
+		}
+	}
+	if got := provider.acquired(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Fatalf("expected one ClientFor call for the shared informer, got %v", got)
+	}
+
+	// The informer keeps running for consumer-2, so nothing is released yet.
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); len(got) != 0 {
+		t.Fatalf("expected no release while consumer-2 still holds the informer, got %v", got)
+	}
+
+	if err := registry.ReleaseAll("consumer-2"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected exactly one release after the last consumer left, got %v", got)
+	}
+}
+
+func TestClientReleaser_IdentityChangeReleasesOldIdentity(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	oldKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/old-sa"}
+	newKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/new-sa"}
+
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: oldKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: newKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The stale old-identity informer stopped; the new one is still running.
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/old-sa"}) {
+		t.Errorf("expected exactly one release of the old identity, got %v", got)
+	}
+
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/old-sa", "team-a/new-sa"}) {
+		t.Errorf("expected old then new identity released, got %v", got)
+	}
+}
+
+func TestClientReleaser_OneReleasePerInformer(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	// Two informers under the same identity: ClientFor is called once each,
+	// so Release must also be called once each.
+	keyA := WatchKey{GVR: secretsGVR, Namespace: "ns-a", Identity: "team-a/reader"}
+	keyB := WatchKey{GVR: secretsGVR, Namespace: "ns-b", Identity: "team-a/reader"}
+
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: keyA, Callback: noopCallback()},
+		{Key: keyB, Callback: noopCallback()},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.acquired(); !slices.Equal(got, []string{"team-a/reader", "team-a/reader"}) {
+		t.Fatalf("expected two ClientFor calls, got %v", got)
+	}
+
+	// Dropping one key from the set stops one informer.
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: keyA, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected one release after dropping one informer, got %v", got)
+	}
+
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader", "team-a/reader"}) {
+		t.Errorf("expected two releases in total, got %v", got)
+	}
+	if acquired, released := provider.acquired(), provider.released(); len(acquired) != len(released) {
+		t.Errorf("expected ClientFor and Release to balance, got %d acquisitions and %d releases", len(acquired), len(released))
+	}
+}
+
+func TestClientReleaser_ProviderErrorRollsBackAndReleases(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+	provider.errFor["team-b/broken"] = context.DeadlineExceeded // any error
+
+	goodKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	badKey := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-b/broken"}
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: goodKey, Callback: noopCallback()},
+		{Key: badKey, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error from failing provider")
+	}
+
+	// The good informer started and was rolled back, so its client is released
+	// once. The failing ClientFor handed out nothing, so nothing is released for it.
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected only the rolled-back identity released, got %v", got)
+	}
+}
+
+// nilReleasingProvider returns (nil, nil) from ClientFor and counts releases.
+type nilReleasingProvider struct {
+	nilClientProvider
+	releases int
+}
+
+func (p *nilReleasingProvider) Release(string) { p.releases++ }
+
+func TestClientReleaser_NilClientIsNotReleased(t *testing.T) {
+	provider := &nilReleasingProvider{}
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{
+		{Key: WatchKey{GVR: deploymentsGVR, Namespace: "default", Identity: "team-a/reader"}, Callback: noopCallback()},
+	})
+	if err == nil {
+		t.Fatal("expected error for provider returning nil client")
+	}
+	if provider.releases != 0 {
+		t.Errorf("expected no release for a rejected nil client, got %d", provider.releases)
+	}
+}
+
+func TestClientReleaser_NotImplementedIsNoop(t *testing.T) {
+	// Neither the plain identity provider nor the legacy single-client
+	// constructor implements ClientReleaser, so the registry records none.
+	provider := newFakeClientProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	if registry.releaser != nil {
+		t.Error("expected no releaser for a provider without Release")
+	}
+	legacy := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second)
+	if legacy.releaser != nil {
+		t.Error("expected no releaser for the single-client registry")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected informer torn down as before, got %d watches", len(registry.watches))
+	}
+}
+
+func TestClientReleaser_AddEventHandlerFailureStopsFreshInformer(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	// Hand the registry an informer that has already stopped, so
+	// AddEventHandler fails deterministically on a freshly started entry.
+	registry.newInformer = func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
+		informer := newDynamicInformer(cli, key, resyncPeriod)
+		stop := make(chan struct{})
+		close(stop)
+		informer.Run(stop)
+		return informer
+	}
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err == nil {
+		t.Fatal("expected error when the handler cannot be added")
+	}
+
+	// The entry must not linger as a handler-less informer, and the one
+	// ClientFor that started it must be paired with one Release.
+	registry.mu.Lock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected the failed informer to be dropped, got %d watches", len(registry.watches))
+	}
+	if len(registry.consumerKeys) != 0 {
+		t.Errorf("expected no consumer keys, got %d", len(registry.consumerKeys))
+	}
+	registry.mu.Unlock()
+
+	if got := provider.acquired(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected one ClientFor call, got %v", got)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected one release for the dropped informer, got %v", got)
+	}
+}
+
+func TestClientReleaser_ConcurrentAccessIsBalanced(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	key := WatchKey{GVR: deploymentsGVR, Namespace: "default", Identity: "team-a/reader"}
+	consumerID := func(i int) string { return string(rune('a'+i)) + "-consumer" }
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go func(id int) {
+			defer wg.Done()
+			_, _ = registry.EnsureWatchSet(ctx, consumerID(id), []WatchRequest{{Key: key, Callback: noopCallback()}})
+		}(i)
+		go func(id int) {
+			defer wg.Done()
+			_ = registry.ReleaseAll(consumerID(id))
+		}(i)
+	}
+	wg.Wait()
+
+	// Whatever interleaving happened, a final release of every consumer must
+	// leave no informer behind and every ClientFor paired with one Release.
+	for i := 0; i < 10; i++ {
+		if err := registry.ReleaseAll(consumerID(i)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	registry.mu.Lock()
+	if len(registry.watches) != 0 {
+		t.Errorf("expected no watches after final release, got %d", len(registry.watches))
+	}
+	registry.mu.Unlock()
+
+	acquired, released := provider.acquired(), provider.released()
+	if len(acquired) == 0 {
+		t.Fatal("expected at least one informer to have started")
+	}
+	if len(acquired) != len(released) {
+		t.Errorf("expected ClientFor and Release to balance, got %d acquisitions and %d releases", len(acquired), len(released))
 	}
 }
 
