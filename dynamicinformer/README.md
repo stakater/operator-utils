@@ -318,7 +318,7 @@ for _, reg := range regs {
 
 After sync, `reg.GetIndexer()` returns the informer's cache (`GetByKey`, `List`, `ByIndex`). The cache is shared with every consumer of the same key, so treat its objects as read only. Cache keys come from the `InformerFunc`: with the kcp example above they are `cluster|namespace/name`, so `GetByKey("ns/name")` finds nothing.
 
-`GetIndexer` returns `ErrWatchStopped` once the watch is released, pruned by a later `EnsureWatchSet`, or shut down, so a kept registration never serves frozen data. Always read through the registrations from the latest `EnsureWatchSet` call.
+`GetIndexer` returns `ErrWatchStopped` if the watch has already stopped for this consumer: it released the key (`ReleaseAll`, or a later `EnsureWatchSet` without it), or `parentCtx` was cancelled. `HasSynced` returns false in the same cases. Keep the registration, not the indexer, and call `GetIndexer` on every read, so a stopped watch is noticed.
 
 ## Running the Interactive Example
 
@@ -403,14 +403,14 @@ kind delete cluster --name demo
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
 | Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Key func and transform must be set before `Run`, so they are fixed per registry. |
-| Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor`, so a provider can reference-count without knowing anything about informers. |
+| Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor` that returned a client (a `(nil, nil)` result is rejected and not released), so a provider can reference-count without knowing anything about informers. |
 
 ## Known Limitations
 
 - **Event gap during initial list.** Handlers registered before the informer syncs may miss events. Use `HasSynced` to wait if needed.
 - **Informer startup errors are not surfaced programmatically.** The reflector retries with backoff and logs errors. Monitor reflector logs for persistent failures (RBAC, missing GVR).
-- **Parent context cancellation is not a release.** Cancelling `parentCtx` stops every informer but leaves registry entries in place and never calls `Release`. It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running.
-- **Lock held during informer creation.** The registry mutex is held while creating the factory and launching the goroutine. The goroutine launch is cheap and list/watch happens asynchronously, but heavily customized REST configs with slow transport initialization could stall other callers.
+- **Parent context cancellation is not a release.** Cancelling `parentCtx` stops every informer but leaves registry entries in place and never calls `Release`. It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running. Registrations of those entries return `ErrWatchStopped`, and a later `EnsureWatchSet` reuses the stopped entries, so do not reuse the registry after cancelling `parentCtx`.
+- **Lock held during informer creation.** `ClientFor`, the `InformerFunc` and `Release` all run under the registry mutex, which keeps `EnsureWatchSet` all or nothing. Keep them quick and never call back into the registry: the mutex is not reentrant, so a callback deadlocks, and a slow func (discovery, network I/O) stalls every other caller. List and watch happen asynchronously in `Run`, so building an informer is cheap.
 - **All handlers on a shared informer receive all events.** Filtering is each handler's responsibility.
 
 ## Testing

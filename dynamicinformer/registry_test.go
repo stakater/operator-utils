@@ -2183,7 +2183,7 @@ func TestWithInformerFunc_PanicRollsBack(t *testing.T) {
 		panic("boom")
 	})
 	_, err := registry.EnsureWatchSet(ctx, "consumer-1", failingWatches())
-	if err == nil || !strings.Contains(err.Error(), "boom") {
+	if err == nil || !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "goroutine") {
 		t.Fatalf("expected the panic as an error, got %v", err)
 	}
 	assertEmptyAndReleased(t, registry, provider)
@@ -2300,11 +2300,43 @@ func TestGetIndexer_ErrorsAfterRelease(t *testing.T) {
 	if _, err := regs[0].GetIndexer(); err != nil {
 		t.Fatalf("expected a live indexer, got %v", err)
 	}
+	if !cache.WaitForCacheSync(ctx.Done(), regs[0].HasSynced) {
+		t.Fatal("informer did not sync")
+	}
 	if err := registry.ReleaseAll("consumer-1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, err := regs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
 		t.Errorf("expected ErrWatchStopped after release, got %v", err)
+	}
+	if regs[0].HasSynced() {
+		t.Error("expected HasSynced false after release")
+	}
+}
+
+func TestGetIndexer_ErrorsAfterOneConsumerReleases(t *testing.T) {
+	registry, ctx, cancel := newFakeRegistry(t)
+	defer cancel()
+
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	regs1, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	regs2, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// consumer-1 drops the key, consumer-2 keeps the shared informer running.
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: secretsGVR, Namespace: "default"}}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := regs1[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
+		t.Errorf("expected ErrWatchStopped for the consumer that dropped the key, got %v", err)
+	}
+	if _, err := regs2[0].GetIndexer(); err != nil {
+		t.Errorf("expected the other consumer's indexer to stay live, got %v", err)
 	}
 }
 

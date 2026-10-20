@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ type EventCallback struct {
 
 type handlerRegistration struct {
 	registration cache.ResourceEventHandlerRegistration
+	released     chan struct{} // closed when this consumer releases the key
 }
 
 // WatchEntry tracks an active informer and its per-consumer handler registrations.
@@ -63,42 +65,59 @@ type WatchRegistration struct {
 	ConsumerID string
 	HasSynced  cache.InformerSynced
 	informer   cache.SharedIndexInformer
-	done       <-chan struct{}
+	released   <-chan struct{} // this consumer released the key
+	done       <-chan struct{} // the shared watch stopped
 }
 
-// ErrWatchStopped is returned by GetIndexer once the watch behind a registration
-// has stopped: released, pruned by a later EnsureWatchSet, or shut down.
-var ErrWatchStopped = errors.New("watch stopped, use the registrations from the latest EnsureWatchSet")
+// ErrWatchStopped is returned by GetIndexer once this consumer released the key
+// (ReleaseAll or a later EnsureWatchSet without it), or the watch was shut down
+// by cancelling parentCtx.
+var ErrWatchStopped = errors.New("watch stopped")
 
 // GetIndexer returns the cache of the informer behind this watch. It is shared
 // with every other consumer of the same WatchKey, so treat its objects as read only.
-// Keys follow the InformerFunc's key func. Fails with ErrWatchStopped once the
-// watch has stopped, so a stale registration never serves frozen data.
+// Keys follow the InformerFunc's key func. Returns ErrWatchStopped if the watch has
+// already stopped for this consumer. Keep the registration, not the indexer, and
+// call GetIndexer on every read.
 func (w *WatchRegistration) GetIndexer() (cache.Indexer, error) {
 	if w.informer == nil {
 		return nil, errors.New("registration was not returned by EnsureWatchSet")
 	}
-	select {
-	case <-w.done:
+	if w.stopped() {
 		return nil, ErrWatchStopped
+	}
+	return w.informer.GetIndexer(), nil
+}
+
+func (w *WatchRegistration) stopped() bool {
+	select {
+	case <-w.released:
+		return true
+	case <-w.done:
+		return true
 	default:
-		return w.informer.GetIndexer(), nil
+		return false
 	}
 }
 
+// newRegistration builds the handle for consumerID, whose handler must already
+// be on entry.
 func newRegistration(key WatchKey, consumerID string, entry *WatchEntry) *WatchRegistration {
-	return &WatchRegistration{
+	w := &WatchRegistration{
 		Key:        key,
 		ConsumerID: consumerID,
-		HasSynced:  entry.informer.HasSynced,
 		informer:   entry.informer,
+		released:   entry.handlers[consumerID].released,
 		done:       entry.done,
 	}
+	w.HasSynced = func() bool { return !w.stopped() && w.informer.HasSynced() }
+	return w
 }
 
 // InformerFunc builds the informer for a watch key on the given client. It must
-// return a fresh, unstarted, non nil informer that the registry then owns: it is
-// started and stopped with the watch. The transform and key func must be set here,
+// return a fresh, unstarted, usable informer that the registry then owns: it is
+// started and stopped with the watch. A nil or nil pointer informer is rejected,
+// other broken shapes (a wrapper around a nil informer) panic in Run. The transform and key func must be set here,
 // before Run. Indexers may be added here or later, as long as names do not clash.
 //
 // It is called while the registry holds its lock, so it must be quick and must not
@@ -341,6 +360,7 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		entry.handlers[consumerID] = &handlerRegistration{
 			registration: reg,
+			released:     make(chan struct{}),
 		}
 		newlyAdded = append(newlyAdded, key)
 
@@ -376,7 +396,7 @@ func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey
 	}
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("InformerFunc panicked for %v: %v", key, p)
+			err = fmt.Errorf("InformerFunc panicked for %v: %v\n%s", key, p, debug.Stack())
 		}
 		if err != nil && r.releaser != nil {
 			r.releaser.Release(key.Identity)
@@ -476,6 +496,7 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 	}
 
 	delete(entry.handlers, consumerID)
+	close(hr.released)
 
 	// Keep consumerKeys in sync
 	if keys, ok := r.consumerKeys[consumerID]; ok {
