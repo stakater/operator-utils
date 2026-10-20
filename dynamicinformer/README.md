@@ -137,9 +137,9 @@ func WithInformerFunc(f InformerFunc) RegistryOption
 Replaces how the registry builds informers. Pass it to either constructor. `WithInformerFunc(nil)` keeps the default dynamic informer.
 
 - Return a fresh, unstarted, non nil informer. The registry owns it and starts and stops it with the watch, so never return one from a long lived factory.
-- Set the transform and key func here, they must be in place before `Run`. Indexers can be added here or later on the shared informer, as long as names do not clash. A separate registry is only needed for a different key func or transform.
+- Set the key func, transform and indexers here, before `Run`. Every informer of the registry is built the same way, so a consumer that needs different ones uses its own registry.
 - The func runs while the registry holds its lock, like `ClientFor`. Keep it quick and never call back into the registry.
-- A returned error, a nil informer or a panic fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client.
+- A returned error or a nil informer fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client.
 
 Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
 
@@ -318,7 +318,7 @@ for _, reg := range regs {
 
 After sync, `reg.GetIndexer()` returns the informer's cache (`GetByKey`, `List`, `ByIndex`). The cache is shared with every consumer of the same key, so treat its objects as read only. Cache keys come from the `InformerFunc`: with the kcp example above they are `cluster|namespace/name`, so `GetByKey("ns/name")` finds nothing.
 
-`GetIndexer` returns `ErrWatchStopped` if the watch has already stopped for this consumer: it released the key (`ReleaseAll`, or a later `EnsureWatchSet` without it), or `parentCtx` was cancelled. `HasSynced` is this consumer's handler flag: true once the informer synced and this consumer's own initial events are delivered, so a consumer joining a synced key still waits for its replay. Once true it stays true after a stop, so a wait on a synced registration returns and the next `GetIndexer` reports the stop. A watch stopped before its first sync never reports synced, so `WaitForCacheSync` on it blocks until its stop channel closes: wait with a bounded ctx (the request's, not the manager's). Keep the registration, not the indexer, and call `GetIndexer` on every read, so a stopped watch is noticed.
+`GetIndexer` returns `ErrWatchStopped` once this consumer released the key (`ReleaseAll`, or a later `EnsureWatchSet` without it) or `parentCtx` was cancelled. Keep the registration, not the indexer, and call `GetIndexer` on every read, so a stopped watch is noticed. `HasSynced` is unchanged: it reports whether the shared informer has synced.
 
 ## Running the Interactive Example
 
@@ -402,15 +402,17 @@ kind delete cluster --name demo
 | Expose `HasSynced` instead of waiting internally | Most consumers don't need the guarantee — resync catches missed events. Those who do can opt in. |
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
-| Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Key func and transform must be set before `Run`, so they are fixed per registry. |
+| Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Fixing them per registry keeps sharing safe without comparing funcs. |
 | Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor` that returned a client (a `(nil, nil)` result is rejected and not released), so a provider can reference-count without knowing anything about informers. |
 
 ## Known Limitations
 
 - **Event gap during initial list.** Handlers registered before the informer syncs may miss events. Use `HasSynced` to wait if needed.
 - **Informer startup errors are not surfaced programmatically.** The reflector retries with backoff and logs errors. Monitor reflector logs for persistent failures (RBAC, missing GVR).
-- **Parent context cancellation is not a release.** Cancelling `parentCtx` stops its informers at once, and their registrations return `ErrWatchStopped`, but the entries stay until the registry touches them again. A later `EnsureWatchSet` that asks for such a key retires the dead entry (every consumer loses the key, the client is released once) and starts a fresh informer; a release or prune of it releases the client once. `EnsureWatchSet` with an already cancelled `parentCtx` returns its error and changes nothing. A failed `EnsureWatchSet` rolls back the keys it added and keeps the consumer's previous live set, but dead entries it met stay retired, since they were already unusable. Use `ReleaseAll` to tear a consumer down while running.
-- **Lock held during informer creation.** `ClientFor`, the `InformerFunc` and `Release` all run under the registry mutex, so no caller sees another's half applied set. Keep them quick and never call back into the registry: the mutex is not reentrant, so a callback deadlocks, and a slow func (discovery, network I/O) stalls every other caller. The default informer does no I/O while being built, list and watch start in `Run`; a custom `InformerFunc` has to stay just as cheap.
+- **Parent context cancellation is not a release.** It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running. Cancelling `parentCtx` stops its informers but leaves their entries in place: registrations return `ErrWatchStopped`, and `Release` is called only when the key is later released or pruned. A later `EnsureWatchSet` that needs such a key, from any consumer, fails to add its handler to the stopped informer, so do not reuse the registry after cancelling `parentCtx`.
+- **A shared informer runs under the first consumer's `parentCtx`.** If consumers pass different contexts and that one is cancelled, the informer stops for every consumer of the key. Pass the same long lived context (the manager's) from every consumer.
+- **Stopped registrations keep their informer.** A registration references its informer, so a stopped informer's cache stays in memory while the registration is held. Refresh registrations from the latest `EnsureWatchSet` and drop old ones.
+- **Lock held during informer creation.** `ClientFor`, the `InformerFunc` and `Release` all run under the registry mutex. Keep them quick and never call back into the registry: the mutex is not reentrant, so a callback deadlocks, and a slow func stalls every other caller. The default informer does no I/O while being built, list and watch start in `Run`.
 - **All handlers on a shared informer receive all events.** Filtering is each handler's responsibility.
 
 ## Testing
