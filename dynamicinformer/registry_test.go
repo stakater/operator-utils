@@ -2086,32 +2086,6 @@ func TestWithInformerFunc_IndexerReachable(t *testing.T) {
 	}
 }
 
-func TestWithInformerFunc_NilInformerRejected(t *testing.T) {
-	provider := newFakeReleasingProvider()
-	nilInformer := func(dynamic.Interface, WatchKey, time.Duration) (cache.SharedIndexInformer, error) { return nil, nil }
-	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(nilInformer))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
-	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err == nil {
-		t.Fatal("expected error for a nil informer")
-	}
-
-	registry.mu.Lock()
-	if len(registry.watches) != 0 || len(registry.consumerKeys) != 0 {
-		t.Errorf("expected no state left, got %d watches, %d consumers", len(registry.watches), len(registry.consumerKeys))
-	}
-	registry.mu.Unlock()
-
-	if got := provider.acquired(); !slices.Equal(got, []string{"team-a/reader"}) {
-		t.Errorf("expected one ClientFor call, got %v", got)
-	}
-	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
-		t.Errorf("expected the client to be released, got %v", got)
-	}
-}
-
 func TestGetIndexer_SharedAcrossConsumers(t *testing.T) {
 	registry, ctx, cancel := newFakeRegistry(t)
 	defer cancel()
@@ -2133,37 +2107,41 @@ func TestGetIndexer_SharedAcrossConsumers(t *testing.T) {
 	}
 }
 
-func TestWithInformerFunc_NilInformerRollsBackEarlierKeys(t *testing.T) {
-	provider := newFakeReleasingProvider()
-	nilForSecrets := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
-		if key.GVR == secretsGVR {
-			return nil, nil
-		}
-		return newDynamicInformer(cli, key, resyncPeriod)
+func TestWithInformerFunc_NilInformerRollsBack(t *testing.T) {
+	registry, provider, ctx := newFailingRegistry(t, func() (cache.SharedIndexInformer, error) {
+		return nil, nil
+	})
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", failingWatches()); err == nil {
+		t.Fatal("expected error for a nil informer")
 	}
-	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(nilForSecrets))
+	assertEmptyAndReleased(t, registry, provider)
+}
+
+func TestWithInformerFunc_PanicReleasesClient(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	panicking := func(dynamic.Interface, WatchKey, time.Duration) (cache.SharedIndexInformer, error) {
+		panic("boom")
+	}
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(panicking))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	watches := []WatchRequest{
-		{Key: WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}, Callback: noopCallback()},
-		{Key: WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-b/reader"}, Callback: noopCallback()},
-	}
-	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", watches); err == nil {
-		t.Fatal("expected error for a nil informer")
-	}
+	key := WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-a/reader"}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected the panic to propagate")
+			}
+		}()
+		_, _ = registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	}()
 
-	registry.mu.Lock()
-	if len(registry.watches) != 0 || len(registry.consumerKeys) != 0 {
-		t.Errorf("expected the earlier key rolled back, got %d watches, %d consumers", len(registry.watches), len(registry.consumerKeys))
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the client released after a panic, got %v", got)
 	}
-	registry.mu.Unlock()
-
-	acquired, released := provider.acquired(), provider.released()
-	slices.Sort(acquired)
-	slices.Sort(released)
-	if !slices.Equal(acquired, []string{"team-a/reader", "team-b/reader"}) || !slices.Equal(released, acquired) {
-		t.Errorf("expected every acquired client released, acquired %v, released %v", acquired, released)
+	// The registry lock must be free again.
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -2284,8 +2262,8 @@ func TestGetIndexer_ErrorsAfterRelease(t *testing.T) {
 	if _, err := regs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
 		t.Errorf("expected ErrWatchStopped after release, got %v", err)
 	}
-	// HasSynced stays true so WaitForCacheSync never hangs on a stopped
-	// registration; GetIndexer is the one that reports the stop.
+	// HasSynced keeps the informer's last value; GetIndexer is the one that
+	// reports the stop.
 	if !regs[0].HasSynced() {
 		t.Error("expected HasSynced to stay true after release")
 	}

@@ -139,7 +139,7 @@ Replaces how the registry builds informers. Pass it to either constructor. `With
 - Return a fresh, unstarted, non nil informer. The registry owns it and starts and stops it with the watch, so never return one from a long lived factory.
 - Set the key func, transform and indexers here, before `Run`. Every informer of the registry is built the same way, so a consumer that needs different ones uses its own registry.
 - The func runs while the registry holds its lock, like `ClientFor`. Keep it quick and never call back into the registry.
-- A returned error or a nil informer fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client.
+- A returned error or a nil informer fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client. A panic propagates to the caller, but the client is still released. A typed nil pointer is not detected and panics inside `Run`.
 
 Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
 
@@ -409,7 +409,7 @@ kind delete cluster --name demo
 
 - **Event gap during initial list.** Handlers registered before the informer syncs may miss events. Use `HasSynced` to wait if needed.
 - **Informer startup errors are not surfaced programmatically.** The reflector retries with backoff and logs errors. Monitor reflector logs for persistent failures (RBAC, missing GVR).
-- **Parent context cancellation is not a release.** It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running. Cancelling `parentCtx` stops its informers but leaves their entries in place: registrations return `ErrWatchStopped`, and `Release` is called only when the key is later released or pruned. A later `EnsureWatchSet` that needs such a key, from any consumer, fails to add its handler to the stopped informer, so do not reuse the registry after cancelling `parentCtx`.
+- **Parent context cancellation is not a release.** It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running. Cancelling `parentCtx` stops its informers but leaves their entries in place: registrations return `ErrWatchStopped`, and `Release` is called only when the key is later released or pruned. A later `EnsureWatchSet` keeps using the stopped entries: a consumer that already holds the key gets a dead registration with no error, and another consumer may fail to add its handler, depending on whether `Run` has returned yet. Do not reuse the registry after cancelling `parentCtx`.
 - **A shared informer runs under the first consumer's `parentCtx`.** If consumers pass different contexts and that one is cancelled, the informer stops for every consumer of the key. Pass the same long lived context (the manager's) from every consumer.
 - **Stopped registrations keep their informer.** A registration references its informer, so a stopped informer's cache stays in memory while the registration is held. Refresh registrations from the latest `EnsureWatchSet` and drop old ones.
 - **Lock held during informer creation.** `ClientFor`, the `InformerFunc` and `Release` all run under the registry mutex. Keep them quick and never call back into the registry: the mutex is not reentrant, so a callback deadlocks, and a slow func stalls every other caller. The default informer does no I/O while being built, list and watch start in `Run`.

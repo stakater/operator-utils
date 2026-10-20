@@ -115,7 +115,8 @@ func newRegistration(key WatchKey, consumerID string, entry *WatchEntry) *WatchR
 //
 // It is called while the registry holds its lock, so it must be quick and must not
 // call back into the registry. A returned error or nil informer fails
-// EnsureWatchSet for that call and releases the client.
+// EnsureWatchSet for that call and releases the client. A panic propagates,
+// but the client is still released. A typed nil pointer is not detected.
 type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error)
 
 // RegistryOption configures a WatchRegistry.
@@ -149,15 +150,16 @@ type ClientProvider interface {
 //
 // The registry pairs the calls one to one: for every ClientFor call that
 // returned a client, Release is called exactly once with the same identity,
-// when the informer started with that client stops. A provider that caches
-// clients per identity can therefore keep a reference count per identity and
-// evict the client when the count reaches zero.
+// when the registry drops the informer started with that client, or right
+// away if building that informer fails. A provider that caches clients per
+// identity can therefore keep a reference count per identity and evict the
+// client when the count reaches zero.
 //
 // Like ClientFor, Release runs while the registry holds its own lock, so it
 // must not call back into the registry. Cancelling the parent context stops
 // informers without dropping them, so their Release comes later, when the key
-// is next released or pruned. Providers that
-// do not implement this interface are never notified.
+// is next released or pruned. Providers that do not implement this interface
+// are never notified.
 type ClientReleaser interface {
 	Release(identity string)
 }
@@ -375,8 +377,8 @@ func (r *WatchRegistry) EnsureWatchSet(
 }
 
 // startWatchLocked gets a client, builds the informer for key and starts it. If
-// the InformerFunc fails or returns nil, the client is released and nothing is
-// stored, so the caller only has to roll back. Caller must hold r.mu.
+// the InformerFunc fails, returns nil or panics, the client is released and
+// nothing is stored, so the caller only has to roll back. Caller must hold r.mu.
 func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey) (*WatchEntry, error) {
 	cli, err := r.clients.ClientFor(key.Identity)
 	if err == nil && cli == nil {
@@ -388,14 +390,19 @@ func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey
 		return nil, fmt.Errorf("failed to get client for %v: %w", key, err)
 	}
 
+	// Deferred so the client is also released when the InformerFunc panics.
+	started := false
+	defer func() {
+		if !started && r.releaser != nil {
+			r.releaser.Release(key.Identity)
+		}
+	}()
+
 	informer, err := r.newInformer(cli, key, r.resyncPeriod)
 	if err == nil && informer == nil {
 		err = errors.New("InformerFunc returned a nil informer")
 	}
 	if err != nil {
-		if r.releaser != nil {
-			r.releaser.Release(key.Identity)
-		}
 		return nil, fmt.Errorf("failed to build informer for %v: %w", key, err)
 	}
 
@@ -408,6 +415,7 @@ func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey
 	}
 	r.watches[key] = entry
 	go informer.Run(ctx.Done())
+	started = true
 	return entry, nil
 }
 
@@ -498,8 +506,8 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 
 // stopWatchLocked stops the informer behind key, forgets it, and gives its
 // client back to a provider that implements ClientReleaser. It is the only
-// place an informer stops, so each Release pairs with the ClientFor that
-// started the informer. Caller must hold r.mu.
+// place a started informer is dropped, so each Release pairs with the ClientFor
+// that started the informer. Caller must hold r.mu.
 func (r *WatchRegistry) stopWatchLocked(key WatchKey, entry *WatchEntry) {
 	entry.cancel()
 	delete(r.watches, key)
