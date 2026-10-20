@@ -106,7 +106,7 @@ Releases all watches for a consumer. Idempotent — calling on an unknown consum
 ### `NewWatchRegistryWithProvider`
 
 ```go
-func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration, opts ...Option) *WatchRegistry
 ```
 
 Creates a registry that resolves the client for each watch from `provider`, keyed by `WatchKey.Identity`. Watches under different identities never share an informer, even for the same GVR and namespace, since they may be authorized differently. The registry treats the identity as an opaque string; what it maps to (impersonation, a token, another cluster) is the provider's concern. `NewWatchRegistry` is the single-client form: it serves the empty identity only and rejects any other.
@@ -125,6 +125,36 @@ type ClientReleaser interface {
 ```
 
 `ClientFor` is called every time an informer starts, so providers should cache clients per identity. A provider that also implements `ClientReleaser` can bound that cache with a reference count: increment in `ClientFor`, decrement in `Release`, evict at zero. Both calls run while the registry holds its lock, so they must not call back into the registry. Providers that do not implement `ClientReleaser` are never notified.
+
+### `WithInformerFunc`
+
+```go
+type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer
+
+func WithInformerFunc(f InformerFunc) Option
+```
+
+Replaces how the registry builds informers. Pass it to either constructor. The func runs before the informer starts, so it can add indexers and a transform. Every informer of the registry is built the same way, so a consumer that needs its own indexers uses its own registry. Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
+
+```go
+func newClusterAwareInformer(cli dynamic.Interface, key di.WatchKey, resync time.Duration) cache.SharedIndexInformer {
+    ri := cli.Resource(key.GVR).Namespace(key.Namespace) // "" lists all namespaces
+    lw := &cache.ListWatch{
+        ListWithContextFunc:  func(ctx context.Context, o metav1.ListOptions) (runtime.Object, error) { return ri.List(ctx, o) },
+        WatchFuncWithContext: func(ctx context.Context, o metav1.ListOptions) (watch.Interface, error) { return ri.Watch(ctx, o) },
+    }
+    inf := kcpinformers.NewSharedIndexInformerWithOptions(lw, &unstructured.Unstructured{}, cache.SharedIndexInformerOptions{
+        ResyncPeriod: resync,
+        Indexers:     cache.Indexers{kcpcache.ClusterIndexName: kcpcache.ClusterIndexFunc},
+    })
+    _ = inf.SetTransform(dropManagedFields)
+    return inf
+}
+
+registry := di.NewWatchRegistryWithProvider(provider, 30*time.Second, di.WithInformerFunc(newClusterAwareInformer))
+```
+
+A func that returns nil fails `EnsureWatchSet` for that key.
 
 ## Convenience Callbacks
 
@@ -279,6 +309,8 @@ for _, reg := range regs {
 }
 ```
 
+After sync, `reg.GetIndexer()` reads the informer's cache (`GetByKey`, `List`, `ByIndex`). The cache is shared with every consumer of the same key, so treat its objects as read only.
+
 ## Running the Interactive Example
 
 An interactive example program is included that demonstrates the registry against a live cluster.
@@ -361,6 +393,7 @@ kind delete cluster --name demo
 | Expose `HasSynced` instead of waiting internally | Most consumers don't need the guarantee — resync catches missed events. Those who do can opt in. |
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
+| Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Fixing them per registry keeps sharing safe without comparing funcs. |
 | Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor`, so a provider can reference-count without knowing anything about informers. |
 
 ## Known Limitations

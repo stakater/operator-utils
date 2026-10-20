@@ -54,11 +54,39 @@ type WatchEntry struct {
 	handlers map[string]*handlerRegistration // keyed by consumerID
 }
 
-// WatchRegistration is returned to the consumer as a handle for optional cache sync.
+// WatchRegistration is returned to the consumer as a handle for optional cache
+// sync and cache reads.
 type WatchRegistration struct {
 	Key        WatchKey
 	ConsumerID string
 	HasSynced  cache.InformerSynced
+	informer   cache.SharedIndexInformer
+}
+
+// GetIndexer returns the cache of the informer behind this watch. It is shared
+// with every other consumer of the same WatchKey, so treat its objects as read only.
+// Only valid on registrations returned by EnsureWatchSet.
+func (w *WatchRegistration) GetIndexer() cache.Indexer {
+	return w.informer.GetIndexer()
+}
+
+// InformerFunc builds the informer for a watch key on the given client. It runs
+// before the informer starts, so it may call AddIndexers and SetTransform. Every
+// informer of a registry is built by the same func, so indexers and transform are
+// fixed per registry.
+type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer
+
+// Option configures a WatchRegistry.
+type Option func(*WatchRegistry)
+
+// WithInformerFunc replaces the default dynamic informer constructor, for example
+// with a cluster aware informer. A nil f keeps the default.
+func WithInformerFunc(f InformerFunc) Option {
+	return func(r *WatchRegistry) {
+		if f != nil {
+			r.newInformer = f
+		}
+	}
 }
 
 // ClientProvider supplies the dynamic client for a given identity. The identity
@@ -119,7 +147,7 @@ type WatchRegistry struct {
 	clients      ClientProvider
 	releaser     ClientReleaser // nil unless clients implements it
 	resyncPeriod time.Duration
-	newInformer  func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer // seam for tests
+	newInformer  InformerFunc
 }
 
 // NewWatchRegistry creates a new registry backed by the given dynamic client.
@@ -127,15 +155,15 @@ type WatchRegistry struct {
 // to serve watches under multiple identities.
 // The resyncPeriod controls how often each informer relists from the API server.
 // A non-zero value is required to recover from dropped events (30s is typical).
-func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duration) *WatchRegistry {
-	return NewWatchRegistryWithProvider(singleClientProvider{client: dynamicClient}, resyncPeriod)
+func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duration, opts ...Option) *WatchRegistry {
+	return NewWatchRegistryWithProvider(singleClientProvider{client: dynamicClient}, resyncPeriod, opts...)
 }
 
 // NewWatchRegistryWithProvider creates a registry that resolves the client for
 // each watch from the provider, keyed by WatchKey.Identity.
-func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry {
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration, opts ...Option) *WatchRegistry {
 	releaser, _ := provider.(ClientReleaser)
-	return &WatchRegistry{
+	r := &WatchRegistry{
 		watches:      make(map[WatchKey]*WatchEntry),
 		consumerKeys: make(map[string]map[WatchKey]struct{}),
 		clients:      provider,
@@ -143,6 +171,10 @@ func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Dur
 		resyncPeriod: resyncPeriod,
 		newInformer:  newDynamicInformer,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // newDynamicInformer builds the informer for a watch key on the given client.
@@ -268,14 +300,19 @@ func (r *WatchRegistry) EnsureWatchSet(
 			ctx, cancel := context.WithCancel(parentCtx)
 
 			informer := r.newInformer(cli, key, r.resyncPeriod)
-			go informer.Run(ctx.Done())
-
 			entry = &WatchEntry{
 				cancel:   cancel,
 				informer: informer,
 				handlers: make(map[string]*handlerRegistration),
 			}
 			r.watches[key] = entry
+			if informer == nil {
+				// Stop through stopWatchLocked so the client is released.
+				r.stopWatchLocked(key, entry)
+				return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
+					fmt.Errorf("InformerFunc returned a nil informer for %v", key))
+			}
+			go informer.Run(ctx.Done())
 		}
 
 		// Deduplicate: already registered for this consumer
@@ -284,6 +321,7 @@ func (r *WatchRegistry) EnsureWatchSet(
 				Key:        key,
 				ConsumerID: consumerID,
 				HasSynced:  entry.informer.HasSynced,
+				informer:   entry.informer,
 			})
 			continue
 		}
@@ -308,6 +346,7 @@ func (r *WatchRegistry) EnsureWatchSet(
 			Key:        key,
 			ConsumerID: consumerID,
 			HasSynced:  entry.informer.HasSynced,
+			informer:   entry.informer,
 		})
 	}
 

@@ -1966,3 +1966,158 @@ func TestEnqueueByOwnerAnnotationCallback_ChannelFull(t *testing.T) {
 	// Should not block or panic when channel is full
 	cb.OnAdd(obj)
 }
+
+func newTeamConfigMap(name, team string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetAPIVersion("v1")
+	obj.SetKind("ConfigMap")
+	obj.SetNamespace("default")
+	obj.SetName(name)
+	obj.SetLabels(map[string]string{"team": team})
+	return obj
+}
+
+func indexByTeam(obj interface{}) ([]string, error) {
+	return []string{obj.(*unstructured.Unstructured).GetLabels()["team"]}, nil
+}
+
+func TestWithInformerFunc_UsedForNewWatches(t *testing.T) {
+	var mu sync.Mutex
+	var built []WatchKey
+	counting := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
+		mu.Lock()
+		built = append(built, key)
+		mu.Unlock()
+		return newDynamicInformer(cli, key, resyncPeriod)
+	}
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second, WithInformerFunc(counting))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmKey := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	secretKey := WatchKey{GVR: secretsGVR, Namespace: "default"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: cmKey}, {Key: secretKey}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: cmKey}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(built, []WatchKey{cmKey, secretKey}) {
+		t.Errorf("expected one informer per distinct key, got %v", built)
+	}
+}
+
+func TestWithInformerFunc_IndexerReachable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	cli := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{configmapsGVR: "ConfigMapList"},
+		newTeamConfigMap("a", "x"), newTeamConfigMap("b", "y"))
+	withTeamIndex := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
+		informer := newDynamicInformer(cli, key, resyncPeriod)
+		if err := informer.AddIndexers(cache.Indexers{"byTeam": indexByTeam}); err != nil {
+			t.Errorf("AddIndexers: %v", err)
+		}
+		return informer
+	}
+	registry := NewWatchRegistry(cli, 30*time.Second, WithInformerFunc(withTeamIndex))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), regs[0].HasSynced) {
+		t.Fatal("informer did not sync")
+	}
+
+	objs, err := regs[0].GetIndexer().ByIndex("byTeam", "x")
+	if err != nil {
+		t.Fatalf("ByIndex: %v", err)
+	}
+	if len(objs) != 1 || objs[0].(*unstructured.Unstructured).GetName() != "a" {
+		t.Errorf("expected only default/a for team x, got %v", objs)
+	}
+}
+
+func TestWithInformerFunc_NilInformerRejected(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	nilInformer := func(dynamic.Interface, WatchKey, time.Duration) cache.SharedIndexInformer { return nil }
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(nilInformer))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err == nil {
+		t.Fatal("expected error for a nil informer")
+	}
+
+	registry.mu.Lock()
+	if len(registry.watches) != 0 || len(registry.consumerKeys) != 0 {
+		t.Errorf("expected no state left, got %d watches, %d consumers", len(registry.watches), len(registry.consumerKeys))
+	}
+	registry.mu.Unlock()
+
+	if got := provider.acquired(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected one ClientFor call, got %v", got)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the client to be released, got %v", got)
+	}
+}
+
+func TestGetIndexer_SharedAcrossConsumers(t *testing.T) {
+	registry, ctx, cancel := newFakeRegistry(t)
+	defer cancel()
+
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	regs1, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	regs2, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if regs1[0].GetIndexer() == nil || regs1[0].GetIndexer() != regs2[0].GetIndexer() {
+		t.Error("expected both consumers to read the same indexer")
+	}
+}
+
+func TestWithInformerFunc_NilInformerRollsBackEarlierKeys(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	nilForSecrets := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
+		if key.GVR == secretsGVR {
+			return nil
+		}
+		return newDynamicInformer(cli, key, resyncPeriod)
+	}
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(nilForSecrets))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watches := []WatchRequest{
+		{Key: WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}, Callback: noopCallback()},
+		{Key: WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-b/reader"}, Callback: noopCallback()},
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", watches); err == nil {
+		t.Fatal("expected error for a nil informer")
+	}
+
+	registry.mu.Lock()
+	if len(registry.watches) != 0 || len(registry.consumerKeys) != 0 {
+		t.Errorf("expected the earlier key rolled back, got %d watches, %d consumers", len(registry.watches), len(registry.consumerKeys))
+	}
+	registry.mu.Unlock()
+
+	acquired, released := provider.acquired(), provider.released()
+	slices.Sort(acquired)
+	slices.Sort(released)
+	if !slices.Equal(acquired, []string{"team-a/reader", "team-b/reader"}) || !slices.Equal(released, acquired) {
+		t.Errorf("expected every acquired client released, acquired %v, released %v", acquired, released)
+	}
+}
