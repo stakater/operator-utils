@@ -2183,7 +2183,7 @@ func TestWithInformerFunc_PanicRollsBack(t *testing.T) {
 		panic("boom")
 	})
 	_, err := registry.EnsureWatchSet(ctx, "consumer-1", failingWatches())
-	if err == nil || !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "goroutine") {
+	if err == nil || !strings.Contains(err.Error(), "boom") || strings.Contains(err.Error(), "\n") {
 		t.Fatalf("expected the panic as an error, got %v", err)
 	}
 	assertEmptyAndReleased(t, registry, provider)
@@ -2309,8 +2309,10 @@ func TestGetIndexer_ErrorsAfterRelease(t *testing.T) {
 	if _, err := regs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
 		t.Errorf("expected ErrWatchStopped after release, got %v", err)
 	}
-	if regs[0].HasSynced() {
-		t.Error("expected HasSynced false after release")
+	// HasSynced stays true so WaitForCacheSync never hangs on a stopped
+	// registration; GetIndexer is the one that reports the stop.
+	if !regs[0].HasSynced() {
+		t.Error("expected HasSynced to stay true after release")
 	}
 }
 
@@ -2343,5 +2345,65 @@ func TestGetIndexer_ErrorsAfterOneConsumerReleases(t *testing.T) {
 func TestGetIndexer_ZeroValueErrors(t *testing.T) {
 	if _, err := (&WatchRegistration{}).GetIndexer(); err == nil {
 		t.Error("expected an error from a registration not returned by EnsureWatchSet")
+	}
+}
+
+func TestEnsureWatchSet_RestartsWatchAfterParentCancel(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}
+
+	oldCtx, cancelOld := context.WithCancel(context.Background())
+	oldRegs, err := registry.EnsureWatchSet(oldCtx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancelOld()
+	time.Sleep(50 * time.Millisecond) // let Run exit so the informer reports stopped
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err != nil {
+		t.Fatalf("expected the dead watch to be restarted for a new consumer, got %v", err)
+	}
+	if _, err := regs[0].GetIndexer(); err != nil {
+		t.Errorf("expected a live indexer, got %v", err)
+	}
+	if _, err := oldRegs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
+		t.Errorf("expected the old registration stopped, got %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the dead watch released once, got %v", got)
+	}
+
+	// consumer-1 no longer holds the key, so releasing it must not release again.
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected no second release, got %v", got)
+	}
+	registry.mu.Lock()
+	if _, ok := registry.consumerKeys["consumer-1"]; ok {
+		t.Error("expected consumer-1 to hold no keys after its watch was retired")
+	}
+	registry.mu.Unlock()
+}
+
+func TestEnsureWatchSet_CancelledContextRejected(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}, Callback: noopCallback()}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if len(registry.watches) != 0 || len(provider.acquired()) != 0 {
+		t.Errorf("expected nothing started, got %d watches, acquired %v", len(registry.watches), provider.acquired())
 	}
 }
