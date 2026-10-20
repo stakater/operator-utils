@@ -2359,7 +2359,6 @@ func TestEnsureWatchSet_RestartsWatchAfterParentCancel(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	cancelOld()
-	time.Sleep(50 * time.Millisecond) // let Run exit so the informer reports stopped
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2405,5 +2404,177 @@ func TestEnsureWatchSet_CancelledContextRejected(t *testing.T) {
 	defer registry.mu.Unlock()
 	if len(registry.watches) != 0 || len(provider.acquired()) != 0 {
 		t.Errorf("expected nothing started, got %d watches, acquired %v", len(registry.watches), provider.acquired())
+	}
+}
+
+func TestHasSynced_WaitsForThisConsumersReplay(t *testing.T) {
+	scheme := runtime.NewScheme()
+	cli := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{configmapsGVR: "ConfigMapList"},
+		newTeamConfigMap("a", "x"))
+	registry := NewWatchRegistry(cli, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	regs1, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), regs1[0].HasSynced) {
+		t.Fatal("informer did not sync")
+	}
+
+	// consumer-2 joins the synced informer; its replay of default/a blocks in OnAdd.
+	unblock := make(chan struct{})
+	release := sync.OnceFunc(func() { close(unblock) })
+	defer release() // never leave the handler goroutine blocked on a failed assert
+	cb := EventCallback{OnAdd: func(*unstructured.Unstructured) { <-unblock }}
+	regs2, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key, Callback: cb}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if regs2[0].HasSynced() {
+		t.Error("expected HasSynced false while this consumer's initial events are undelivered")
+	}
+	release()
+	if !cache.WaitForCacheSync(ctx.Done(), regs2[0].HasSynced) {
+		t.Error("expected HasSynced true once the replay is delivered")
+	}
+}
+
+func TestEnsureWatchSet_RetiredDeadEntryStaysCleanOnFailure(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	failSecrets := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		if key.GVR == secretsGVR {
+			return nil, errors.New("bad key")
+		}
+		return newDynamicInformer(cli, key, resyncPeriod)
+	}
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(failSecrets))
+	deadKey := WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}
+	badKey := WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-b/reader"}
+
+	oldCtx, cancelOld := context.WithCancel(context.Background())
+	if _, err := registry.EnsureWatchSet(oldCtx, "consumer-1", []WatchRequest{{Key: deadKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancelOld()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: deadKey, Callback: noopCallback()}, {Key: badKey, Callback: noopCallback()}}); err == nil {
+		t.Fatal("expected error for the bad key")
+	}
+
+	// The dead entry is gone for good, not half restored: no watches, no
+	// consumer keys, and every acquired client released exactly once.
+	assertEmptyAndReleased(t, registry, provider)
+}
+
+func TestReleaseAll_DeadEntryReleasedOnce(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancel()
+	if got := provider.released(); len(got) != 0 {
+		t.Fatalf("expected no release on cancel alone, got %v", got)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := registry.ReleaseAll("consumer-1"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the dead entry released exactly once, got %v", got)
+	}
+}
+
+func TestEnsureWatchSet_PruneDeadEntryReleasedOnce(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	deadKey := WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}
+
+	oldCtx, cancelOld := context.WithCancel(context.Background())
+	if _, err := registry.EnsureWatchSet(oldCtx, "consumer-1", []WatchRequest{{Key: deadKey, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancelOld()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	other := WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-b/reader"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: other, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the pruned dead entry released exactly once, got %v", got)
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if _, ok := registry.watches[deadKey]; ok {
+		t.Error("expected the dead entry pruned, not restarted")
+	}
+}
+
+func TestEnsureWatchSet_RetireDeadEntrySharedByTwoConsumers(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}
+
+	oldCtx, cancelOld := context.WithCancel(context.Background())
+	regs1, err := registry.EnsureWatchSet(oldCtx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	regs2, err := registry.EnsureWatchSet(oldCtx, "consumer-2", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancelOld()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	regs3, err := registry.EnsureWatchSet(ctx, "consumer-3", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for i, reg := range []*WatchRegistration{regs1[0], regs2[0]} {
+		if _, err := reg.GetIndexer(); !errors.Is(err, ErrWatchStopped) {
+			t.Errorf("consumer-%d: expected ErrWatchStopped, got %v", i+1, err)
+		}
+	}
+	if _, err := regs3[0].GetIndexer(); err != nil {
+		t.Errorf("expected a live indexer for consumer-3, got %v", err)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the shared dead entry released once, got %v", got)
+	}
+
+	registry.mu.Lock()
+	_, has1 := registry.consumerKeys["consumer-1"]
+	_, has2 := registry.consumerKeys["consumer-2"]
+	registry.mu.Unlock()
+	if has1 || has2 {
+		t.Error("expected both old consumers to lose the retired key")
+	}
+	// Their later release must not touch consumer-3's fresh watch.
+	for _, id := range []string{"consumer-1", "consumer-2"} {
+		if err := registry.ReleaseAll(id); err != nil {
+			t.Fatalf("ReleaseAll(%s): %v", id, err)
+		}
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected no extra release, got %v", got)
+	}
+	if _, err := regs3[0].GetIndexer(); err != nil {
+		t.Errorf("expected consumer-3 to stay live, got %v", err)
 	}
 }

@@ -100,10 +100,12 @@ func newRegistration(key WatchKey, consumerID string, entry *WatchEntry) *WatchR
 	return &WatchRegistration{
 		Key:        key,
 		ConsumerID: consumerID,
-		HasSynced:  entry.informer.HasSynced,
-		informer:   entry.informer,
-		released:   entry.handlers[consumerID].released,
-		done:       entry.done,
+		// The handler's own flag: true only once this consumer's initial
+		// events are delivered, not just when the shared informer synced.
+		HasSynced: entry.handlers[consumerID].registration.HasSynced,
+		informer:  entry.informer,
+		released:  entry.handlers[consumerID].released,
+		done:      entry.done,
 	}
 }
 
@@ -151,15 +153,16 @@ type ClientProvider interface {
 //
 // The registry pairs the calls one to one: for every ClientFor call that
 // returned a client, Release is called exactly once with the same identity,
-// when the informer started with that client stops. A provider that caches
+// when the registry drops the informer started with that client (its last
+// consumer released it, or a stopped watch was retired). A provider that caches
 // clients per identity can therefore keep a reference count per identity and
 // evict the client when the count reaches zero.
 //
 // Like ClientFor, Release runs while the registry holds its own lock, so it
-// must not call back into the registry. An informer stopped by cancelling the
-// parent context is released later, exactly once: when its key is released or
-// requested again. Providers that do not implement this interface are never
-// notified.
+// must not call back into the registry. Cancelling the parent context stops
+// informers without dropping them, so their Release comes later, when the key
+// is next released, pruned or requested. Providers that do not implement this
+// interface are never notified.
 type ClientReleaser interface {
 	Release(identity string)
 }
@@ -508,14 +511,7 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 
 	delete(entry.handlers, consumerID)
 	close(hr.released)
-
-	// Keep consumerKeys in sync
-	if keys, ok := r.consumerKeys[consumerID]; ok {
-		delete(keys, key)
-		if len(keys) == 0 {
-			delete(r.consumerKeys, consumerID)
-		}
-	}
+	r.forgetKeyLocked(consumerID, key)
 
 	var removeErr error
 	if err := entry.informer.RemoveEventHandler(hr.registration); err != nil {
@@ -529,20 +525,25 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 	return removeErr
 }
 
-// retireWatchLocked drops a watch whose parentCtx was cancelled: every consumer's
-// registration reports stopped and loses the key, and the client is released
-// once, through stopWatchLocked. Caller must hold r.mu.
+// retireWatchLocked drops a watch whose parentCtx was cancelled: every consumer
+// loses the key, and the client is released once, through stopWatchLocked. Their
+// registrations already report stopped, since done is closed. Caller must hold r.mu.
 func (r *WatchRegistry) retireWatchLocked(key WatchKey, entry *WatchEntry) {
-	for consumerID, hr := range entry.handlers {
-		close(hr.released)
-		if keys, ok := r.consumerKeys[consumerID]; ok {
-			delete(keys, key)
-			if len(keys) == 0 {
-				delete(r.consumerKeys, consumerID)
-			}
-		}
+	for consumerID := range entry.handlers {
+		r.forgetKeyLocked(consumerID, key)
 	}
 	r.stopWatchLocked(key, entry)
+}
+
+// forgetKeyLocked drops key from consumerID's key set, and the set once empty.
+// Caller must hold r.mu.
+func (r *WatchRegistry) forgetKeyLocked(consumerID string, key WatchKey) {
+	if keys, ok := r.consumerKeys[consumerID]; ok {
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(r.consumerKeys, consumerID)
+		}
+	}
 }
 
 func isDone(done <-chan struct{}) bool {
