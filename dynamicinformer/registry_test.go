@@ -2117,28 +2117,22 @@ func TestWithInformerFunc_NilInformerRollsBack(t *testing.T) {
 	assertEmptyAndReleased(t, registry, provider)
 }
 
-func TestWithInformerFunc_PanicReleasesClient(t *testing.T) {
-	provider := newFakeReleasingProvider()
-	panicking := func(dynamic.Interface, WatchKey, time.Duration) (cache.SharedIndexInformer, error) {
+func TestWithInformerFunc_PanicRollsBack(t *testing.T) {
+	registry, provider, ctx := newFailingRegistry(t, func() (cache.SharedIndexInformer, error) {
 		panic("boom")
-	}
-	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(panicking))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	})
 
-	key := WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-a/reader"}
 	func() {
 		defer func() {
 			if recover() == nil {
 				t.Fatal("expected the panic to propagate")
 			}
 		}()
-		_, _ = registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+		_, _ = registry.EnsureWatchSet(ctx, "consumer-1", failingWatches())
 	}()
 
-	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
-		t.Errorf("expected the client released after a panic, got %v", got)
-	}
+	// The key added before the panic is rolled back too, not just the failing one.
+	assertEmptyAndReleased(t, registry, provider)
 	// The registry lock must be free again.
 	if err := registry.ReleaseAll("consumer-1"); err != nil {
 		t.Errorf("unexpected error: %v", err)

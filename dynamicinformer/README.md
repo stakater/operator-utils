@@ -139,7 +139,7 @@ Replaces how the registry builds informers. Pass it to either constructor. `With
 - Return a fresh, unstarted, non nil informer. The registry owns it and starts and stops it with the watch, so never return one from a long lived factory.
 - Set the key func, transform and indexers here, before `Run`. Every informer of the registry is built the same way, so a consumer that needs different ones uses its own registry.
 - The func runs while the registry holds its lock, like `ClientFor`. Keep it quick and never call back into the registry.
-- A returned error or a nil informer fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client. A panic propagates to the caller, but the client is still released. A typed nil pointer is not detected and panics inside `Run`.
+- A returned error or a nil informer fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client. A panic propagates to the caller after the call is rolled back and the client released, like an error. A typed nil pointer is not detected and panics inside `Run`.
 
 Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
 

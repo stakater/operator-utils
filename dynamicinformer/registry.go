@@ -115,8 +115,8 @@ func newRegistration(key WatchKey, consumerID string, entry *WatchEntry) *WatchR
 //
 // It is called while the registry holds its lock, so it must be quick and must not
 // call back into the registry. A returned error or nil informer fails
-// EnsureWatchSet for that call and releases the client. A panic propagates,
-// but the client is still released. A typed nil pointer is not detected.
+// EnsureWatchSet for that call and releases the client. A panic propagates after
+// the call is rolled back the same way. A typed nil pointer is not detected.
 type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error)
 
 // RegistryOption configures a WatchRegistry.
@@ -324,6 +324,15 @@ func (r *WatchRegistry) EnsureWatchSet(
 	var regs []*WatchRegistration
 	var newlyAdded []WatchKey // keys where AddEventHandler was called (for rollback)
 	newCurrent := make(map[WatchKey]struct{}, len(watches))
+
+	// A panic in the InformerFunc would skip the rollback below and leave keys
+	// added earlier in this call running untracked. Roll them back, then re-panic.
+	defer func() {
+		if p := recover(); p != nil {
+			_ = r.rollbackNewlyAddedLocked(consumerID, newlyAdded, nil)
+			panic(p)
+		}
+	}()
 
 	for _, w := range watches {
 		key := w.Key
