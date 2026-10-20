@@ -106,7 +106,7 @@ Releases all watches for a consumer. Idempotent — calling on an unknown consum
 ### `NewWatchRegistryWithProvider`
 
 ```go
-func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration, opts ...Option) *WatchRegistry
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration, opts ...RegistryOption) *WatchRegistry
 ```
 
 Creates a registry that resolves the client for each watch from `provider`, keyed by `WatchKey.Identity`. Watches under different identities never share an informer, even for the same GVR and namespace, since they may be authorized differently. The registry treats the identity as an opaque string; what it maps to (impersonation, a token, another cluster) is the provider's concern. `NewWatchRegistry` is the single-client form: it serves the empty identity only and rejects any other.
@@ -129,15 +129,22 @@ type ClientReleaser interface {
 ### `WithInformerFunc`
 
 ```go
-type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer
+type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error)
 
-func WithInformerFunc(f InformerFunc) Option
+func WithInformerFunc(f InformerFunc) RegistryOption
 ```
 
-Replaces how the registry builds informers. Pass it to either constructor. The func runs before the informer starts, so it can add indexers and a transform. Every informer of the registry is built the same way, so a consumer that needs its own indexers uses its own registry. Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
+Replaces how the registry builds informers. Pass it to either constructor. `WithInformerFunc(nil)` keeps the default dynamic informer.
+
+- Return a fresh, unstarted, non nil informer. The registry owns it and starts and stops it with the watch, so never return one from a long lived factory.
+- Set the transform and key func here, they must be in place before `Run`. Indexers can be added here or later on the shared informer, as long as names do not clash. A separate registry is only needed for a different key func or transform.
+- The func runs while the registry holds its lock, like `ClientFor`. Keep it quick and never call back into the registry.
+- A returned error, a nil informer or a panic fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client.
+
+Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
 
 ```go
-func newClusterAwareInformer(cli dynamic.Interface, key di.WatchKey, resync time.Duration) cache.SharedIndexInformer {
+func newClusterAwareInformer(cli dynamic.Interface, key di.WatchKey, resync time.Duration) (cache.SharedIndexInformer, error) {
     ri := cli.Resource(key.GVR).Namespace(key.Namespace) // "" lists all namespaces
     lw := &cache.ListWatch{
         ListWithContextFunc:  func(ctx context.Context, o metav1.ListOptions) (runtime.Object, error) { return ri.List(ctx, o) },
@@ -147,14 +154,14 @@ func newClusterAwareInformer(cli dynamic.Interface, key di.WatchKey, resync time
         ResyncPeriod: resync,
         Indexers:     cache.Indexers{kcpcache.ClusterIndexName: kcpcache.ClusterIndexFunc},
     })
-    _ = inf.SetTransform(dropManagedFields)
-    return inf
+    if err := inf.SetTransform(dropManagedFields); err != nil {
+        return nil, err
+    }
+    return inf, nil
 }
 
 registry := di.NewWatchRegistryWithProvider(provider, 30*time.Second, di.WithInformerFunc(newClusterAwareInformer))
 ```
-
-A func that returns nil fails `EnsureWatchSet` for that key.
 
 ## Convenience Callbacks
 
@@ -309,7 +316,9 @@ for _, reg := range regs {
 }
 ```
 
-After sync, `reg.GetIndexer()` reads the informer's cache (`GetByKey`, `List`, `ByIndex`). The cache is shared with every consumer of the same key, so treat its objects as read only.
+After sync, `reg.GetIndexer()` returns the informer's cache (`GetByKey`, `List`, `ByIndex`). The cache is shared with every consumer of the same key, so treat its objects as read only. Cache keys come from the `InformerFunc`: with the kcp example above they are `cluster|namespace/name`, so `GetByKey("ns/name")` finds nothing.
+
+`GetIndexer` returns `ErrWatchStopped` once the watch is released, pruned by a later `EnsureWatchSet`, or shut down, so a kept registration never serves frozen data. Always read through the registrations from the latest `EnsureWatchSet` call.
 
 ## Running the Interactive Example
 
@@ -393,7 +402,7 @@ kind delete cluster --name demo
 | Expose `HasSynced` instead of waiting internally | Most consumers don't need the guarantee — resync catches missed events. Those who do can opt in. |
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
-| Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Fixing them per registry keeps sharing safe without comparing funcs. |
+| Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Key func and transform must be set before `Run`, so they are fixed per registry. |
 | Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor`, so a provider can reference-count without knowing anything about informers. |
 
 ## Known Limitations
