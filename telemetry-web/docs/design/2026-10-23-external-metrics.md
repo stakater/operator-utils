@@ -81,8 +81,7 @@ early in this mode.
 `retire()` (`telemetry.go`) gets a parameter saying whether to reset the
 meter provider.
 Everything else about `Init` stays as it is: `ErrAlreadyInitialized`, the
-rule about calling it twice, the OTLP endpoint,
-protocol and TLS rules for traces.
+rule about calling it twice, and the protocol and TLS rules for traces.
 
 ### Instrumentation
 

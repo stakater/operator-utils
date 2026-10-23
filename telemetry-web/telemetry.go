@@ -76,8 +76,8 @@ func validEndpoint(ep string) error {
 
 // Init wires the global TracerProvider, MeterProvider, propagator, resource,
 // sampler, OTLP exporters, and runtime metrics. Call once in main. The returned
-// shutdown flushes the providers Init created; defer it under a bounded context so an
-// unreachable collector cannot stall process exit.
+// shutdown flushes the providers Init created; defer it under a bounded context
+// so an unreachable collector cannot stall process exit.
 //
 // With Config.ExternalMetrics, Init wires tracing only; see the field.
 //

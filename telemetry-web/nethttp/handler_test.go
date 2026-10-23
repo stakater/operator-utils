@@ -115,12 +115,16 @@ func TestHandlerFollowsTheGlobalMeterProvider(t *testing.T) {
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
 	first := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(first)))
+	mp1 := sdkmetric.NewMeterProvider(sdkmetric.WithReader(first))
+	t.Cleanup(func() { _ = mp1.Shutdown(context.Background()) })
+	otel.SetMeterProvider(mp1)
 	h := Handler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
 
 	second := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(second)))
+	mp2 := sdkmetric.NewMeterProvider(sdkmetric.WithReader(second))
+	t.Cleanup(func() { _ = mp2.Shutdown(context.Background()) })
+	otel.SetMeterProvider(mp2)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
 
 	if got := countOn(t, second); got != 1 {

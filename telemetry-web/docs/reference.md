@@ -109,7 +109,7 @@ type Config struct {
     ServiceName     string   // REQUIRED — labels every span/metric/log (service.name)
     ServiceVersion  string   // optional — service.version resource attribute
     Environment     string   // optional — deployment.environment.name (e.g. "prod")
-    OTLPEndpoint    string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317
+    OTLPEndpoint    string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317; host:port or a URL, malformed fails Init
     SampleRatio     *float64 // optional — nil = use env/default; a set pointer (incl. &0.0) is used verbatim
     Insecure        bool     // export without TLS (dev/local collector)
     ExternalMetrics bool     // another component owns the global MeterProvider; Init sets up tracing only
@@ -118,7 +118,7 @@ type Config struct {
 
 | Setting | `Config` field | Env var | Default |
 | --- | --- | --- | --- |
-| OTLP endpoint | `OTLPEndpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` |
+| OTLP endpoint | `OTLPEndpoint` (`host:port` or a URL; malformed fails `Init`) | `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` |
 | Trace sample ratio | `SampleRatio` (`*float64`) | `OTEL_TRACES_SAMPLER_ARG` | `1.0` |
 | TLS | `Insecure` (set `true` to disable) | — | TLS on |
 | Resource attributes | `ServiceName`/`ServiceVersion`/`Environment` | `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` | process/host/SDK detectors |
