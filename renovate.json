@@ -1,0 +1,79 @@
+{
+	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"extends": [
+		"local>stakater/.github:renovate-config",
+		"config:best-practices",
+		":semanticCommits"
+	],
+	"rangeStrategy": "replace",
+	"prCreation": "immediate",
+	"dependencyDashboard": true,
+	"dependencyDashboardTitle": "📦 Dependency Updates Dashboard",
+	"configMigration": true,
+	"vulnerabilityAlerts": {
+		"enabled": true
+	},
+	"groupName": "🔄 All Dependency Updates",
+	"packageRules": [
+    {
+      "packageNames": [
+        "k8s.io/api",
+        "k8s.io/apiextensions-apiserver",
+        "k8s.io/apimachinery",
+        "k8s.io/apiserver",
+        "k8s.io/cli-runtime",
+        "k8s.io/client-go",
+        "k8s.io/kubectl",
+        "k8s.io/kubernetes",
+        "sigs.k8s.io/controller-runtime"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "enabled": false
+    },
+		{
+			"description": "Auto-merge patches immediately",
+			"matchUpdateTypes": [
+				"patch"
+			],
+			"automerge": true,
+			"automergeType": "pr",
+			"platformAutomerge": true
+		},
+		{
+			"description": "Hold minors for 2 weeks then auto-merge",
+			"matchUpdateTypes": [
+				"minor"
+			],
+			"minimumReleaseAge": "14 days",
+			"automerge": true,
+			"automergeType": "pr",
+			"platformAutomerge": true
+		},
+		{
+			"description": "Hold majors - require manual approval",
+			"matchUpdateTypes": [
+				"major"
+			],
+			"automerge": false
+		},
+		{
+			"description": "Stakater dependencies - auto-merge immediately",
+			"automerge": true,
+			"automergeType": "pr",
+			"platformAutomerge": true,
+			"minimumReleaseAge": null,
+			"matchSourceUrls": [
+				"https://github.com/stakater/{/,}**",
+				"https://github.com/stakater-ab/{/,}**"
+			]
+		}
+	],
+	"labels": [
+		"dependencies",
+		"renovate",
+		"automated"
+	]
+}
