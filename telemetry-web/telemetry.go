@@ -3,7 +3,10 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -55,6 +58,25 @@ var (
 	initialized bool
 )
 
+// validEndpoint rejects a malformed Config.OTLPEndpoint before Init changes
+// any global state: a URL form (with "://") must parse, a bare form must be
+// host:port. Endpoints from OTEL_* variables are read by the SDK, not here.
+func validEndpoint(ep string) error {
+	if ep == "" {
+		return nil
+	}
+	var err error
+	if strings.Contains(ep, "://") {
+		_, err = url.Parse(ep)
+	} else {
+		_, _, err = net.SplitHostPort(ep)
+	}
+	if err != nil {
+		return fmt.Errorf("telemetry: invalid OTLP endpoint %q: %w", ep, err)
+	}
+	return nil
+}
+
 // Init wires the global TracerProvider, MeterProvider, propagator, resource,
 // sampler, OTLP exporters, and runtime metrics. Call once in main. The returned
 // shutdown flushes all providers; defer it under a bounded context so an
@@ -72,6 +94,9 @@ var (
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, retErr error) {
 	if cfg.ServiceName == "" {
 		return nil, errors.New("telemetry: Config.ServiceName is required")
+	}
+	if err := validEndpoint(cfg.OTLPEndpoint); err != nil {
+		return nil, err
 	}
 
 	initMu.Lock()

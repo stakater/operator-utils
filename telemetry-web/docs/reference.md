@@ -153,6 +153,9 @@ tracing only.
 Handlers follow the global MeterProvider on each request, so the owning
 component's provider may be created before or after the handler is built.
 
+`Init` rejects a malformed `OTLPEndpoint` in both modes; endpoints from
+`OTEL_*` variables are checked by the SDK when exporting.
+
 ### OTLP transport
 
 `OTEL_EXPORTER_OTLP_PROTOCOL`, and the per-signal

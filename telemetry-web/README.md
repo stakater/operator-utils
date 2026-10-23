@@ -146,10 +146,8 @@ never sets or resets the global MeterProvider; shutdown flushes traces
 only. The HTTP and `endpoint` metrics record into the `Publisher`'s
 provider: handlers follow the global MeterProvider on each request.
 
-With the `http/protobuf` protocol, the default mode rejects a malformed OTLP
-endpoint in `Init`, because the metric exporter checks it eagerly. In this
-mode the trace exporter checks it lazily, so the error only shows up through
-the error handler in the log when spans are exported.
+`Init` rejects a malformed `OTLPEndpoint` in both modes; endpoints from
+`OTEL_*` variables are checked by the SDK when exporting.
 
 ---
 

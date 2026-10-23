@@ -231,44 +231,37 @@ func TestResolveRatio(t *testing.T) {
 // already installed and then shut down. Callers overwhelmingly log a telemetry
 // error and keep serving, so the difference is between a service that records
 // nothing and a service wired to a dead pipeline.
-func TestInitFailureRestoresNoopProviders(t *testing.T) {
-	// The HTTP metric exporter validates its endpoint eagerly and the trace
-	// exporter does not, so this fails at newMetricReader — after
-	// SetTracerProvider has already installed tp. That is the ordering that used
-	// to strand a shut-down provider on the global.
-	setProtocol(t, "http/protobuf")
-	shutdown, err := Init(context.Background(), Config{
-		ServiceName:  "svc",
-		OTLPEndpoint: "http://a b c",
+//
+// Init's deferred failure handler calls retire(!cfg.ExternalMetrics). Since the
+// endpoint check now rejects bad input before Init touches any global, no input
+// a test can provide fails Init after that point, so the reset is tested here
+// directly (as TestRetireLeavesAMeterProviderItDoesNotOwn does for the other
+// mode).
+func TestRetireResetsBothProvidersWhenItOwnsMetrics(t *testing.T) {
+	prevTP, prevMP, prevName := otel.GetTracerProvider(), otel.GetMeterProvider(), ident.ServiceName()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetMeterProvider(prevMP)
+		ident.SetServiceName(prevName)
 	})
-	if err == nil {
-		_ = shutdown(bounded(t))
-		t.Fatal("Init succeeded on a malformed endpoint, want an error")
-	}
-	if shutdown != nil {
-		t.Error("a failed Init must not return a shutdown func")
-	}
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider())
+	ident.SetServiceName("svc")
+
+	retire(true)
 
 	// Asserted on the concrete type, not on IsRecording: a shut-down SDK provider
 	// also reports non-recording, so only the type distinguishes "restored to
 	// noop" from "still holding the corpse".
 	if got := otel.GetTracerProvider(); !isNoopTracerProvider(got) {
-		t.Errorf("global TracerProvider is %T after a failed Init, want the noop", got)
+		t.Errorf("global TracerProvider is %T after retire(true), want the noop", got)
 	}
 	if got := otel.GetMeterProvider(); !isNoopMeterProvider(got) {
-		t.Errorf("global MeterProvider is %T after a failed Init, want the noop", got)
+		t.Errorf("global MeterProvider is %T after retire(true), want the noop", got)
 	}
 	if name := ident.ServiceName(); name != "" {
-		t.Errorf("log scope = %q after a failed Init, want it cleared", name)
+		t.Errorf("log scope = %q after retire(true), want it cleared", name)
 	}
-
-	// The guard must not be left latched, or one failed Init would make every
-	// later attempt return ErrAlreadyInitialized.
-	second, err := Init(context.Background(), Config{ServiceName: "svc", Insecure: true})
-	if err != nil {
-		t.Fatalf("Init after a failure returned %v, want it to succeed", err)
-	}
-	_ = second(bounded(t))
 }
 
 func isNoopTracerProvider(tp trace.TracerProvider) bool {

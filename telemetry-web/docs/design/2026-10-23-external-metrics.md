@@ -47,7 +47,8 @@ All agreed on 2026-10-23.
    and any other user is unaffected.
 4. **No environment variable.** `OTEL_METRICS_EXPORTER=none` means "no
    metrics at all", the opposite of this mode. A code switch is clearer.
-5. **No early check of the OTLP endpoint in this mode** (see below).
+5. **Malformed `Config.OTLPEndpoint` fails `Init` in both modes.** Changed
+   in review (#33): the original decision was no early check.
 6. Changed in review (#33): `nethttp` follows the global MeterProvider per
    request, removing the ordering rule.
 
@@ -89,13 +90,12 @@ provider changes (one atomic load and a comparison per request). The
 other component's provider may therefore be created before or after any
 handler, and a re-Init needs no rebuilt handlers.
 
-### A malformed endpoint fails later
+### Endpoint check
 
-With `http/protobuf`, a malformed OTLP endpoint makes `Init` fail today,
-because the metric exporter checks it eagerly. (With the default gRPC
-protocol `Init` never failed on one.) The trace exporter checks lazily, so
-with `ExternalMetrics` the error only appears when spans are exported,
-through the error handler into the log. This is documented, not worked around.
+`Init` calls `validEndpoint` (`telemetry.go`) before it takes the lock or
+changes any global state, in both modes. A URL form (with `://`) must
+parse; a bare form must be `host:port`. Endpoints from `OTEL_*` variables
+are not checked: the SDK reads them and reports problems when exporting.
 
 ### Docs
 
@@ -112,8 +112,9 @@ Written test first, in this module:
 2. After shutdown it is still that object; the tracer provider is the
    no-op.
 3. `retire` with the external flag leaves the meter provider alone. Tested
-   directly: in this mode `Init` has no reachable failure after it starts
-   changing global state, because the trace exporter validates lazily.
+   directly: since the endpoint check, no input a test can provide fails
+   `Init` after it starts changing global state. `retire(true)` is tested
+   the same way.
 4. End to end: the caller's provider with a manual reader, `Init` with
    `ExternalMetrics`, one request through `nethttp.Handler` and one
    `endpoint.Instrument`. The reader holds `http.server.request.duration`

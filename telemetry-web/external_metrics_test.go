@@ -84,9 +84,9 @@ func TestExternalMetrics_ShutdownLeavesTheCallersMeterProvider(t *testing.T) {
 	}
 }
 
-// In this mode Init has no failure a test can trigger after it starts changing
-// global state (the trace exporter validates its endpoint lazily), so the
-// failure path's reset is tested on retire itself.
+// No input a test can provide fails Init after it starts changing global state
+// (the endpoint check runs first), so the failure path's reset is tested on
+// retire itself.
 func TestRetireLeavesAMeterProviderItDoesNotOwn(t *testing.T) {
 	mp, _ := ownMeterProvider(t)
 
