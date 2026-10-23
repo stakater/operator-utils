@@ -1,0 +1,62 @@
+name: Test
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Superseded PR runs are wasted work; master runs are kept so every commit is tested.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    name: Discover modules
+    runs-on: ubuntu-latest
+    if: "! contains(github.event.pull_request.title, '[skip-ci]')"
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      # Every directory holding a go.mod is a module, so a new module is tested
+      # as soon as it lands, without touching this file.
+      - name: Find Go modules
+        id: find
+        run: |
+          modules=$(find . -name go.mod -not -path '*/vendor/*' -printf '%h\n' \
+            | sed 's|^\./||' | sort | jq -R . | jq -sc .)
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          echo "Found: $modules"
+
+  test:
+    name: Test ${{ matrix.module }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJSON(needs.discover.outputs.modules) }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      # Modules pin different Go versions, so each uses its own.
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: Unit tests
+        working-directory: ${{ matrix.module }}
+        run: go test -race -count=1 -shuffle=on ./...
