@@ -1,6 +1,6 @@
 # telemetry-web: leave metrics to another component
 
-- **Status:** design agreed 2026-10-23, not implemented.
+- **Status:** design agreed 2026-10-23, implemented on this branch.
 - **Tracked by:** SA-9148 (observability for cloud-orchestrator-gateway,
   part of the epic SA-9145).
 - **Consumer that drives it:** cloud-orchestrator-gateway. Its half of the
@@ -88,10 +88,11 @@ each use. The provider set by the other component must exist before
 
 ### A malformed endpoint fails later
 
-Today a malformed OTLP endpoint makes `Init` fail, because the metric
-exporter checks it eagerly. The trace exporter checks lazily, so with
-`ExternalMetrics` the error only appears when spans are exported, through
-the error handler into the log. This is documented, not worked around.
+With `http/protobuf`, a malformed OTLP endpoint makes `Init` fail today,
+because the metric exporter checks it eagerly. (With the default gRPC
+protocol `Init` never failed on one.) The trace exporter checks lazily, so
+with `ExternalMetrics` the error only appears when spans are exported,
+through the error handler into the log. This is documented, not worked around.
 
 ### Docs
 

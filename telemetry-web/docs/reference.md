@@ -106,13 +106,13 @@ override them.
 
 ```go
 type Config struct {
-    ServiceName    string   // REQUIRED — labels every span/metric/log (service.name)
-    ServiceVersion string   // optional — service.version resource attribute
-    Environment    string   // optional — deployment.environment.name (e.g. "prod")
-    OTLPEndpoint   string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317
-    SampleRatio    *float64 // optional — nil = use env/default; a set pointer (incl. &0.0) is used verbatim
-    Insecure       bool     // export without TLS (dev/local collector)
-    ExternalMetrics bool    // another component owns the global MeterProvider; Init sets up tracing only
+    ServiceName     string   // REQUIRED — labels every span/metric/log (service.name)
+    ServiceVersion  string   // optional — service.version resource attribute
+    Environment     string   // optional — deployment.environment.name (e.g. "prod")
+    OTLPEndpoint    string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317
+    SampleRatio     *float64 // optional — nil = use env/default; a set pointer (incl. &0.0) is used verbatim
+    Insecure        bool     // export without TLS (dev/local collector)
+    ExternalMetrics bool     // another component owns the global MeterProvider; Init sets up tracing only
 }
 ```
 
@@ -133,6 +133,26 @@ than silently becoming `1.0`, since failing open to full-volume export on a typo
 costs money.
 
 `ServiceName` is required — `Init` returns an error if it is empty.
+
+### Metrics owned by another component (`ExternalMetrics`)
+
+Set `ExternalMetrics` when another component, such as the `observability`
+module's `Publisher`, owns the global MeterProvider: `Init` then sets up
+tracing only.
+
+| Step | Default | `ExternalMetrics` |
+| --- | --- | --- |
+| error handler, service name, resource | yes | yes |
+| propagators, sampler, tracer provider | yes | yes |
+| metric exporter and meter provider | yes | **no** |
+| `otel.SetMeterProvider` | yes | **no** |
+| Go runtime metrics | yes | **no** |
+| shutdown flushes | traces, metrics | traces only |
+| shutdown or failure resets to no-op | both providers | tracer only |
+
+**Ordering rule:** the owning component's MeterProvider must exist before
+`nethttp.Handler` or a framework adapter builds a handler, because otelhttp
+reads the global provider once, when the handler is built.
 
 ### OTLP transport
 
@@ -234,7 +254,9 @@ var ErrAlreadyInitialized error // second Init without an intervening shutdown
 ```
 
 Wires the global `TracerProvider`, `MeterProvider`, propagator, resource,
-sampler, OTLP exporters, and runtime metrics. **Call once in `main`.** The
+sampler, OTLP exporters, and runtime metrics (with `ExternalMetrics` it wires
+tracing only and leaves the MeterProvider and runtime metrics to their
+owner). **Call once in `main`.** The
 returned `shutdown` flushes all providers — `defer` it (with your own bounded
 context; the library does not impose a timeout). If a later setup step fails,
 `Init` shuts down anything it already started before returning the error.
@@ -631,10 +653,15 @@ collector `shutdown` may return a non-nil error — that is expected on teardown
 and generally safe to log-and-ignore.
 
 `shutdown` is idempotent, and after it runs the globals are back on noop providers
-with the log scope cleared, so a goroutine that outlives it writes into a noop
+(with `ExternalMetrics`, the tracer provider only; see below) with the log
+scope cleared, so a goroutine that outlives it writes into a noop
 rather than into a dead pipeline. A failed `Init` restores the same state, so a
 caller that logs the error and keeps serving gets a service that records nothing
 rather than one wired to a provider it already shut down.
+
+With `ExternalMetrics`, shutdown flushes and retires the tracer provider
+only. The global MeterProvider belongs to the component that owns metrics
+and is left as it is, also when `Init` fails.
 
 ### Re-`Init` after shutdown
 
@@ -649,9 +676,9 @@ on it: an `http.Handler` built by `nethttp.Handler` **before** the re-`Init`
 global `MeterProvider` on each use and rebuilds its instruments when it changes.
 Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
 
-With `ExternalMetrics`, shutdown flushes and retires the tracer provider
-only. The global MeterProvider belongs to the component that owns metrics
-and is left as it is, also when `Init` fails.
+With `ExternalMetrics`, re-`Init` does not swap the meter provider, so
+handlers keep producing `http.server.*` metrics.
+
 
 ---
 

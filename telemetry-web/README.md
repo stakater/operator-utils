@@ -125,16 +125,21 @@ sampling decision — you never get half a trace.
 
 An operator that serves its metrics on controller-runtime's `/metrics`
 through the `observability` module's `Publisher` can still use
-telemetry-web for tracing and HTTP instrumentation. Create the `Publisher`
-first, then call `Init` with `ExternalMetrics`:
+telemetry-web for tracing and HTTP instrumentation. The `Publisher` must
+exist before any handler is built (`Init` itself does not touch meters in
+this mode); call `Init` with `ExternalMetrics`:
 
 ```go
 pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})
 // handle err
+defer func() { _ = pub.Shutdown(ctx) }()
+
 shutdown, err := telemetry.Init(ctx, telemetry.Config{
     ServiceName:     "my-operator",
     ExternalMetrics: true,
 })
+// handle err
+defer func() { _ = shutdown(ctx) }()
 ```
 
 `Init` then builds no meter provider, starts no Go runtime metrics, and
@@ -143,9 +148,10 @@ only. The HTTP and `endpoint` metrics record into the `Publisher`'s
 provider, so build handlers after both calls: `otelhttp` reads the global
 provider once, when the handler is built.
 
-In this mode a malformed OTLP endpoint does not make `Init` fail. The
-trace exporter checks it lazily, so the error shows up through the error
-handler in the log when spans are exported.
+With the `http/protobuf` protocol, the default mode rejects a malformed OTLP
+endpoint in `Init`, because the metric exporter checks it eagerly. In this
+mode the trace exporter checks it lazily, so the error only shows up through
+the error handler in the log when spans are exported.
 
 ---
 

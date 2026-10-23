@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/stakater/operator-utils/telemetry-web/endpoint"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
@@ -65,6 +66,9 @@ func TestExternalMetrics_InitKeepsTheCallersMeterProvider(t *testing.T) {
 	if got := otel.GetMeterProvider(); got != metric.MeterProvider(mp) {
 		t.Errorf("global MeterProvider is %T after Init, want the caller's", got)
 	}
+	if _, ok := otel.GetTracerProvider().(*sdktrace.TracerProvider); !ok {
+		t.Errorf("global TracerProvider is %T after Init, want *sdktrace.TracerProvider", otel.GetTracerProvider())
+	}
 }
 
 func TestExternalMetrics_ShutdownLeavesTheCallersMeterProvider(t *testing.T) {
@@ -80,7 +84,7 @@ func TestExternalMetrics_ShutdownLeavesTheCallersMeterProvider(t *testing.T) {
 	}
 }
 
-// In this mode Init has no reachable failure after it starts changing
+// In this mode Init has no failure a test can trigger after it starts changing
 // global state (the trace exporter validates its endpoint lazily), so the
 // failure path's reset is tested on retire itself.
 func TestRetireLeavesAMeterProviderItDoesNotOwn(t *testing.T) {
