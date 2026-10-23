@@ -125,9 +125,8 @@ sampling decision — you never get half a trace.
 
 An operator that serves its metrics on controller-runtime's `/metrics`
 through the `observability` module's `Publisher` can still use
-telemetry-web for tracing and HTTP instrumentation. The `Publisher` must
-exist before any handler is built (`Init` itself does not touch meters in
-this mode); call `Init` with `ExternalMetrics`:
+telemetry-web for tracing and HTTP instrumentation. Call `Init` with
+`ExternalMetrics`:
 
 ```go
 pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})
@@ -145,8 +144,7 @@ defer func() { _ = shutdown(ctx) }()
 `Init` then builds no meter provider, starts no Go runtime metrics, and
 never sets or resets the global MeterProvider; shutdown flushes traces
 only. The HTTP and `endpoint` metrics record into the `Publisher`'s
-provider, so build handlers after both calls: `otelhttp` reads the global
-provider once, when the handler is built.
+provider: handlers follow the global MeterProvider on each request.
 
 With the `http/protobuf` protocol, the default mode rejects a malformed OTLP
 endpoint in `Init`, because the metric exporter checks it eagerly. In this
@@ -439,9 +437,8 @@ you: latency for work that is not an inbound HTTP request.
 - **`Init` is once per process, until you shut it down.** A second call without an
   intervening shutdown returns `ErrAlreadyInitialized`, because the first pair of
   providers would be orphaned with no path to `Shutdown`. After the returned
-  shutdown runs, `Init` may be called again. One caveat: a handler built before a
-  re-`Init` keeps producing spans but stops producing `http.server.*` metrics, since
-  `otelhttp` resolves its meter once at construction. Rebuild the handler.
+  shutdown runs, `Init` may be called again. Handlers follow the global
+  MeterProvider on each request, so a re-`Init` needs no rebuilt handlers.
 - Async boundaries (queues) and background goroutines don't carry `ctx` — pass it
   through, or inject/extract trace context in message metadata, to keep the trace
   alive.

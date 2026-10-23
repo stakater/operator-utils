@@ -22,10 +22,13 @@ func TestMain(m *testing.M) {
 
 // durationCount sums the request counts recorded on the otelhttp server
 // duration histogram — one per instrumented request.
-func durationCount(t *testing.T) uint64 {
+func durationCount(t *testing.T) uint64 { return countOn(t, reader) }
+
+// countOn is durationCount for an arbitrary reader.
+func countOn(t *testing.T, r *sdkmetric.ManualReader) uint64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
+	if err := r.Collect(context.Background(), &rm); err != nil {
 		t.Fatalf("collect: %v", err)
 	}
 	var total uint64
@@ -100,5 +103,30 @@ func TestHandlerSkippedPathsStillServed(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("skipped path must still reach the handler: status = %d, want 200", rec.Code)
+	}
+}
+
+// A handler must record into whichever MeterProvider is global when the
+// request arrives, not the one it was built with: otelhttp binds its
+// instruments at construction, so without re-binding a provider swap
+// (a re-Init, or a provider owned by another component) strands them.
+func TestHandlerFollowsTheGlobalMeterProvider(t *testing.T) {
+	prev := otel.GetMeterProvider()
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	first := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(first)))
+	h := Handler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	second := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(second)))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if got := countOn(t, second); got != 1 {
+		t.Errorf("new provider recorded %d requests, want 1", got)
+	}
+	if got := countOn(t, first); got != 1 {
+		t.Errorf("old provider recorded %d requests, want it frozen at 1", got)
 	}
 }

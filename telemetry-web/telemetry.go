@@ -40,9 +40,8 @@ type Config struct {
 	// MeterProvider, for example observability's Publisher. Init then sets
 	// up tracing only: it builds no meter provider, starts no Go runtime
 	// metrics, and never sets or resets the global MeterProvider. The HTTP
-	// and endpoint instrumentation records into that provider. Create it
-	// before building any handler, because otelhttp reads the global
-	// provider once, when the handler is built.
+	// and endpoint instrumentation records into that provider, which
+	// handlers follow on each request.
 	ExternalMetrics bool
 }
 
@@ -68,9 +67,8 @@ var (
 // ErrAlreadyInitialized. The returned shutdown is safe to call more than once;
 // after it runs, Init may be called again.
 //
-// Re-Init caveat: an http.Handler built before the re-Init keeps producing spans
-// but stops producing http.server.* metrics, because otelhttp resolves its meter
-// once at construction. Rebuild the handler if you depend on those metrics.
+// Handlers follow the global MeterProvider on each request, so a re-Init
+// needs no rebuilt handlers.
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, retErr error) {
 	if cfg.ServiceName == "" {
 		return nil, errors.New("telemetry: Config.ServiceName is required")

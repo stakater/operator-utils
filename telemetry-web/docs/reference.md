@@ -150,9 +150,8 @@ tracing only.
 | shutdown flushes | traces, metrics | traces only |
 | shutdown or failure resets to no-op | both providers | tracer only |
 
-**Ordering rule:** the owning component's MeterProvider must exist before
-`nethttp.Handler` or a framework adapter builds a handler, because otelhttp
-reads the global provider once, when the handler is built.
+Handlers follow the global MeterProvider on each request, so the owning
+component's provider may be created before or after the handler is built.
 
 ### OTLP transport
 
@@ -665,19 +664,12 @@ and is left as it is, also when `Init` fails.
 
 ### Re-`Init` after shutdown
 
-Supported, but with one caveat worth knowing before you build a config-reload path
-on it: an `http.Handler` built by `nethttp.Handler` **before** the re-`Init`
+Supported. Handlers built before the re-`Init` keep working: `nethttp.Handler`
+resolves its tracer per request and rebuilds its otelhttp handler when the global
+`MeterProvider` changes, and the `endpoint` package does the same for its
+instruments. No handler needs rebuilding.
 
-- keeps producing **spans**, because otelhttp resolves its tracer per request, and
-- stops producing **`http.server.*` metrics**, because it resolves its meter once
-  at construction and this library cannot reach inside it to rebind.
-
-`endpoint.*` metrics survive either way, because the `endpoint` package compares the
-global `MeterProvider` on each use and rebuilds its instruments when it changes.
-Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
-
-With `ExternalMetrics`, re-`Init` does not swap the meter provider, so
-handlers keep producing `http.server.*` metrics.
+With `ExternalMetrics`, re-`Init` does not swap the meter provider at all.
 
 
 ---

@@ -48,6 +48,8 @@ All agreed on 2026-10-23.
 4. **No environment variable.** `OTEL_METRICS_EXPORTER=none` means "no
    metrics at all", the opposite of this mode. A code switch is clearer.
 5. **No early check of the OTLP endpoint in this mode** (see below).
+6. Changed in review (#33): `nethttp` follows the global MeterProvider per
+   request, removing the ordering rule.
 
 ## Design
 
@@ -57,8 +59,7 @@ All agreed on 2026-10-23.
 // ExternalMetrics tells Init that another component owns the global
 // MeterProvider, for example observability's Publisher. Init then sets up
 // tracing only; the HTTP and endpoint instrumentation records into that
-// provider. Create it before building any handler, because otelhttp reads
-// the global provider once, when the handler is built.
+// provider, which handlers follow on each request.
 ExternalMetrics bool
 ```
 
@@ -76,15 +77,17 @@ ExternalMetrics bool
 
 `retire()` gets a parameter saying whether to reset the meter provider.
 Everything else about `Init` stays as it is: `ErrAlreadyInitialized`, the
-rule about calling it twice, the re-Init caveat, the OTLP endpoint,
+rule about calling it twice, the OTLP endpoint,
 protocol and TLS rules for traces.
 
 ### Instrumentation
 
-No change to `nethttp` or `endpoint`. Both already read the global meter
-provider: `otelhttp` once, when the handler is built, and `endpoint` on
-each use. The provider set by the other component must exist before
-`nethttp.Handler` is called; the docs say so.
+`endpoint` already re-checks the global meter provider on each use.
+`nethttp.Handler` now does the same: otelhttp binds its instruments to the
+provider it is built with, so the handler is rebuilt whenever the global
+provider changes (one atomic load and a comparison per request). The
+other component's provider may therefore be created before or after any
+handler, and a re-Init needs no rebuilt handlers.
 
 ### A malformed endpoint fails later
 
@@ -97,8 +100,8 @@ through the error handler into the log. This is documented, not worked around.
 ### Docs
 
 - README: a short section "Metrics owned by another component", with the
-  `observability` example and the ordering rule.
-- `docs/reference.md`: the field, the table above, the ordering rule.
+  `observability` example.
+- `docs/reference.md`: the field and the table above.
 
 ## Testing
 
