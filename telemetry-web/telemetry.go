@@ -3,7 +3,10 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -36,6 +39,10 @@ type Config struct {
 	// a non-nil pointer is used verbatim, including 0 to never sample new roots.
 	SampleRatio *float64
 	Insecure    bool
+	// ExternalMetrics: another component, such as observability's Publisher,
+	// owns the global MeterProvider. Init then sets up tracing only and never
+	// builds, starts runtime metrics on, sets or resets that provider.
+	ExternalMetrics bool
 }
 
 // ErrAlreadyInitialized is returned by a second Init not preceded by the first
@@ -48,21 +55,44 @@ var (
 	initialized bool
 )
 
+// validEndpoint rejects a malformed Config.OTLPEndpoint before Init changes
+// any global state: a URL form (with "://") must parse, a bare form must be
+// host:port. Endpoints from OTEL_* variables are read by the SDK, not here.
+func validEndpoint(ep string) error {
+	if ep == "" {
+		return nil
+	}
+	var err error
+	if strings.Contains(ep, "://") {
+		_, err = url.Parse(ep)
+	} else {
+		_, _, err = net.SplitHostPort(ep)
+	}
+	if err != nil {
+		return fmt.Errorf("telemetry: invalid OTLP endpoint %q: %w", ep, err)
+	}
+	return nil
+}
+
 // Init wires the global TracerProvider, MeterProvider, propagator, resource,
 // sampler, OTLP exporters, and runtime metrics. Call once in main. The returned
-// shutdown flushes all providers; defer it under a bounded context so an
-// unreachable collector cannot stall process exit.
+// shutdown flushes the providers Init created; defer it under a bounded context
+// so an unreachable collector cannot stall process exit.
+//
+// With Config.ExternalMetrics, Init wires tracing only; see the field.
 //
 // Calling Init twice without an intervening shutdown returns
 // ErrAlreadyInitialized. The returned shutdown is safe to call more than once;
 // after it runs, Init may be called again.
 //
-// Re-Init caveat: an http.Handler built before the re-Init keeps producing spans
-// but stops producing http.server.* metrics, because otelhttp resolves its meter
-// once at construction. Rebuild the handler if you depend on those metrics.
+// Handlers follow the global MeterProvider on each request, so a re-Init
+// needs no rebuilt handlers.
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, retErr error) {
 	if cfg.ServiceName == "" {
 		return nil, errors.New("telemetry: Config.ServiceName is required")
+	}
+	if err := validEndpoint(cfg.OTLPEndpoint); err != nil {
+		return nil, err
 	}
 
 	initMu.Lock()
@@ -76,7 +106,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	// wired to a shut-down pipeline instead of to a noop.
 	defer func() {
 		if retErr != nil {
-			retire()
+			retire(!cfg.ExternalMetrics)
 		}
 	}()
 
@@ -137,21 +167,8 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	)
 	otel.SetTracerProvider(tp)
 
-	reader, err := newMetricReader(ctx, cfg)
+	mp, err := startMetrics(ctx, cleanupCtx, cfg, res)
 	if err != nil {
-		_ = tp.Shutdown(cleanupCtx)
-		return nil, err
-	}
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(reader),
-		sdkmetric.WithResource(res),
-	)
-	otel.SetMeterProvider(mp)
-
-	// Bound to mp rather than the global provider so mp.Shutdown retires the
-	// runtime callbacks along with it.
-	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
-		_ = mp.Shutdown(cleanupCtx)
 		_ = tp.Shutdown(cleanupCtx)
 		return nil, err
 	}
@@ -164,8 +181,12 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		once.Do(func() {
 			flushCtx, cancel := flushContext(shutdownCtx)
 			defer cancel()
-			shutdownErr = errors.Join(tp.Shutdown(flushCtx), mp.Shutdown(flushCtx))
-			retire()
+			errs := []error{tp.Shutdown(flushCtx)}
+			if mp != nil {
+				errs = append(errs, mp.Shutdown(flushCtx))
+			}
+			shutdownErr = errors.Join(errs...)
+			retire(!cfg.ExternalMetrics)
 
 			initMu.Lock()
 			initialized = false
@@ -173,6 +194,32 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		})
 		return shutdownErr
 	}, nil
+}
+
+// startMetrics builds the meter provider, makes it the global one and
+// starts the Go runtime metrics on it. With ExternalMetrics another
+// component owns metrics, so it does nothing and returns nil.
+func startMetrics(ctx, cleanupCtx context.Context, cfg Config, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
+	if cfg.ExternalMetrics {
+		return nil, nil
+	}
+	reader, err := newMetricReader(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+
+	// Bound to mp rather than the global provider so mp.Shutdown retires the
+	// runtime callbacks along with it.
+	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
+		_ = mp.Shutdown(cleanupCtx)
+		return nil, err
+	}
+	return mp, nil
 }
 
 // flushFloor bounds a flush whose caller left it unbounded, or handed over a
@@ -198,7 +245,9 @@ func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
 
 // retire points the global providers at noops, so a lingering goroutine writes
 // into a noop rather than a dead pipeline. Cached instruments follow on their own,
-// because they compare the global provider on each use.
+// because they compare the global provider on each use. The meter provider is
+// reset only when Init owned it, since with ExternalMetrics another component
+// keeps exporting.
 //
 // It deliberately does NOT restore the propagator or the error handler. Neither
 // holds a pipeline, so neither can write anywhere after shutdown; the propagator
@@ -206,9 +255,11 @@ func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
 // emits a well formed traceparent instead of silently dropping context. Undoing
 // them would mean stashing the pre-Init error handler in package state, which is
 // more machinery than the problem justifies.
-func retire() {
+func retire(ownsMetrics bool) {
 	otel.SetTracerProvider(tracenoop.NewTracerProvider())
-	otel.SetMeterProvider(metricnoop.NewMeterProvider())
+	if ownsMetrics {
+		otel.SetMeterProvider(metricnoop.NewMeterProvider())
+	}
 	ident.SetServiceName("")
 }
 

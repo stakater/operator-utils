@@ -11,10 +11,13 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/felixge/httpsnoop"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -105,10 +108,13 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		inner = Recovery(next)
 	}
 
-	instrumented := otelhttp.NewHandler(inner, "server",
-		otelhttp.WithFilter(func(r *http.Request) bool { return !skipped(r.Context()) }),
-		otelhttp.WithSpanNameFormatter(spanName),
-	)
+	instrumented := &followMeter{build: func(mp metric.MeterProvider) http.Handler {
+		return otelhttp.NewHandler(inner, "server",
+			otelhttp.WithFilter(func(r *http.Request) bool { return !skipped(r.Context()) }),
+			otelhttp.WithSpanNameFormatter(spanName),
+			otelhttp.WithMeterProvider(mp),
+		)
+	}}
 
 	if len(cfg.skipPaths) == 0 {
 		return instrumented
@@ -125,6 +131,41 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 		}
 		instrumented.ServeHTTP(w, r)
 	})
+}
+
+// followMeter rebuilds the otelhttp handler whenever the global
+// MeterProvider changes, as endpoint does for its instruments: otelhttp binds
+// its instruments to the provider it was built with. One atomic load and a
+// comparison per request; a rebuild only on a swap. Assumes a comparable
+// MeterProvider, as every SDK implementation is.
+type followMeter struct {
+	build   func(metric.MeterProvider) http.Handler
+	mu      sync.Mutex
+	current atomic.Pointer[boundHandler]
+}
+
+type boundHandler struct {
+	mp metric.MeterProvider
+	h  http.Handler
+}
+
+func (f *followMeter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.handler().ServeHTTP(w, r)
+}
+
+func (f *followMeter) handler() http.Handler {
+	mp := otel.GetMeterProvider()
+	if b := f.current.Load(); b != nil && b.mp == mp {
+		return b.h
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b := f.current.Load(); b != nil && b.mp == mp {
+		return b.h
+	}
+	b := &boundHandler{mp: mp, h: f.build(mp)}
+	f.current.Store(b)
+	return b.h
 }
 
 // trackWrites returns w wrapped so responded reports whether anything has been
