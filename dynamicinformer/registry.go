@@ -45,20 +45,91 @@ type EventCallback struct {
 
 type handlerRegistration struct {
 	registration cache.ResourceEventHandlerRegistration
+	released     chan struct{} // closed when this consumer releases the key
 }
 
 // WatchEntry tracks an active informer and its per-consumer handler registrations.
 type WatchEntry struct {
 	cancel   context.CancelFunc
+	done     <-chan struct{} // closed once the informer is stopped
 	informer cache.SharedIndexInformer
 	handlers map[string]*handlerRegistration // keyed by consumerID
 }
 
-// WatchRegistration is returned to the consumer as a handle for optional cache sync.
+// WatchRegistration is returned to the consumer as a handle for optional cache
+// sync and cache reads.
 type WatchRegistration struct {
 	Key        WatchKey
 	ConsumerID string
 	HasSynced  cache.InformerSynced
+	informer   cache.SharedIndexInformer
+	released   <-chan struct{} // this consumer released the key
+	done       <-chan struct{} // the shared watch stopped
+}
+
+// ErrWatchStopped is returned by GetIndexer once this consumer released the key
+// (ReleaseAll or a later EnsureWatchSet without it), or parentCtx was cancelled.
+var ErrWatchStopped = errors.New("watch stopped")
+
+// GetIndexer returns the cache of the informer behind this watch. It is shared
+// with every other consumer of the same WatchKey, so treat its objects as read only.
+// Keys follow the InformerFunc's key func. Returns ErrWatchStopped if the watch has
+// already stopped for this consumer. Keep the registration, not the indexer, and
+// call GetIndexer on every read.
+func (w *WatchRegistration) GetIndexer() (cache.Indexer, error) {
+	if w.informer == nil {
+		return nil, errors.New("registration was not returned by EnsureWatchSet")
+	}
+	if isClosed(w.released) || isClosed(w.done) {
+		return nil, ErrWatchStopped
+	}
+	return w.informer.GetIndexer(), nil
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// newRegistration builds the handle for consumerID, whose handler must already
+// be on entry.
+func newRegistration(key WatchKey, consumerID string, entry *WatchEntry) *WatchRegistration {
+	return &WatchRegistration{
+		Key:        key,
+		ConsumerID: consumerID,
+		HasSynced:  entry.informer.HasSynced,
+		informer:   entry.informer,
+		released:   entry.handlers[consumerID].released,
+		done:       entry.done,
+	}
+}
+
+// InformerFunc builds the informer for a watch key on the given client. It must
+// return a fresh, unstarted, non nil informer that the registry then owns: it is
+// started and stopped with the watch. Set the key func, transform and indexers
+// here, before Run.
+//
+// It is called while the registry holds its lock, so it must be quick and must not
+// call back into the registry. A returned error or nil informer fails
+// EnsureWatchSet for that call and releases the client. A panic propagates after
+// the call is rolled back the same way. A typed nil pointer is not detected.
+type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error)
+
+// RegistryOption configures a WatchRegistry.
+type RegistryOption func(*WatchRegistry)
+
+// WithInformerFunc replaces the default dynamic informer constructor, for example
+// with a cluster aware informer. A nil f keeps the default.
+func WithInformerFunc(f InformerFunc) RegistryOption {
+	return func(r *WatchRegistry) {
+		if f != nil {
+			r.newInformer = f
+		}
+	}
 }
 
 // ClientProvider supplies the dynamic client for a given identity. The identity
@@ -79,14 +150,16 @@ type ClientProvider interface {
 //
 // The registry pairs the calls one to one: for every ClientFor call that
 // returned a client, Release is called exactly once with the same identity,
-// when the informer started with that client stops. A provider that caches
-// clients per identity can therefore keep a reference count per identity and
-// evict the client when the count reaches zero.
+// when the registry drops the informer started with that client, or right
+// away if building that informer fails. A provider that caches clients per
+// identity can therefore keep a reference count per identity and evict the
+// client when the count reaches zero.
 //
 // Like ClientFor, Release runs while the registry holds its own lock, so it
-// must not call back into the registry. Informers stopped by cancelling the
-// parent context are not released; that path is for shutdown. Providers that
-// do not implement this interface are never notified.
+// must not call back into the registry. Cancelling the parent context stops
+// informers without dropping them, so their Release comes later, when the key
+// is next released or pruned. Providers that do not implement this interface
+// are never notified.
 type ClientReleaser interface {
 	Release(identity string)
 }
@@ -119,7 +192,7 @@ type WatchRegistry struct {
 	clients      ClientProvider
 	releaser     ClientReleaser // nil unless clients implements it
 	resyncPeriod time.Duration
-	newInformer  func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer // seam for tests
+	newInformer  InformerFunc
 }
 
 // NewWatchRegistry creates a new registry backed by the given dynamic client.
@@ -127,15 +200,15 @@ type WatchRegistry struct {
 // to serve watches under multiple identities.
 // The resyncPeriod controls how often each informer relists from the API server.
 // A non-zero value is required to recover from dropped events (30s is typical).
-func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duration) *WatchRegistry {
-	return NewWatchRegistryWithProvider(singleClientProvider{client: dynamicClient}, resyncPeriod)
+func NewWatchRegistry(dynamicClient dynamic.Interface, resyncPeriod time.Duration, opts ...RegistryOption) *WatchRegistry {
+	return NewWatchRegistryWithProvider(singleClientProvider{client: dynamicClient}, resyncPeriod, opts...)
 }
 
 // NewWatchRegistryWithProvider creates a registry that resolves the client for
 // each watch from the provider, keyed by WatchKey.Identity.
-func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry {
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration, opts ...RegistryOption) *WatchRegistry {
 	releaser, _ := provider.(ClientReleaser)
-	return &WatchRegistry{
+	r := &WatchRegistry{
 		watches:      make(map[WatchKey]*WatchEntry),
 		consumerKeys: make(map[string]map[WatchKey]struct{}),
 		clients:      provider,
@@ -143,17 +216,21 @@ func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Dur
 		resyncPeriod: resyncPeriod,
 		newInformer:  newDynamicInformer,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // newDynamicInformer builds the informer for a watch key on the given client.
-func newDynamicInformer(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
+func newDynamicInformer(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
 	factory := kubedynamicinformer.NewFilteredDynamicSharedInformerFactory(
 		cli,
 		resyncPeriod,
 		key.Namespace,
 		nil,
 	)
-	return factory.ForResource(key.GVR).Informer()
+	return factory.ForResource(key.GVR).Informer(), nil
 }
 
 // extractObject unwraps an object from the informer event, handling tombstones.
@@ -248,43 +325,30 @@ func (r *WatchRegistry) EnsureWatchSet(
 	var newlyAdded []WatchKey // keys where AddEventHandler was called (for rollback)
 	newCurrent := make(map[WatchKey]struct{}, len(watches))
 
+	// A panic in the InformerFunc would skip the rollback below and leave keys
+	// added earlier in this call running untracked. Roll them back, then re-panic.
+	defer func() {
+		if p := recover(); p != nil {
+			_ = r.rollbackNewlyAddedLocked(consumerID, newlyAdded, nil)
+			panic(p)
+		}
+	}()
+
 	for _, w := range watches {
 		key := w.Key
 		newCurrent[key] = struct{}{}
 
 		entry, exists := r.watches[key]
 		if !exists {
-			cli, err := r.clients.ClientFor(key.Identity)
-			if err == nil && cli == nil {
-				// The provider is caller-supplied; guard against (nil, nil) so
-				// the failure surfaces here instead of a panic inside the informer.
-				err = fmt.Errorf("ClientFor returned a nil client")
+			var err error
+			if entry, err = r.startWatchLocked(parentCtx, key); err != nil {
+				return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded, err)
 			}
-			if err != nil {
-				return nil, r.rollbackNewlyAddedLocked(consumerID, newlyAdded,
-					fmt.Errorf("failed to get client for %v: %w", key, err))
-			}
-
-			ctx, cancel := context.WithCancel(parentCtx)
-
-			informer := r.newInformer(cli, key, r.resyncPeriod)
-			go informer.Run(ctx.Done())
-
-			entry = &WatchEntry{
-				cancel:   cancel,
-				informer: informer,
-				handlers: make(map[string]*handlerRegistration),
-			}
-			r.watches[key] = entry
 		}
 
 		// Deduplicate: already registered for this consumer
 		if _, ok := entry.handlers[consumerID]; ok {
-			regs = append(regs, &WatchRegistration{
-				Key:        key,
-				ConsumerID: consumerID,
-				HasSynced:  entry.informer.HasSynced,
-			})
+			regs = append(regs, newRegistration(key, consumerID, entry))
 			continue
 		}
 
@@ -301,14 +365,11 @@ func (r *WatchRegistry) EnsureWatchSet(
 
 		entry.handlers[consumerID] = &handlerRegistration{
 			registration: reg,
+			released:     make(chan struct{}),
 		}
 		newlyAdded = append(newlyAdded, key)
 
-		regs = append(regs, &WatchRegistration{
-			Key:        key,
-			ConsumerID: consumerID,
-			HasSynced:  entry.informer.HasSynced,
-		})
+		regs = append(regs, newRegistration(key, consumerID, entry))
 	}
 
 	// All new handlers succeeded — now remove stale watches
@@ -322,6 +383,49 @@ func (r *WatchRegistry) EnsureWatchSet(
 	r.consumerKeys[consumerID] = newCurrent
 
 	return regs, errors.Join(errs...)
+}
+
+// startWatchLocked gets a client, builds the informer for key and starts it. If
+// the InformerFunc fails, returns nil or panics, the client is released and
+// nothing is stored, so the caller only has to roll back. Caller must hold r.mu.
+func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey) (*WatchEntry, error) {
+	cli, err := r.clients.ClientFor(key.Identity)
+	if err == nil && cli == nil {
+		// The provider is caller supplied; guard against (nil, nil) so the
+		// failure surfaces here instead of a panic inside the informer.
+		err = fmt.Errorf("ClientFor returned a nil client")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get client for %v: %w", key, err)
+	}
+
+	// Deferred so the client is also released when the InformerFunc panics.
+	started := false
+	defer func() {
+		if !started && r.releaser != nil {
+			r.releaser.Release(key.Identity)
+		}
+	}()
+
+	informer, err := r.newInformer(cli, key, r.resyncPeriod)
+	if err == nil && informer == nil {
+		err = errors.New("InformerFunc returned a nil informer")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to build informer for %v: %w", key, err)
+	}
+
+	ctx, cancel := context.WithCancel(parentCtx)
+	entry := &WatchEntry{
+		cancel:   cancel,
+		done:     ctx.Done(),
+		informer: informer,
+		handlers: make(map[string]*handlerRegistration),
+	}
+	r.watches[key] = entry
+	go informer.Run(ctx.Done())
+	started = true
+	return entry, nil
 }
 
 // rollbackNewlyAddedLocked releases the watches added earlier in the same
@@ -387,6 +491,7 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 	}
 
 	delete(entry.handlers, consumerID)
+	close(hr.released)
 
 	// Keep consumerKeys in sync
 	if keys, ok := r.consumerKeys[consumerID]; ok {
@@ -410,8 +515,8 @@ func (r *WatchRegistry) releaseWatchLocked(key WatchKey, consumerID string) erro
 
 // stopWatchLocked stops the informer behind key, forgets it, and gives its
 // client back to a provider that implements ClientReleaser. It is the only
-// place an informer stops, so each Release pairs with the ClientFor that
-// started the informer. Caller must hold r.mu.
+// place a started informer is dropped, so each Release pairs with the ClientFor
+// that started the informer. Caller must hold r.mu.
 func (r *WatchRegistry) stopWatchLocked(key WatchKey, entry *WatchEntry) {
 	entry.cancel()
 	delete(r.watches, key)

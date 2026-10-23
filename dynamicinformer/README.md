@@ -106,7 +106,7 @@ Releases all watches for a consumer. Idempotent — calling on an unknown consum
 ### `NewWatchRegistryWithProvider`
 
 ```go
-func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration) *WatchRegistry
+func NewWatchRegistryWithProvider(provider ClientProvider, resyncPeriod time.Duration, opts ...RegistryOption) *WatchRegistry
 ```
 
 Creates a registry that resolves the client for each watch from `provider`, keyed by `WatchKey.Identity`. Watches under different identities never share an informer, even for the same GVR and namespace, since they may be authorized differently. The registry treats the identity as an opaque string; what it maps to (impersonation, a token, another cluster) is the provider's concern. `NewWatchRegistry` is the single-client form: it serves the empty identity only and rejects any other.
@@ -125,6 +125,43 @@ type ClientReleaser interface {
 ```
 
 `ClientFor` is called every time an informer starts, so providers should cache clients per identity. A provider that also implements `ClientReleaser` can bound that cache with a reference count: increment in `ClientFor`, decrement in `Release`, evict at zero. Both calls run while the registry holds its lock, so they must not call back into the registry. Providers that do not implement `ClientReleaser` are never notified.
+
+### `WithInformerFunc`
+
+```go
+type InformerFunc func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error)
+
+func WithInformerFunc(f InformerFunc) RegistryOption
+```
+
+Replaces how the registry builds informers. Pass it to either constructor. `WithInformerFunc(nil)` keeps the default dynamic informer.
+
+- Return a fresh, unstarted, non nil informer. The registry owns it and starts and stops it with the watch, so never return one from a long lived factory.
+- Set the key func, transform and indexers here, before `Run`. Every informer of the registry is built the same way, so a consumer that needs different ones uses its own registry.
+- The func runs while the registry holds its lock, like `ClientFor`. Keep it quick and never call back into the registry.
+- A returned error or a nil informer fails `EnsureWatchSet` for that call, rolls back the keys it added and releases the client. A panic propagates to the caller after the call is rolled back and the client released, like an error. A typed nil pointer is not detected and panics inside `Run`.
+
+Example with a kcp cluster aware informer, keyed `cluster|namespace/name`:
+
+```go
+func newClusterAwareInformer(cli dynamic.Interface, key di.WatchKey, resync time.Duration) (cache.SharedIndexInformer, error) {
+    ri := cli.Resource(key.GVR).Namespace(key.Namespace) // "" lists all namespaces
+    lw := &cache.ListWatch{
+        ListWithContextFunc:  func(ctx context.Context, o metav1.ListOptions) (runtime.Object, error) { return ri.List(ctx, o) },
+        WatchFuncWithContext: func(ctx context.Context, o metav1.ListOptions) (watch.Interface, error) { return ri.Watch(ctx, o) },
+    }
+    inf := kcpinformers.NewSharedIndexInformerWithOptions(lw, &unstructured.Unstructured{}, cache.SharedIndexInformerOptions{
+        ResyncPeriod: resync,
+        Indexers:     cache.Indexers{kcpcache.ClusterIndexName: kcpcache.ClusterIndexFunc},
+    })
+    if err := inf.SetTransform(dropManagedFields); err != nil {
+        return nil, err
+    }
+    return inf, nil
+}
+
+registry := di.NewWatchRegistryWithProvider(provider, 30*time.Second, di.WithInformerFunc(newClusterAwareInformer))
+```
 
 ## Convenience Callbacks
 
@@ -279,6 +316,10 @@ for _, reg := range regs {
 }
 ```
 
+After sync, `reg.GetIndexer()` returns the informer's cache (`GetByKey`, `List`, `ByIndex`). The cache is shared with every consumer of the same key, so treat its objects as read only. Cache keys come from the `InformerFunc`: with the kcp example above they are `cluster|namespace/name`, so `GetByKey("ns/name")` finds nothing.
+
+`GetIndexer` returns `ErrWatchStopped` once this consumer released the key (`ReleaseAll`, or a later `EnsureWatchSet` without it) or `parentCtx` was cancelled. Keep the registration, not the indexer, and call `GetIndexer` on every read, so a stopped watch is noticed. `HasSynced` is unchanged: it reports whether the shared informer has synced.
+
 ## Running the Interactive Example
 
 An interactive example program is included that demonstrates the registry against a live cluster.
@@ -361,14 +402,17 @@ kind delete cluster --name demo
 | Expose `HasSynced` instead of waiting internally | Most consumers don't need the guarantee — resync catches missed events. Those who do can opt in. |
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
-| Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor`, so a provider can reference-count without knowing anything about informers. |
+| Indexers and transform on the `InformerFunc`, not on `WatchRequest` | The informer is shared per `WatchKey`, so per request options would conflict. Fixing them per registry keeps sharing safe without comparing funcs. |
+| Optional `ClientReleaser` over a `Release` method on `ClientProvider` | Existing providers keep working unchanged. The registry type-asserts once at construction and pairs one `Release` with every `ClientFor` that returned a client (a `(nil, nil)` result is rejected and not released), so a provider can reference-count without knowing anything about informers. |
 
 ## Known Limitations
 
 - **Event gap during initial list.** Handlers registered before the informer syncs may miss events. Use `HasSynced` to wait if needed.
 - **Informer startup errors are not surfaced programmatically.** The reflector retries with backoff and logs errors. Monitor reflector logs for persistent failures (RBAC, missing GVR).
-- **Parent context cancellation is not a release.** Cancelling `parentCtx` stops every informer but leaves registry entries in place and never calls `Release`. It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running.
-- **Lock held during informer creation.** The registry mutex is held while creating the factory and launching the goroutine. The goroutine launch is cheap and list/watch happens asynchronously, but heavily customized REST configs with slow transport initialization could stall other callers.
+- **Parent context cancellation is not a release.** It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running. Cancelling `parentCtx` stops its informers but leaves their entries in place: registrations return `ErrWatchStopped`, and `Release` is called only when the key is later released or pruned. A later `EnsureWatchSet` keeps using the stopped entries: a consumer that already holds the key gets a dead registration with no error, and another consumer may fail to add its handler, depending on whether `Run` has returned yet. Do not reuse the registry after cancelling `parentCtx`.
+- **A shared informer runs under the first consumer's `parentCtx`.** If consumers pass different contexts and that one is cancelled, the informer stops for every consumer of the key. Pass the same long lived context (the manager's) from every consumer.
+- **Stopped registrations keep their informer.** A registration references its informer, so a stopped informer's cache stays in memory while the registration is held. Refresh registrations from the latest `EnsureWatchSet` and drop old ones.
+- **Lock held during informer creation.** `ClientFor`, the `InformerFunc` and `Release` all run under the registry mutex. Keep them quick and never call back into the registry: the mutex is not reentrant, so a callback deadlocks, and a slow func stalls every other caller. The default informer does no I/O while being built, list and watch start in `Run`.
 - **All handlers on a shared informer receive all events.** Filtering is each handler's responsibility.
 
 ## Testing

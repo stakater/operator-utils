@@ -2,16 +2,21 @@ package dynamicinformer
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/tools/cache"
@@ -1386,12 +1391,12 @@ func TestClientReleaser_AddEventHandlerFailureStopsFreshInformer(t *testing.T) {
 
 	// Hand the registry an informer that has already stopped, so
 	// AddEventHandler fails deterministically on a freshly started entry.
-	registry.newInformer = func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) cache.SharedIndexInformer {
-		informer := newDynamicInformer(cli, key, resyncPeriod)
+	registry.newInformer = func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		informer, _ := newDynamicInformer(cli, key, resyncPeriod)
 		stop := make(chan struct{})
 		close(stop)
 		informer.Run(stop)
-		return informer
+		return informer, nil
 	}
 
 	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
@@ -1965,4 +1970,364 @@ func TestEnqueueByOwnerAnnotationCallback_ChannelFull(t *testing.T) {
 
 	// Should not block or panic when channel is full
 	cb.OnAdd(obj)
+}
+
+func newTeamConfigMap(name, team string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetAPIVersion("v1")
+	obj.SetKind("ConfigMap")
+	obj.SetNamespace("default")
+	obj.SetName(name)
+	obj.SetLabels(map[string]string{"team": team})
+	return obj
+}
+
+func indexByTeam(obj interface{}) ([]string, error) {
+	return []string{obj.(*unstructured.Unstructured).GetLabels()["team"]}, nil
+}
+
+// newFailingRegistry returns a registry whose InformerFunc runs fail for secrets
+// and builds the default informer for anything else.
+func newFailingRegistry(t *testing.T, fail func() (cache.SharedIndexInformer, error)) (*WatchRegistry, *fakeReleasingProvider, context.Context) {
+	t.Helper()
+	provider := newFakeReleasingProvider()
+	informerFunc := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		if key.GVR == secretsGVR {
+			return fail()
+		}
+		return newDynamicInformer(cli, key, resyncPeriod)
+	}
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second, WithInformerFunc(informerFunc))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return registry, provider, ctx
+}
+
+// assertEmptyAndReleased checks that a failed EnsureWatchSet left no state and
+// released every client it acquired.
+func assertEmptyAndReleased(t *testing.T, registry *WatchRegistry, provider *fakeReleasingProvider) {
+	t.Helper()
+	registry.mu.Lock()
+	if len(registry.watches) != 0 || len(registry.consumerKeys) != 0 {
+		t.Errorf("expected no state left, got %d watches, %d consumers", len(registry.watches), len(registry.consumerKeys))
+	}
+	registry.mu.Unlock()
+	acquired, released := provider.acquired(), provider.released()
+	slices.Sort(acquired)
+	slices.Sort(released)
+	if len(acquired) == 0 || !slices.Equal(released, acquired) {
+		t.Errorf("expected every acquired client released, acquired %v, released %v", acquired, released)
+	}
+}
+
+func failingWatches() []WatchRequest {
+	return []WatchRequest{
+		{Key: WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}, Callback: noopCallback()},
+		{Key: WatchKey{GVR: secretsGVR, Namespace: "default", Identity: "team-b/reader"}, Callback: noopCallback()},
+	}
+}
+
+func TestWithInformerFunc_UsedForNewWatches(t *testing.T) {
+	// The func runs on the calling goroutine under r.mu, so no lock is needed.
+	var built []WatchKey
+	counting := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		built = append(built, key)
+		return newDynamicInformer(cli, key, resyncPeriod)
+	}
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second, WithInformerFunc(counting))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmKey := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	secretKey := WatchKey{GVR: secretsGVR, Namespace: "default"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: cmKey}, {Key: secretKey}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: cmKey}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !slices.Equal(built, []WatchKey{cmKey, secretKey}) {
+		t.Errorf("expected one informer per distinct key, got %v", built)
+	}
+}
+
+func TestWithInformerFunc_IndexerReachable(t *testing.T) {
+	scheme := runtime.NewScheme()
+	cli := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{configmapsGVR: "ConfigMapList"},
+		newTeamConfigMap("a", "x"), newTeamConfigMap("b", "y"))
+	withTeamIndex := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		informer, _ := newDynamicInformer(cli, key, resyncPeriod)
+		return informer, informer.AddIndexers(cache.Indexers{"byTeam": indexByTeam})
+	}
+	registry := NewWatchRegistry(cli, 30*time.Second, WithInformerFunc(withTeamIndex))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), regs[0].HasSynced) {
+		t.Fatal("informer did not sync")
+	}
+
+	indexer, err := regs[0].GetIndexer()
+	if err != nil {
+		t.Fatalf("GetIndexer: %v", err)
+	}
+	objs, err := indexer.ByIndex("byTeam", "x")
+	if err != nil {
+		t.Fatalf("ByIndex: %v", err)
+	}
+	if len(objs) != 1 || objs[0].(*unstructured.Unstructured).GetName() != "a" {
+		t.Errorf("expected only default/a for team x, got %v", objs)
+	}
+}
+
+func TestGetIndexer_SharedAcrossConsumers(t *testing.T) {
+	registry, ctx, cancel := newFakeRegistry(t)
+	defer cancel()
+
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	regs1, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	regs2, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	indexer1, err1 := regs1[0].GetIndexer()
+	indexer2, err2 := regs2[0].GetIndexer()
+	if err1 != nil || err2 != nil || indexer1 == nil || indexer1 != indexer2 {
+		t.Error("expected both consumers to read the same indexer")
+	}
+}
+
+func TestWithInformerFunc_NilInformerRollsBack(t *testing.T) {
+	registry, provider, ctx := newFailingRegistry(t, func() (cache.SharedIndexInformer, error) {
+		return nil, nil
+	})
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", failingWatches()); err == nil {
+		t.Fatal("expected error for a nil informer")
+	}
+	assertEmptyAndReleased(t, registry, provider)
+}
+
+func TestWithInformerFunc_PanicRollsBack(t *testing.T) {
+	registry, provider, ctx := newFailingRegistry(t, func() (cache.SharedIndexInformer, error) {
+		panic("boom")
+	})
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected the panic to propagate")
+			}
+		}()
+		_, _ = registry.EnsureWatchSet(ctx, "consumer-1", failingWatches())
+	}()
+
+	// The key added before the panic is rolled back too, not just the failing one.
+	assertEmptyAndReleased(t, registry, provider)
+	// The registry lock must be free again.
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestWithInformerFunc_ErrorRollsBack(t *testing.T) {
+	registry, provider, ctx := newFailingRegistry(t, func() (cache.SharedIndexInformer, error) {
+		return nil, errors.New("transform failed")
+	})
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", failingWatches())
+	if err == nil || !strings.Contains(err.Error(), "transform failed") {
+		t.Fatalf("expected the InformerFunc error, got %v", err)
+	}
+	assertEmptyAndReleased(t, registry, provider)
+}
+
+func TestWithInformerFunc_NilInformerKeepsPreviousWatchSet(t *testing.T) {
+	registry, _, ctx := newFailingRegistry(t, func() (cache.SharedIndexInformer, error) { return nil, nil })
+	watches := failingWatches()
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", watches[:1]); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", watches); err == nil {
+		t.Fatal("expected error for a nil informer")
+	}
+
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	entry, ok := registry.watches[watches[0].Key]
+	if !ok || entry.handlers["consumer-1"] == nil {
+		t.Error("expected the previous watch and handler to stay")
+	}
+	if _, ok := registry.consumerKeys["consumer-1"][watches[0].Key]; !ok || len(registry.watches) != 1 {
+		t.Errorf("expected consumer-1 to keep only its previous key, got %d watches", len(registry.watches))
+	}
+}
+
+func TestWithInformerFunc_NilFuncKeepsDefault(t *testing.T) {
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second, WithInformerFunc(nil))
+	if reflect.ValueOf(registry.newInformer).Pointer() != reflect.ValueOf(InformerFunc(newDynamicInformer)).Pointer() {
+		t.Error("expected WithInformerFunc(nil) to keep the default constructor")
+	}
+}
+
+func TestWithInformerFunc_CalledAgainAfterRelease(t *testing.T) {
+	calls := 0
+	counting := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		calls++
+		return newDynamicInformer(cli, key, resyncPeriod)
+	}
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second, WithInformerFunc(counting))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("expected a fresh informer after release, func called %d times", calls)
+	}
+}
+
+func TestWithInformerFunc_CallbacksFire(t *testing.T) {
+	scheme := runtime.NewScheme()
+	cli := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{configmapsGVR: "ConfigMapList"},
+		newTeamConfigMap("a", "x"))
+	plainInformer := func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		ri := cli.Resource(key.GVR).Namespace(key.Namespace)
+		lw := &cache.ListWatch{
+			ListWithContextFunc:  func(ctx context.Context, o metav1.ListOptions) (runtime.Object, error) { return ri.List(ctx, o) },
+			WatchFuncWithContext: func(ctx context.Context, o metav1.ListOptions) (watch.Interface, error) { return ri.Watch(ctx, o) },
+		}
+		// The fake client lacks watch list support, the same wrapper client-go's dynamic informer uses.
+		return cache.NewSharedIndexInformer(cache.ToListWatcherWithWatchListSemantics(lw, cli), &unstructured.Unstructured{}, resyncPeriod, cache.Indexers{}), nil
+	}
+	registry := NewWatchRegistry(cli, 30*time.Second, WithInformerFunc(plainInformer))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	added := make(chan string, 1)
+	cb := EventCallback{OnAdd: func(obj *unstructured.Unstructured) { added <- obj.GetName() }}
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}, Callback: cb}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	select {
+	case name := <-added:
+		if name != "a" {
+			t.Errorf("expected OnAdd for a, got %s", name)
+		}
+	case <-ctx.Done():
+		t.Fatal("OnAdd did not fire on the custom informer")
+	}
+}
+
+func TestGetIndexer_ErrorsAfterRelease(t *testing.T) {
+	registry, ctx, cancel := newFakeRegistry(t)
+	defer cancel()
+
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := regs[0].GetIndexer(); err != nil {
+		t.Fatalf("expected a live indexer, got %v", err)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), regs[0].HasSynced) {
+		t.Fatal("informer did not sync")
+	}
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := regs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
+		t.Errorf("expected ErrWatchStopped after release, got %v", err)
+	}
+	// HasSynced keeps the informer's last value; GetIndexer is the one that
+	// reports the stop.
+	if !regs[0].HasSynced() {
+		t.Error("expected HasSynced to stay true after release")
+	}
+}
+
+func TestGetIndexer_ErrorsAfterOneConsumerReleases(t *testing.T) {
+	registry, ctx, cancel := newFakeRegistry(t)
+	defer cancel()
+
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	regs1, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	regs2, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// consumer-1 drops the key, consumer-2 keeps the shared informer running.
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: secretsGVR, Namespace: "default"}}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := regs1[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
+		t.Errorf("expected ErrWatchStopped for the consumer that dropped the key, got %v", err)
+	}
+	if _, err := regs2[0].GetIndexer(); err != nil {
+		t.Errorf("expected the other consumer's indexer to stay live, got %v", err)
+	}
+}
+
+func TestGetIndexer_ZeroValueErrors(t *testing.T) {
+	if _, err := (&WatchRegistration{}).GetIndexer(); err == nil {
+		t.Error("expected an error from a registration not returned by EnsureWatchSet")
+	}
+}
+
+func TestReleaseAll_DeadEntryReleasedOnce(t *testing.T) {
+	provider := newFakeReleasingProvider()
+	registry := NewWatchRegistryWithProvider(provider, 30*time.Second)
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default", Identity: "team-a/reader"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancel()
+	if got := provider.released(); len(got) != 0 {
+		t.Fatalf("expected no release on cancel alone, got %v", got)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := registry.ReleaseAll("consumer-1"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected the dead entry released exactly once, got %v", got)
+	}
+}
+
+func TestGetIndexer_ErrorsAfterParentCancel(t *testing.T) {
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancel()
+	if _, err := regs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
+		t.Errorf("expected ErrWatchStopped after parentCtx cancel, got %v", err)
+	}
 }
