@@ -44,12 +44,50 @@ Must satisfy `naming.ValidateMetricName`:
 Reserved prefixes match metrics that come from the Go runtime,
 controller-runtime, or other OTel-internal sources. Allowing custom
 metrics with these prefixes would create ambiguous time series
-downstream.
+downstream, and would now genuinely collide: the Prometheus reader
+exposes custom metrics on the same registry those sources use. The same
+prefixes also keep the OTLP bridge able to tell our families apart from
+controller-runtime's by name alone.
+
+Counter names may end in `_total` or not: the Prometheus exporter appends
+that suffix only when it is missing, so `reconcile` and `reconcile_total`
+are both served as `reconcile_total`.
+
+Pick one spelling per metric. Because both land on the same `/metrics`
+family, registering both on one publisher would give that family two
+sources, which fails the whole registry's gather and makes controller-runtime
+serve a 500 on every scrape. Registration therefore reserves the translated
+name as well as the one you passed, and the second registration fails:
+
+```
+metric "reconcile_total" collides with metric "reconcile": both are served as "reconcile_total" on /metrics
+```
+
+The same applies across instrument types, since only counters get the
+suffix: a Gauge named `widgets_total` and a Counter named `widgets` are
+one family on `/metrics`, and the second one is rejected. The name you
+pass is never rewritten, only checked.
 
 Names are tracked across instrument types. Registering a Counter named
 `"reconcile_total"` makes a subsequent Gauge or Histogram registration
 with the same name fail — even though they are different instrument
 shapes at the OTel level.
+
+The registry the Prometheus reader writes to (controller-runtime's by
+default) is checked too. If you already register a family there with
+`client_golang`, for example `myop_widgets_total` kept from before the
+migration, registering `myop_widgets` here fails instead of breaking
+every scrape:
+
+```
+metric "myop_widgets": "myop_widgets_total" is already on the Prometheus registry: ...
+```
+
+This only catches metrics registered before yours, which is the usual
+case for package-level vars. A `client_golang` metric with the same name
+registered after it is accepted by the registry, and every scrape of
+`/metrics` then fails. Register your `client_golang` metrics first, or
+pick names that differ.
 
 ### `description string`
 

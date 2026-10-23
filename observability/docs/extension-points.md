@@ -83,19 +83,29 @@ The right-hand resource's attributes overwrite the left-hand resource's
 on key conflict — see [the OTel resource docs](https://opentelemetry.io/docs/specs/otel/resource/sdk/#merge)
 for the merge semantics.
 
-## bridge.ControllerRuntimeProducer
+## bridge.ProducerFor and bridge.ControllerRuntimeProducer
 
 ```go
 import "github.com/stakater/operator-utils/observability/pkg/bridge"
 
-producer := bridge.ControllerRuntimeProducer()
+producer := bridge.ProducerFor(myGatherer)
+producer = bridge.ControllerRuntimeProducer() // ProducerFor(ctrlmetrics.Registry)
 ```
 
-Returns a `metric.Producer` that reads from controller-runtime's existing
-`prometheus.Registry`. Attach it to a `PeriodicReader` via
-`sdkmetric.WithProducer` to push controller-runtime metrics through OTLP
-(or any other Reader) without touching the registry or the `/metrics`
-endpoint.
+`ProducerFor(g)` returns a `metric.Producer` that reads from any
+`prometheus.Gatherer` you give it. Attach it to a `PeriodicReader` via
+`sdkmetric.WithProducer` to push those metrics through OTLP without
+writing them into an OTel-native path.
+
+`ControllerRuntimeProducer()` is `ProducerFor` fixed to
+controller-runtime's existing `prometheus.Registry`, for the common case
+of bridging only controller-runtime's own metrics.
+
+Do not attach an unfiltered producer to a Reader whose provider also
+writes into the same registry, such as the Prometheus exporter: the
+metrics it writes would be gathered straight back out and exported
+twice. Give `ProducerFor` a gatherer that filters those families out
+instead, the way `publisher.New` does internally.
 
 ### When to use
 
@@ -109,18 +119,21 @@ reader := sdkmetric.NewPeriodicReader(otlpExporter,
 )
 ```
 
+Reach for `ProducerFor` directly when the registry to bridge is not
+simply controller-runtime's default one, or when you need to filter it
+yourself.
+
 ### Why this flow exists
 
 The bridge is the only mechanism this module uses to get
-controller-runtime's Prometheus-native metrics into OTLP. The alternative
-— writing OTel metrics back into the Prometheus registry via the OTel
-Prometheus exporter — would create a duplication loop: every custom
-metric would round-trip through the registry and be re-exported via the
-bridge, ending up in OTLP twice.
+controller-runtime's Prometheus-native metrics into OTLP. The
+alternative — writing OTel metrics back into the Prometheus registry via
+the OTel Prometheus exporter — would create a duplication loop: every
+custom metric would round-trip through the registry and be re-exported
+via the bridge, ending up in OTLP twice.
 
-By keeping the flow one-directional (Prometheus → bridge → OTLP), the
-module avoids the loop. There is intentionally no support in this
-module for the reverse direction.
+By keeping the flow one-directional (Prometheus → bridge → OTLP) for the
+families the bridge reads, the module avoids the loop.
 
 ## bridge.StartGoRuntime
 
