@@ -89,6 +89,7 @@ else is optional and falls back to standard `OTEL_*` env vars, then defaults.
 | `OTLPEndpoint`   | `string`   | Optional collector endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT`.   |
 | `SampleRatio`    | `*float64` | `nil` = unset; a non-nil pointer is used verbatim, **including `0`** to never sample new roots. |
 | `Insecure`       | `bool`     | Export without TLS (local/dev collector).                               |
+| `ExternalMetrics`| `bool`     | Another component owns the global MeterProvider; `Init` sets up tracing only. See below. |
 
 **Environment variables** (config fields take precedence):
 
@@ -119,6 +120,32 @@ tracecontext + baggage). See [the reference](docs/reference.md) for the full lis
 
 Sampling is `ParentBased(TraceIDRatioBased(ratio))`, so a service honors an upstream
 sampling decision — you never get half a trace.
+
+### Metrics owned by another component
+
+An operator that serves its metrics on controller-runtime's `/metrics`
+through the `observability` module's `Publisher` can still use
+telemetry-web for tracing and HTTP instrumentation. Create the `Publisher`
+first, then call `Init` with `ExternalMetrics`:
+
+```go
+pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})
+// handle err
+shutdown, err := telemetry.Init(ctx, telemetry.Config{
+    ServiceName:     "my-operator",
+    ExternalMetrics: true,
+})
+```
+
+`Init` then builds no meter provider, starts no Go runtime metrics, and
+never sets or resets the global MeterProvider; shutdown flushes traces
+only. The HTTP and `endpoint` metrics record into the `Publisher`'s
+provider, so build handlers after both calls: `otelhttp` reads the global
+provider once, when the handler is built.
+
+In this mode a malformed OTLP endpoint does not make `Init` fail. The
+trace exporter checks it lazily, so the error shows up through the error
+handler in the log when spans are exported.
 
 ---
 

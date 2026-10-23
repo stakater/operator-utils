@@ -112,6 +112,7 @@ type Config struct {
     OTLPEndpoint   string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317
     SampleRatio    *float64 // optional — nil = use env/default; a set pointer (incl. &0.0) is used verbatim
     Insecure       bool     // export without TLS (dev/local collector)
+    ExternalMetrics bool    // another component owns the global MeterProvider; Init sets up tracing only
 }
 ```
 
@@ -647,6 +648,10 @@ on it: an `http.Handler` built by `nethttp.Handler` **before** the re-`Init`
 `endpoint.*` metrics survive either way, because the `endpoint` package compares the
 global `MeterProvider` on each use and rebuilds its instruments when it changes.
 Rebuild the handler after a re-`Init` if you depend on `http.server.*`.
+
+With `ExternalMetrics`, shutdown flushes and retires the tracer provider
+only. The global MeterProvider belongs to the component that owns metrics
+and is left as it is, also when `Init` fails.
 
 ---
 
