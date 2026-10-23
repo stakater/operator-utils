@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/otlptranslator"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -29,8 +30,14 @@ var promNamer = otlptranslator.NewMetricNamer("", otlptranslator.UnderscoreEscap
 // fails to gather when that happens, which controller-runtime serves as
 // a 500 on every scrape, so reserve rejects the second registration
 // instead.
+//
+// The same failure happens when the operator already registered that
+// family on the registry with client_golang, so reserve checks reg too.
 type CustomMetrics struct {
 	meter metric.Meter
+	// reg is the registry the Prometheus reader writes to, nil when the
+	// reader is off.
+	reg prometheus.Registerer
 
 	mu sync.Mutex
 	// names maps every claimed name to the metric that claimed it. A
@@ -72,6 +79,11 @@ func (c *CustomMetrics) reserve(name, description string, typ otlptranslator.Met
 		}
 		return fmt.Errorf("metric %q collides with metric %q: both are served as %q on /metrics", name, owner, promName)
 	}
+	if c.reg != nil {
+		if err := claimedOn(c.reg, promName); err != nil {
+			return fmt.Errorf("metric %q: %q is already on the Prometheus registry: %w", name, promName, err)
+		}
+	}
 	for _, key := range keysFor(name, promName) {
 		c.names[key] = name
 	}
@@ -90,6 +102,20 @@ func (c *CustomMetrics) release(name string, typ otlptranslator.MetricType) {
 	for _, key := range keysFor(name, promName) {
 		delete(c.names, key)
 	}
+}
+
+// claimedOn returns an error when name is already a family on reg.
+// Registry has no lookup API, and Gather misses vecs with no series yet,
+// so it registers a throwaway descriptor and lets the registry's own
+// duplicate check answer. Our OTel collector is unchecked, so this only
+// sees collectors registered by others.
+func claimedOn(reg prometheus.Registerer, name string) error {
+	probe := prometheus.NewCounter(prometheus.CounterOpts{Name: name, Help: "name probe"})
+	if err := reg.Register(probe); err != nil {
+		return err
+	}
+	reg.Unregister(probe)
+	return nil
 }
 
 // keysFor returns the reservation keys for a metric, deduplicated: the

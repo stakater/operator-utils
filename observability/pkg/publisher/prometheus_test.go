@@ -158,6 +158,26 @@ func TestPrometheus_GaugeCollidingWithCounterIsRejected(t *testing.T) {
 	}
 }
 
+// Operators migrating to the SDK may already register the same family
+// with client_golang. A vec with no series yet must be caught too: it is
+// what a package-level var looks like before the first reconcile.
+func TestPrometheus_NameOnRegistryIsRejected(t *testing.T) {
+	p, reg := newPromPublisher(t, Config{DisableGoRuntime: true})
+	reg.MustRegister(prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "myop_widgets_total", Help: "legacy"}, []string{"kind"}))
+
+	if _, err := p.Custom().Counter("myop_widgets", "new"); err == nil {
+		t.Fatal("Counter(\"myop_widgets\") was accepted; myop_widgets_total is already on the registry")
+	}
+
+	// The check must not leave anything behind on a free name.
+	p.Custom().MustCounter("myop_free", "d").Inc(context.Background())
+	p.Custom().MustCounter("myop_other", "d").Inc(context.Background())
+	if names := gatheredNames(t, reg); !hasName(names, "myop_free_total") {
+		t.Fatalf("want myop_free_total on /metrics, got %v", names)
+	}
+}
+
 func TestPrometheus_DisabledRegistersNothing(t *testing.T) {
 	_, reg := newPromPublisher(t, Config{
 		DisableGoRuntime:  true,

@@ -157,6 +157,9 @@ func New(ctx context.Context, cfg Config) (*Publisher, error) {
 
 	meter := provider.Meter("github.com/stakater/operator-utils/observability/pkg/publisher")
 	custom := &CustomMetrics{meter: meter}
+	if rs.prometheus != nil {
+		custom.reg = cfg.Prometheus.Registerer
+	}
 
 	if !cfg.DisableGoRuntime {
 		if err := bridge.StartGoRuntime(); err != nil {

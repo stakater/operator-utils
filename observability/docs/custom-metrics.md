@@ -73,6 +73,22 @@ Names are tracked across instrument types. Registering a Counter named
 with the same name fail — even though they are different instrument
 shapes at the OTel level.
 
+The registry the Prometheus reader writes to (controller-runtime's by
+default) is checked too. If you already register a family there with
+`client_golang`, for example `myop_widgets_total` kept from before the
+migration, registering `myop_widgets` here fails instead of breaking
+every scrape:
+
+```
+metric "myop_widgets": "myop_widgets_total" is already on the Prometheus registry: ...
+```
+
+This only catches metrics registered before yours, which is the usual
+case for package-level vars. A `client_golang` metric with the same name
+registered after it is accepted by the registry, and every scrape of
+`/metrics` then fails. Register your `client_golang` metrics first, or
+pick names that differ.
+
 ### `description string`
 
 Must be non-empty. The description is passed through to the OTel SDK as
