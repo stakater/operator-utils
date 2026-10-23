@@ -14,6 +14,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/stakater/operator-utils/telemetry-web/endpoint"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 	"github.com/stakater/operator-utils/telemetry-web/nethttp"
 )
 
@@ -26,7 +27,10 @@ func ownMeterProvider(t *testing.T) (*sdkmetric.MeterProvider, *sdkmetric.Manual
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
-	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prev)
+		_ = mp.Shutdown(context.Background())
+	})
 	return mp, reader
 }
 
@@ -88,6 +92,11 @@ func TestExternalMetrics_ShutdownLeavesTheCallersMeterProvider(t *testing.T) {
 // (the endpoint check runs first), so the failure path's reset is tested on
 // retire itself.
 func TestRetireLeavesAMeterProviderItDoesNotOwn(t *testing.T) {
+	prevTP, prevName := otel.GetTracerProvider(), ident.ServiceName()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		ident.SetServiceName(prevName)
+	})
 	mp, _ := ownMeterProvider(t)
 
 	retire(false)

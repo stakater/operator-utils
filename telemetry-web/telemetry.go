@@ -39,12 +39,9 @@ type Config struct {
 	// a non-nil pointer is used verbatim, including 0 to never sample new roots.
 	SampleRatio *float64
 	Insecure    bool
-	// ExternalMetrics tells Init that another component owns the global
-	// MeterProvider, for example observability's Publisher. Init then sets
-	// up tracing only: it builds no meter provider, starts no Go runtime
-	// metrics, and never sets or resets the global MeterProvider. The HTTP
-	// and endpoint instrumentation records into that provider, which
-	// handlers follow on each request.
+	// ExternalMetrics: another component, such as observability's Publisher,
+	// owns the global MeterProvider. Init then sets up tracing only and never
+	// builds, starts runtime metrics on, sets or resets that provider.
 	ExternalMetrics bool
 }
 
@@ -79,11 +76,10 @@ func validEndpoint(ep string) error {
 
 // Init wires the global TracerProvider, MeterProvider, propagator, resource,
 // sampler, OTLP exporters, and runtime metrics. Call once in main. The returned
-// shutdown flushes all providers; defer it under a bounded context so an
+// shutdown flushes the providers Init created; defer it under a bounded context so an
 // unreachable collector cannot stall process exit.
 //
-// With Config.ExternalMetrics, Init wires tracing only and leaves the global
-// MeterProvider, and the Go runtime metrics, to the component that owns them.
+// With Config.ExternalMetrics, Init wires tracing only; see the field.
 //
 // Calling Init twice without an intervening shutdown returns
 // ErrAlreadyInitialized. The returned shutdown is safe to call more than once;
@@ -171,7 +167,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	)
 	otel.SetTracerProvider(tp)
 
-	mp, err := startMetrics(ctx, cfg, res)
+	mp, err := startMetrics(ctx, cleanupCtx, cfg, res)
 	if err != nil {
 		_ = tp.Shutdown(cleanupCtx)
 		return nil, err
@@ -203,7 +199,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 // startMetrics builds the meter provider, makes it the global one and
 // starts the Go runtime metrics on it. With ExternalMetrics another
 // component owns metrics, so it does nothing and returns nil.
-func startMetrics(ctx context.Context, cfg Config, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
+func startMetrics(ctx, cleanupCtx context.Context, cfg Config, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
 	if cfg.ExternalMetrics {
 		return nil, nil
 	}
@@ -220,7 +216,7 @@ func startMetrics(ctx context.Context, cfg Config, res *resource.Resource) (*sdk
 	// Bound to mp rather than the global provider so mp.Shutdown retires the
 	// runtime callbacks along with it.
 	if err := runtime.Start(runtime.WithMeterProvider(mp)); err != nil {
-		_ = mp.Shutdown(context.WithoutCancel(ctx))
+		_ = mp.Shutdown(cleanupCtx)
 		return nil, err
 	}
 	return mp, nil
@@ -250,8 +246,8 @@ func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
 // retire points the global providers at noops, so a lingering goroutine writes
 // into a noop rather than a dead pipeline. Cached instruments follow on their own,
 // because they compare the global provider on each use. The meter provider is
-// reset only when Init owned it: with ExternalMetrics it belongs to another
-// component, which keeps exporting after tracing stops.
+// reset only when Init owned it, since with ExternalMetrics another component
+// keeps exporting.
 //
 // It deliberately does NOT restore the propagator or the error handler. Neither
 // holds a pipeline, so neither can write anywhere after shutdown; the propagator

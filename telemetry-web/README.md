@@ -149,6 +149,14 @@ provider: handlers follow the global MeterProvider on each request.
 `Init` rejects a malformed `OTLPEndpoint` in both modes; endpoints from
 `OTEL_*` variables are checked by the SDK when exporting.
 
+`Init` installs OpenTelemetry's process-wide error handler, so SDK errors
+from the component that owns metrics are logged through telemetry-web's
+logger as well, and the handler stays after shutdown.
+
+Give telemetry-web's `ServiceName` and the metrics owner's service name (the
+`Publisher`'s `OperatorName`) the same value, or traces and metrics land
+under two services.
+
 ---
 
 ## Exported API

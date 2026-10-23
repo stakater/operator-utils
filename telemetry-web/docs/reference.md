@@ -156,6 +156,10 @@ component's provider may be created before or after the handler is built.
 `Init` rejects a malformed `OTLPEndpoint` in both modes; endpoints from
 `OTEL_*` variables are checked by the SDK when exporting.
 
+`Init` installs OpenTelemetry's process-wide error handler, so SDK errors
+from the component that owns metrics are logged through telemetry-web's
+logger as well, and the handler stays after shutdown.
+
 ### OTLP transport
 
 `OTEL_EXPORTER_OTLP_PROTOCOL`, and the per-signal
@@ -673,7 +677,6 @@ resolves its tracer per request and rebuilds its otelhttp handler when the globa
 instruments. No handler needs rebuilding.
 
 With `ExternalMetrics`, re-`Init` does not swap the meter provider at all.
-
 
 ---
 

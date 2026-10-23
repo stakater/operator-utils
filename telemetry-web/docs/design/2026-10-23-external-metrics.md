@@ -57,14 +57,16 @@ All agreed on 2026-10-23.
 ### The field
 
 ```go
-// ExternalMetrics tells Init that another component owns the global
-// MeterProvider, for example observability's Publisher. Init then sets up
-// tracing only; the HTTP and endpoint instrumentation records into that
-// provider, which handlers follow on each request.
+// ExternalMetrics: another component, such as observability's Publisher,
+// owns the global MeterProvider. Init then sets up tracing only and never
+// builds, starts runtime metrics on, sets or resets that provider.
 ExternalMetrics bool
 ```
 
 ### What Init does when it is set
+
+Implemented in `telemetry.go`: `Init` and `startMetrics`, which returns
+early in this mode.
 
 | Step                                        | Default | `ExternalMetrics` |
 | ------------------------------------------- | ------- | ----------------- |
@@ -76,15 +78,17 @@ ExternalMetrics bool
 | shutdown flushes                            | traces, metrics | traces only |
 | shutdown or failure resets to no-op         | both providers | tracer only |
 
-`retire()` gets a parameter saying whether to reset the meter provider.
+`retire()` (`telemetry.go`) gets a parameter saying whether to reset the
+meter provider.
 Everything else about `Init` stays as it is: `ErrAlreadyInitialized`, the
 rule about calling it twice, the OTLP endpoint,
 protocol and TLS rules for traces.
 
 ### Instrumentation
 
-`endpoint` already re-checks the global meter provider on each use.
-`nethttp.Handler` now does the same: otelhttp binds its instruments to the
+`endpoint` already re-checks the global meter provider on each use
+(`endpoint/endpoint.go`, `get()`). `nethttp.Handler` now does the same
+(`nethttp/nethttp.go`, `followMeter`): otelhttp binds its instruments to the
 provider it is built with, so the handler is rebuilt whenever the global
 provider changes (one atomic load and a comparison per request). The
 other component's provider may therefore be created before or after any
@@ -119,7 +123,11 @@ Written test first, in this module:
    `ExternalMetrics`, one request through `nethttp.Handler` and one
    `endpoint.Instrument`. The reader holds `http.server.request.duration`
    and `endpoint.duration`, and no `go.*` runtime metrics.
-5. The existing tests pass unchanged, covering the default mode.
+5. The existing tests pass, covering the default mode. The failure-path
+   test for the default mode now calls `retire(true)` directly
+   (`TestRetireResetsBothProvidersWhenItOwnsMetrics`).
+6. `nethttp.Handler` records into the provider that is global when the
+   request arrives (`TestHandlerFollowsTheGlobalMeterProvider`).
 
 ## Out of scope
 
