@@ -2,8 +2,6 @@ name: Test
 
 on:
   pull_request:
-    branches:
-      - master
   push:
     branches:
       - master
@@ -26,7 +24,7 @@ jobs:
       modules: ${{ steps.find.outputs.modules }}
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # Every directory holding a go.mod is a module, so a new module is tested
       # as soon as it lands, without touching this file.
@@ -48,11 +46,11 @@ jobs:
         module: ${{ fromJSON(needs.discover.outputs.modules) }}
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # Modules pin different Go versions, so each uses its own.
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: ${{ matrix.module }}/go.sum

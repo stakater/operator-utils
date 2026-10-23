@@ -8,7 +8,7 @@ runs:
   using: composite
   steps:
     - name: Set up Go (telemetry toolchain)
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@v7
       with:
         go-version-file: telemetry-web/go.mod
         cache-dependency-path: |

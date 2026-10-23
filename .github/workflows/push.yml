@@ -18,14 +18,14 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal token
           fetch-depth: 0 # otherwise, you will fail to push refs to dest repo
 
       - name: Set up Go
         id: go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GOLANG_VERSION }}
 
@@ -37,7 +37,7 @@ jobs:
           args: --timeout 10m
 
       - name: Push Latest Tag
-        uses: anothrNick/github-tag-action@1.26.0
+        uses: anothrNick/github-tag-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.STAKATER_GITHUB_TOKEN }}
           WITH_V: true
