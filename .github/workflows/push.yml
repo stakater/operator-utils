@@ -14,7 +14,8 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
       - name: Check out code
         uses: actions/checkout@v7
@@ -38,7 +39,7 @@ jobs:
       - name: Push Latest Tag
         uses: anothrNick/github-tag-action@1.75.0
         env:
-          GITHUB_TOKEN: ${{ secrets.STAKATER_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WITH_V: true
           DEFAULT_BUMP: patch
 
