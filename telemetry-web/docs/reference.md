@@ -667,8 +667,8 @@ caller that logs the error and keeps serving gets a service that records nothing
 rather than one wired to a provider it already shut down.
 
 With `MeterProvider`, shutdown flushes and retires the tracer provider
-only. The provider belongs to the component that owns metrics: it is left
-as the global one, also when `Init` fails.
+only. The provider belongs to the component that owns metrics: `Init`
+never resets it, also when it fails.
 
 ### Re-`Init` after shutdown
 
