@@ -42,7 +42,7 @@ jobs:
       # on push. Pinning to head.sha would test the branch, not what merging
       # would actually produce.
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Validate telemetry
         uses: ./telemetry-web/.github/actions/validate
@@ -57,10 +57,10 @@ jobs:
         module: ["", adapters/gin, adapters/echo, adapters/chi]
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: telemetry-web/go.mod
           cache-dependency-path: |

@@ -11,18 +11,27 @@ package bridge
 import (
 	"fmt"
 
+	"github.com/prometheus/client_golang/prometheus"
 	bridgeprom "go.opentelemetry.io/contrib/bridges/prometheus"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel/sdk/metric"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// ProducerFor returns a Prometheus bridge Producer that reads from g. Use
+// it when the metrics to bridge are not simply everything in
+// controller-runtime's registry, for example when SDK metrics share that
+// registry and must be filtered out.
+func ProducerFor(g prometheus.Gatherer) metric.Producer {
+	return bridgeprom.NewMetricProducer(bridgeprom.WithGatherer(g))
+}
+
 // ControllerRuntimeProducer returns a Prometheus bridge Producer that
-// reads from controller-runtime's existing prometheus.Registry. Attach
-// it to an OTLP PeriodicReader via sdkmetric.WithProducer to push
-// controller-runtime metrics through OTLP without touching the registry.
+// reads from controller-runtime's existing prometheus.Registry. Attach it
+// to a Reader via sdkmetric.WithProducer to pull controller-runtime
+// metrics into OTel without writing to the registry.
 func ControllerRuntimeProducer() metric.Producer {
-	return bridgeprom.NewMetricProducer(bridgeprom.WithGatherer(ctrlmetrics.Registry))
+	return ProducerFor(ctrlmetrics.Registry)
 }
 
 // StartGoRuntime starts Go runtime metric collection via otel/contrib.

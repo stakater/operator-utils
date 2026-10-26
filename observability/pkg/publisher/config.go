@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // Config configures a Publisher. The zero value with only OperatorName set
-// is a valid configuration that enables both default instrumentations
-// (controller-runtime bridge and Go runtime).
+// is a valid configuration. The controller-runtime bridge is always on;
+// Go runtime instrumentation is on by default and can be disabled.
 type Config struct {
 	// OperatorName is required. Used for the service.name resource attribute.
 	OperatorName string
@@ -24,12 +26,17 @@ type Config struct {
 	// constructed from env-derived defaults.
 	OTLP *OTLPConfig
 
+	// Prometheus, if non-nil, tunes the Prometheus reader. A nil value means
+	// the reader runs with defaults; use DisablePrometheus to turn it off.
+	Prometheus *PrometheusConfig
+
+	// DisablePrometheus disables the Prometheus reader that exposes SDK
+	// metrics on controller-runtime's /metrics endpoint. Zero value means
+	// the reader is enabled.
+	DisablePrometheus bool
+
 	// Stdout enables a stdout metric exporter for local development. Default false.
 	Stdout bool
-
-	// DisableControllerRuntimeBridge disables the bridge producer that feeds
-	// controller-runtime metrics into OTLP. Zero value means bridge enabled.
-	DisableControllerRuntimeBridge bool
 
 	// DisableGoRuntime disables Go runtime instrumentation. Zero value means
 	// runtime metrics enabled.
@@ -37,6 +44,28 @@ type Config struct {
 
 	// Logger is optional. Defaults to logr.Discard().
 	Logger logr.Logger
+}
+
+// PrometheusConfig tunes the Prometheus reader, which exposes SDK metrics
+// on the Prometheus registry controller-runtime already serves at /metrics.
+type PrometheusConfig struct {
+	// Registerer is the registry to expose metrics on. Defaults to
+	// controller-runtime's global registry, i.e. the manager's /metrics.
+	//
+	// Supported values are that registry, or a registry controller-runtime
+	// does not serve. A wrapper around controller-runtime's registry
+	// (prometheus.WrapRegistererWithPrefix, WrapRegistererWith) is not
+	// supported: it rewrites metric names on the way in, the OTLP bridge
+	// cannot compute the rewritten names, and every metric would reach the
+	// collector twice.
+	//
+	// Whatever you pass must be a registry something actually scrapes.
+	// Only controller-runtime's default is wired to an endpoint for you.
+	Registerer prometheus.Registerer
+
+	// DisableTargetInfo drops the target_info metric carrying the resource
+	// attributes (service.name, service.version, ...). Zero value keeps it.
+	DisableTargetInfo bool
 }
 
 // OTLPConfig configures the OTLP exporter.
@@ -70,6 +99,19 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.OTLP != nil {
 		applyOTLPDefaults(cfg.OTLP)
+	}
+	if !cfg.DisablePrometheus {
+		// Copy before defaulting. cfg is passed by value but Prometheus is
+		// a pointer, so writing through it would mutate the struct the
+		// caller still holds.
+		p := PrometheusConfig{}
+		if cfg.Prometheus != nil {
+			p = *cfg.Prometheus
+		}
+		if p.Registerer == nil {
+			p.Registerer = ctrlmetrics.Registry
+		}
+		cfg.Prometheus = &p
 	}
 }
 
