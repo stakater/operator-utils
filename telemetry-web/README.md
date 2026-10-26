@@ -126,8 +126,7 @@ sampling decision — you never get half a trace.
 An operator that serves its metrics on controller-runtime's `/metrics`
 through the `observability` module's `Publisher` can still use
 telemetry-web for tracing and HTTP instrumentation. Pass the `Publisher`'s
-provider (`Publisher.MeterProvider()` comes with operator-utils #28) as
-`MeterProvider`:
+provider as `MeterProvider`:
 
 ```go
 pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})

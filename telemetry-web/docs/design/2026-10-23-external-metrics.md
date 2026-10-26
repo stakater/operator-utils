@@ -6,8 +6,8 @@
 - **Consumer that drives it:** cloud-orchestrator-gateway. Its half of the
   design is in that repository, in `docs/superpowers/specs/`,
   `2026-10-23-gateway-metrics-on-prometheus-design.md`.
-- **Depends on:** operator-utils #28, which lets the `observability`
-  module serve metrics on controller-runtime's `/metrics`.
+- **Depends on:** operator-utils #28 (merged), which lets the
+  `observability` module serve metrics on controller-runtime's `/metrics`.
 
 ## Why
 
@@ -132,5 +132,7 @@ Written test first, in this module:
 
 - A Prometheus exporter inside `telemetry-web`. Metrics on `/metrics` are
   `observability`'s job.
-- Changes to `observability`; #28 is used as it is.
+- Changes to `observability` beyond one accessor:
+  `Publisher.MeterProvider()`, added with this change so callers can pass
+  the provider to `Config.MeterProvider`.
 - The gateway's wiring, chart and ServiceMonitor: see the gateway's spec.

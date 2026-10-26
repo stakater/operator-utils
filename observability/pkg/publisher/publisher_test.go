@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -203,5 +204,23 @@ func TestPrometheus_SecondReaderOnCtrlRegistryIsRejected(t *testing.T) {
 
 	if _, err := ctrlmetrics.Registry.Gather(); err != nil {
 		t.Fatalf("/metrics is broken after a second New: %v", err)
+	}
+}
+
+// MeterProvider hands the Publisher's provider to libraries that take one,
+// such as telemetry-web's Config.MeterProvider: it is the provider New made
+// global, not a copy.
+func TestPublisher_MeterProviderIsTheGlobalOne(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
+
+	p, err := New(context.Background(), Config{OperatorName: "op", DisablePrometheus: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Shutdown(context.Background())
+
+	if got := p.MeterProvider(); got == nil || got != otel.GetMeterProvider() {
+		t.Errorf("MeterProvider() = %v, want the global provider New installed", got)
 	}
 }
