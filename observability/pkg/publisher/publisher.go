@@ -182,6 +182,10 @@ func (p *Publisher) Custom() *CustomMetrics { return p.custom }
 // advanced users who need direct SDK access; most consumers should use Custom().
 func (p *Publisher) Meter() metric.Meter { return p.meter }
 
+// MeterProvider returns the provider New made global, for libraries that take
+// one, such as telemetry-web's Config.MeterProvider.
+func (p *Publisher) MeterProvider() metric.MeterProvider { return p.provider }
+
 // Shutdown flushes pending metrics and releases resources. It honors ctx
 // cancellation and always returns nil: errors from the final flush (e.g.
 // collector unreachable, or a double-shutdown on the provider) are logged

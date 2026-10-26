@@ -140,8 +140,8 @@ func Setup() {
 }
 
 // Reset drops recorded spans so a subtest sees only the spans it produced.
-// Metrics stay cumulative — the instruments are bound to the provider installed
-// by Setup and cannot be rebound — so assert on deltas instead.
+// Metrics stay cumulative — the instruments stay bound to the provider installed
+// by Setup, which is never replaced — so assert on deltas instead.
 func Reset() {
 	if spans != nil {
 		spans.Reset()

@@ -8,6 +8,8 @@ topology — you have two paths:
 1. **Escape-hatch into the SDK.** `pub.Meter()` returns the underlying
    `metric.Meter`, so you can use OTel SDK APIs directly while keeping
    the publisher's resource attributes, OTLP wiring, and shutdown.
+   `pub.MeterProvider()` returns the provider itself, for libraries that
+   take one, such as telemetry-web's `Config.MeterProvider`.
 2. **Bypass the publisher entirely.** Wire your own `MeterProvider` and
    use the `resource` and `bridge` packages as standalone building
    blocks to keep the module's conventions.

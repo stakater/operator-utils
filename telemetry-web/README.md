@@ -86,9 +86,10 @@ else is optional and falls back to standard `OTEL_*` env vars, then defaults.
 | `ServiceName`    | `string`   | **Required.** How this service labels itself on every span/metric/log.  |
 | `ServiceVersion` | `string`   | Optional build/version tag. Omitted from the resource when empty.       |
 | `Environment`    | `string`   | Optional `"prod"`/`"staging"`/… Omitted from the resource when empty.   |
-| `OTLPEndpoint`   | `string`   | Optional collector endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT`.   |
+| `OTLPEndpoint`   | `string`   | Optional collector endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT`. `host:port` or a URL; a malformed value, or a host without a port, fails `Init`. |
 | `SampleRatio`    | `*float64` | `nil` = unset; a non-nil pointer is used verbatim, **including `0`** to never sample new roots. |
 | `Insecure`       | `bool`     | Export without TLS (local/dev collector).                               |
+| `MeterProvider`  | `metric.MeterProvider` | Optional. The provider another component owns; `Init` makes it global and sets up tracing only. See below. |
 
 **Environment variables** (config fields take precedence):
 
@@ -119,6 +120,42 @@ tracecontext + baggage). See [the reference](docs/reference.md) for the full lis
 
 Sampling is `ParentBased(TraceIDRatioBased(ratio))`, so a service honors an upstream
 sampling decision — you never get half a trace.
+
+### Metrics owned by another component
+
+An operator that serves its metrics on controller-runtime's `/metrics`
+through the `observability` module's `Publisher` can still use
+telemetry-web for tracing and HTTP instrumentation. Pass the `Publisher`'s
+provider as `MeterProvider`:
+
+```go
+pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})
+// handle err
+defer func() { _ = pub.Shutdown(ctx) }()
+
+shutdown, err := telemetry.Init(ctx, telemetry.Config{
+    ServiceName:   "my-operator",
+    MeterProvider: pub.MeterProvider(),
+})
+// handle err
+defer func() { _ = shutdown(ctx) }()
+```
+
+`Init` then builds no meter provider and starts no Go runtime metrics; it
+makes the given provider the global one. Shutdown flushes traces only and
+never flushes or resets that provider. The HTTP and `endpoint` metrics
+record into it: handlers follow the global MeterProvider on each request.
+
+`Init` rejects a malformed `OTLPEndpoint` in both modes; endpoints from
+`OTEL_*` variables are checked by the SDK when exporting.
+
+`Init` installs OpenTelemetry's process-wide error handler, so SDK errors
+from the component that owns metrics are logged through telemetry-web's
+logger as well, and the handler stays after shutdown.
+
+Give telemetry-web's `ServiceName` and the metrics owner's service name (the
+`Publisher`'s `OperatorName`) the same value, or traces and metrics land
+under two services.
 
 ---
 
@@ -406,9 +443,8 @@ you: latency for work that is not an inbound HTTP request.
 - **`Init` is once per process, until you shut it down.** A second call without an
   intervening shutdown returns `ErrAlreadyInitialized`, because the first pair of
   providers would be orphaned with no path to `Shutdown`. After the returned
-  shutdown runs, `Init` may be called again. One caveat: a handler built before a
-  re-`Init` keeps producing spans but stops producing `http.server.*` metrics, since
-  `otelhttp` resolves its meter once at construction. Rebuild the handler.
+  shutdown runs, `Init` may be called again. Handlers follow the global
+  MeterProvider on each request, so a re-`Init` needs no rebuilt handlers.
 - Async boundaries (queues) and background goroutines don't carry `ctx` — pass it
   through, or inject/extract trace context in message metadata, to keep the trace
   alive.
