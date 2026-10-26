@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 )
 
 func TestValidEndpoint(t *testing.T) {
@@ -32,23 +33,25 @@ func TestValidEndpoint(t *testing.T) {
 	}
 }
 
-// The check runs before Init changes anything global, in both modes.
+// The check runs before Init changes anything global, with and without an
+// injected MeterProvider.
 func TestInitRejectsAMalformedEndpointBeforeChangingGlobals(t *testing.T) {
-	for _, external := range []bool{false, true} {
+	owner, _ := newMeterProvider(t)
+	for _, mp := range []metric.MeterProvider{nil, owner} {
 		tp := otel.GetTracerProvider()
 		shutdown, err := Init(context.Background(), Config{
-			ServiceName:     "svc",
-			OTLPEndpoint:    "http://a b c",
-			ExternalMetrics: external,
+			ServiceName:   "svc",
+			OTLPEndpoint:  "http://a b c",
+			MeterProvider: mp,
 		})
 		if err == nil || !strings.Contains(err.Error(), "invalid OTLP endpoint") {
 			if err == nil {
 				_ = shutdown(context.Background())
 			}
-			t.Fatalf("external=%v: Init error = %v, want an invalid OTLP endpoint error", external, err)
+			t.Fatalf("mp=%T: Init error = %v, want an invalid OTLP endpoint error", mp, err)
 		}
 		if got := otel.GetTracerProvider(); got != tp {
-			t.Errorf("external=%v: global TracerProvider changed to %T", external, got)
+			t.Errorf("mp=%T: global TracerProvider changed to %T", mp, got)
 		}
 	}
 

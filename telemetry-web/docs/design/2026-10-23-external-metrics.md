@@ -34,22 +34,20 @@ meter provider to a no-op, which would switch off the operator's metrics.
 
 All agreed on 2026-10-23.
 
-1. **A switch in `Config`, not an injected provider.** The two modules stay
-   independent and meet only through OpenTelemetry's global provider.
-   Injecting a provider (`Config.MeterProvider`) was rejected: the
-   `Publisher` exposes no provider, and it raises questions about who sets
-   and retires the global. Depending on `observability` from `telemetry-web`
-   was rejected: a web library would pull in controller-runtime.
-2. **Named `ExternalMetrics`.** It says what is true: the metrics exist,
-   someone else owns the provider. `DisableMetrics` would suggest the HTTP
-   metrics stop, which they do not.
-3. **Opt in.** The zero value keeps today's behaviour, so finops-gateway
+1. **An injected provider, `Config.MeterProvider`.** Changed in review
+   (#33): the first version was an `ExternalMetrics` switch; an injected
+   provider makes the dependency explicit and works with any provider. A
+   nil pointer behind the interface is rejected. The two modules still
+   stay independent: `telemetry-web` takes the standard
+   `metric.MeterProvider` interface, so it does not depend on
+   `observability` (a web library would pull in controller-runtime).
+2. **Opt in.** The zero value keeps today's behaviour, so finops-gateway
    and any other user is unaffected.
-4. **No environment variable.** `OTEL_METRICS_EXPORTER=none` means "no
-   metrics at all", the opposite of this mode. A code switch is clearer.
-5. **Malformed `Config.OTLPEndpoint` fails `Init` in both modes.** Changed
+3. **No environment variable.** `OTEL_METRICS_EXPORTER=none` means "no
+   metrics at all", the opposite of this mode. A code setting is clearer.
+4. **Malformed `Config.OTLPEndpoint` fails `Init` in both modes.** Changed
    in review (#33): the original decision was no early check.
-6. Changed in review (#33): `nethttp` follows the global MeterProvider per
+5. Changed in review (#33): `nethttp` follows the global MeterProvider per
    request, removing the ordering rule.
 
 ## Design
@@ -57,10 +55,10 @@ All agreed on 2026-10-23.
 ### The field
 
 ```go
-// ExternalMetrics: another component, such as observability's Publisher,
-// owns the global MeterProvider. Init then sets up tracing only and never
-// builds, starts runtime metrics on, sets or resets that provider.
-ExternalMetrics bool
+// MeterProvider, when set, is the provider another component owns, such as
+// observability's Publisher. Init makes it the global one and sets up
+// tracing only; shutdown neither flushes nor resets it.
+MeterProvider metric.MeterProvider
 ```
 
 ### What Init does when it is set
@@ -68,12 +66,12 @@ ExternalMetrics bool
 Implemented in `telemetry.go`: `Init` and `startMetrics`, which returns
 early in this mode.
 
-| Step                                        | Default | `ExternalMetrics` |
+| Step                                        | Default | `MeterProvider` set |
 | ------------------------------------------- | ------- | ----------------- |
 | error handler, service name, resource       | yes     | yes               |
 | propagators, sampler, tracer provider       | yes     | yes               |
 | metric exporter and meter provider          | yes     | **no**            |
-| `otel.SetMeterProvider`                     | yes     | **no**            |
+| `otel.SetMeterProvider`                     | its own | the given one     |
 | Go runtime metrics                          | yes     | **no**            |
 | shutdown flushes                            | traces, metrics | traces only |
 | shutdown or failure resets to no-op         | both providers | tracer only |
@@ -110,22 +108,24 @@ are not checked: the SDK reads them and reports problems when exporting.
 
 Written test first, in this module:
 
-1. With `ExternalMetrics`, the global meter provider after `Init` is the
-   same object the caller set before it.
+1. With `MeterProvider`, the global meter provider after `Init` is the
+   given one, whatever was global before.
 2. After shutdown it is still that object; the tracer provider is the
    no-op.
-3. `retire` with the external flag leaves the meter provider alone. Tested
+3. A nil pointer inside `MeterProvider` is rejected before anything
+   global changes (`TestInitRejectsANilPointerMeterProvider`).
+4. `retire(false)` leaves the meter provider alone. Tested
    directly: since the endpoint check, no input a test can provide fails
    `Init` after it starts changing global state. `retire(true)` is tested
    the same way.
-4. End to end: the caller's provider with a manual reader, `Init` with
-   `ExternalMetrics`, one request through `nethttp.Handler` and one
+5. End to end: the caller's provider with a manual reader, `Init` with
+   `MeterProvider`, one request through `nethttp.Handler` and one
    `endpoint.Instrument`. The reader holds `http.server.request.duration`
    and `endpoint.duration`, and no `go.*` runtime metrics.
-5. The existing tests pass, covering the default mode. The failure-path
+6. The existing tests pass, covering the default mode. The failure-path
    test for the default mode now calls `retire(true)` directly
    (`TestRetireResetsBothProvidersWhenItOwnsMetrics`).
-6. `nethttp.Handler` records into the provider that is global when the
+7. `nethttp.Handler` records into the provider that is global when the
    request arrives (`TestHandlerFollowsTheGlobalMeterProvider`).
 
 ## Out of scope

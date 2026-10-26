@@ -112,7 +112,7 @@ type Config struct {
     OTLPEndpoint    string   // optional — else OTEL_EXPORTER_OTLP_ENDPOINT, else localhost:4317; host:port or a URL, malformed fails Init
     SampleRatio     *float64 // optional — nil = use env/default; a set pointer (incl. &0.0) is used verbatim
     Insecure        bool     // export without TLS (dev/local collector)
-    ExternalMetrics bool     // another component owns the global MeterProvider; Init sets up tracing only
+    MeterProvider   metric.MeterProvider // optional — the provider another component owns; Init makes it global and sets up tracing only
 }
 ```
 
@@ -134,18 +134,19 @@ costs money.
 
 `ServiceName` is required — `Init` returns an error if it is empty.
 
-### Metrics owned by another component (`ExternalMetrics`)
+### Metrics owned by another component (`MeterProvider`)
 
-Set `ExternalMetrics` when another component, such as the `observability`
-module's `Publisher`, owns the global MeterProvider: `Init` then sets up
-tracing only.
+Set `MeterProvider` when another component, such as the `observability`
+module's `Publisher`, owns the metrics: `Init` makes that provider the
+global one and sets up tracing only. A nil pointer inside the interface is
+rejected.
 
-| Step | Default | `ExternalMetrics` |
+| Step | Default | `MeterProvider` set |
 | --- | --- | --- |
 | error handler, service name, resource | yes | yes |
 | propagators, sampler, tracer provider | yes | yes |
 | metric exporter and meter provider | yes | **no** |
-| `otel.SetMeterProvider` | yes | **no** |
+| `otel.SetMeterProvider` | its own | the given one |
 | Go runtime metrics | yes | **no** |
 | shutdown flushes | traces, metrics | traces only |
 | shutdown or failure resets to no-op | both providers | tracer only |
@@ -260,9 +261,9 @@ var ErrAlreadyInitialized error // second Init without an intervening shutdown
 ```
 
 Wires the global `TracerProvider`, `MeterProvider`, propagator, resource,
-sampler, OTLP exporters, and runtime metrics (with `ExternalMetrics` it wires
-tracing only and leaves the MeterProvider and runtime metrics to their
-owner). **Call once in `main`.** The
+sampler, OTLP exporters, and runtime metrics (with `MeterProvider` it wires
+tracing only, makes the given provider global, and leaves runtime metrics to
+its owner). **Call once in `main`.** The
 returned `shutdown` flushes all providers — `defer` it (with your own bounded
 context; the library does not impose a timeout). If a later setup step fails,
 `Init` shuts down anything it already started before returning the error.
@@ -659,15 +660,15 @@ collector `shutdown` may return a non-nil error — that is expected on teardown
 and generally safe to log-and-ignore.
 
 `shutdown` is idempotent, and after it runs the globals are back on noop providers
-(with `ExternalMetrics`, the tracer provider only; see below) with the log
+(with `MeterProvider`, the tracer provider only; see below) with the log
 scope cleared, so a goroutine that outlives it writes into a noop
 rather than into a dead pipeline. A failed `Init` restores the same state, so a
 caller that logs the error and keeps serving gets a service that records nothing
 rather than one wired to a provider it already shut down.
 
-With `ExternalMetrics`, shutdown flushes and retires the tracer provider
-only. The global MeterProvider belongs to the component that owns metrics
-and is left as it is, also when `Init` fails.
+With `MeterProvider`, shutdown flushes and retires the tracer provider
+only. The provider belongs to the component that owns metrics: it is left
+as the global one, also when `Init` fails.
 
 ### Re-`Init` after shutdown
 
@@ -676,7 +677,7 @@ resolves its tracer per request and rebuilds its otelhttp handler when the globa
 `MeterProvider` changes, and the `endpoint` package does the same for its
 instruments. No handler needs rebuilding.
 
-With `ExternalMetrics`, re-`Init` does not swap the meter provider at all.
+With `MeterProvider`, re-`Init` sets the given provider global again.
 
 ---
 

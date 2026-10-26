@@ -89,7 +89,7 @@ else is optional and falls back to standard `OTEL_*` env vars, then defaults.
 | `OTLPEndpoint`   | `string`   | Optional collector endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT`. `host:port` or a URL; a malformed value, or a host without a port, fails `Init`. |
 | `SampleRatio`    | `*float64` | `nil` = unset; a non-nil pointer is used verbatim, **including `0`** to never sample new roots. |
 | `Insecure`       | `bool`     | Export without TLS (local/dev collector).                               |
-| `ExternalMetrics`| `bool`     | Another component owns the global MeterProvider; `Init` sets up tracing only. See below. |
+| `MeterProvider`  | `metric.MeterProvider` | Optional. The provider another component owns; `Init` makes it global and sets up tracing only. See below. |
 
 **Environment variables** (config fields take precedence):
 
@@ -125,8 +125,9 @@ sampling decision — you never get half a trace.
 
 An operator that serves its metrics on controller-runtime's `/metrics`
 through the `observability` module's `Publisher` can still use
-telemetry-web for tracing and HTTP instrumentation. Call `Init` with
-`ExternalMetrics`:
+telemetry-web for tracing and HTTP instrumentation. Pass the `Publisher`'s
+provider (`Publisher.MeterProvider()` comes with operator-utils #28) as
+`MeterProvider`:
 
 ```go
 pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})
@@ -134,17 +135,17 @@ pub, err := publisher.New(ctx, publisher.Config{OperatorName: "my-operator"})
 defer func() { _ = pub.Shutdown(ctx) }()
 
 shutdown, err := telemetry.Init(ctx, telemetry.Config{
-    ServiceName:     "my-operator",
-    ExternalMetrics: true,
+    ServiceName:   "my-operator",
+    MeterProvider: pub.MeterProvider(),
 })
 // handle err
 defer func() { _ = shutdown(ctx) }()
 ```
 
-`Init` then builds no meter provider, starts no Go runtime metrics, and
-never sets or resets the global MeterProvider; shutdown flushes traces
-only. The HTTP and `endpoint` metrics record into the `Publisher`'s
-provider: handlers follow the global MeterProvider on each request.
+`Init` then builds no meter provider and starts no Go runtime metrics; it
+makes the given provider the global one. Shutdown flushes traces only and
+never flushes or resets that provider. The HTTP and `endpoint` metrics
+record into it: handlers follow the global MeterProvider on each request.
 
 `Init` rejects a malformed `OTLPEndpoint` in both modes; endpoints from
 `OTEL_*` variables are checked by the SDK when exporting.

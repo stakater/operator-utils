@@ -1,6 +1,6 @@
 # telemetry-web ExternalMetrics Implementation Plan
 
-> Superseded in review (#33): handlers now follow the global MeterProvider and `Init` checks `OTLPEndpoint`; the spec is current.
+> Superseded in review (#33): handlers now follow the global MeterProvider, `Init` checks `OTLPEndpoint`, and `ExternalMetrics` became `Config.MeterProvider`; the spec is current.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -39,10 +41,10 @@ type Config struct {
 	// a non-nil pointer is used verbatim, including 0 to never sample new roots.
 	SampleRatio *float64
 	Insecure    bool
-	// ExternalMetrics: another component, such as observability's Publisher,
-	// owns the global MeterProvider. Init then sets up tracing only and never
-	// builds, starts runtime metrics on, sets or resets that provider.
-	ExternalMetrics bool
+	// MeterProvider, when set, is the provider another component owns, such as
+	// observability's Publisher. Init makes it the global one and sets up
+	// tracing only; shutdown neither flushes nor resets it.
+	MeterProvider metric.MeterProvider
 }
 
 // ErrAlreadyInitialized is returned by a second Init not preceded by the first
@@ -79,7 +81,7 @@ func validEndpoint(ep string) error {
 // shutdown flushes the providers Init created; defer it under a bounded context
 // so an unreachable collector cannot stall process exit.
 //
-// With Config.ExternalMetrics, Init wires tracing only; see the field.
+// With Config.MeterProvider, Init wires tracing only; see the field.
 //
 // Calling Init twice without an intervening shutdown returns
 // ErrAlreadyInitialized. The returned shutdown is safe to call more than once;
@@ -90,6 +92,9 @@ func validEndpoint(ep string) error {
 func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error, retErr error) {
 	if cfg.ServiceName == "" {
 		return nil, errors.New("telemetry: Config.ServiceName is required")
+	}
+	if v := reflect.ValueOf(cfg.MeterProvider); v.Kind() == reflect.Pointer && v.IsNil() {
+		return nil, errors.New("telemetry: Config.MeterProvider is a nil pointer")
 	}
 	if err := validEndpoint(cfg.OTLPEndpoint); err != nil {
 		return nil, err
@@ -106,7 +111,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 	// wired to a shut-down pipeline instead of to a noop.
 	defer func() {
 		if retErr != nil {
-			retire(!cfg.ExternalMetrics)
+			retire(cfg.MeterProvider == nil)
 		}
 	}()
 
@@ -186,7 +191,7 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 				errs = append(errs, mp.Shutdown(flushCtx))
 			}
 			shutdownErr = errors.Join(errs...)
-			retire(!cfg.ExternalMetrics)
+			retire(cfg.MeterProvider == nil)
 
 			initMu.Lock()
 			initialized = false
@@ -197,10 +202,12 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 }
 
 // startMetrics builds the meter provider, makes it the global one and
-// starts the Go runtime metrics on it. With ExternalMetrics another
-// component owns metrics, so it does nothing and returns nil.
+// starts the Go runtime metrics on it. With Config.MeterProvider another
+// component owns metrics: it keeps exporting and shuts the provider down, so
+// Init only makes it global and returns nil.
 func startMetrics(ctx, cleanupCtx context.Context, cfg Config, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
-	if cfg.ExternalMetrics {
+	if cfg.MeterProvider != nil {
+		otel.SetMeterProvider(cfg.MeterProvider)
 		return nil, nil
 	}
 	reader, err := newMetricReader(ctx, cfg)
@@ -246,8 +253,8 @@ func flushContext(ctx context.Context) (context.Context, context.CancelFunc) {
 // retire points the global providers at noops, so a lingering goroutine writes
 // into a noop rather than a dead pipeline. Cached instruments follow on their own,
 // because they compare the global provider on each use. The meter provider is
-// reset only when Init owned it, since with ExternalMetrics another component
-// keeps exporting.
+// reset only when Init owned it, since with Config.MeterProvider another
+// component keeps exporting.
 //
 // It deliberately does NOT restore the propagator or the error handler. Neither
 // holds a pipeline, so neither can write anywhere after shutdown; the propagator

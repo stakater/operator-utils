@@ -232,7 +232,7 @@ func TestResolveRatio(t *testing.T) {
 // error and keep serving, so the difference is between a service that records
 // nothing and a service wired to a dead pipeline.
 //
-// Init's deferred failure handler calls retire(!cfg.ExternalMetrics). Since the
+// Init's deferred failure handler calls retire(cfg.MeterProvider == nil). Since the
 // endpoint check now rejects bad input before Init touches any global, no input
 // a test can provide fails Init after that point, so the reset is tested here
 // directly (as TestRetireLeavesAMeterProviderItDoesNotOwn does for the other
