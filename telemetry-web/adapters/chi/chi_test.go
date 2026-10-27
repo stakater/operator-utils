@@ -247,12 +247,16 @@ func TestRouteTagNamesRejectedRequests(t *testing.T) {
 	r.Get("/rej/items/{id}", okFunc)
 	sub := chi.NewRouter()
 	sub.Get("/users/{id}", okFunc)
+	sub.Get("/", okFunc)
 	r.Mount("/rej/api", sub)
+	r.Get("/rej/slash/", okFunc)
 
 	tests := []struct{ name, path, wantRoute string }{
 		{"top-level route", "/rej/items/7", "/rej/items/{id}"},
 		{"mounted router", "/rej/api/users/7", "/rej/api/users/{id}"},
 		{"no route matches", "/rej/nope", ""},
+		{"mount root with trailing slash", "/rej/api/", "/rej/api"},
+		{"route registered with trailing slash", "/rej/slash/", "/rej/slash"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) { assertRejected(t, h, tt.path, tt.wantRoute) })
@@ -296,5 +300,59 @@ func TestRouteTagLookupNeedsTheRouter(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) { assertRejected(t, tt.h, "/ctx/items/7", tt.wantRoute) })
+	}
+}
+
+// A rejected request must name the same route as a served one, including for
+// patterns chi trims a trailing "/" from.
+func TestRejectedMatchesServedRoute(t *testing.T) {
+	build := func(reject bool) http.Handler {
+		r := chi.NewRouter()
+		h := Instrument(r)
+		if reject {
+			r.Use(rejectAll)
+		}
+		sub := chi.NewRouter()
+		sub.Get("/", okFunc)
+		r.Mount("/rej/api", sub)
+		r.Get("/rej/slash/", okFunc)
+		return h
+	}
+	served, rejected := build(false), build(true)
+
+	for _, tt := range []struct{ path, route string }{
+		{"/rej/api/", "/rej/api"},
+		{"/rej/slash/", "/rej/slash"},
+	} {
+		t.Run(tt.route, func(t *testing.T) {
+			before := adaptertest.Collect(t)
+			if rec := get(t, served, tt.path); rec.Code != http.StatusOK {
+				t.Fatalf("served status = %d, want 200", rec.Code)
+			}
+			after := adaptertest.Collect(t)
+			if delta := adaptertest.DurationStatusCount(after, tt.route, http.StatusOK) -
+				adaptertest.DurationStatusCount(before, tt.route, http.StatusOK); delta != 1 {
+				t.Errorf("served observations on %q = %d, want 1", tt.route, delta)
+			}
+			assertRejected(t, rejected, tt.path, tt.route)
+		})
+	}
+}
+
+// A method the route does not allow matches nothing, so the rejection
+// carries no route.
+func TestRejectedWrongMethodGetsNoRoute(t *testing.T) {
+	r := chi.NewRouter()
+	h := Instrument(r)
+	r.Use(rejectAll)
+	r.Get("/rej/wrong/{id}", okFunc)
+
+	before := adaptertest.DurationStatusCountNoRoute(adaptertest.Collect(t), http.StatusUnauthorized)
+	req := httptest.NewRequest(http.MethodPost, "/rej/wrong/7", nil)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	after := adaptertest.DurationStatusCountNoRoute(adaptertest.Collect(t), http.StatusUnauthorized)
+
+	if delta := after - before; delta != 1 {
+		t.Errorf("unrouted 401 observations = %d, want 1", delta)
 	}
 }

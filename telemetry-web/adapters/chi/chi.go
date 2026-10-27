@@ -92,7 +92,12 @@ func wouldMatch(r *http.Request) string {
 	if path == "" {
 		path = r.URL.Path
 	}
-	return rctx.Routes.Find(chi.NewRouteContext(), r.Method, path)
+	found := rctx.Routes.Find(chi.NewRouteContext(), r.Method, path)
+	// Find returns the raw pattern; RoutePattern applies the trailing-slash
+	// trim a served request gets, so both name the same http.route.
+	norm := chi.NewRouteContext()
+	norm.RoutePatterns = []string{found}
+	return norm.RoutePattern()
 }
 
 // routePattern returns the matched route pattern, or "" when routing found no
