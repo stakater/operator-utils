@@ -211,6 +211,21 @@ func DurationStatusCount(rm metricdata.ResourceMetrics, route string, status int
 	return total
 }
 
+// DurationStatusCountNoRoute returns the cumulative
+// http.server.request.duration observation count with the given status and
+// no http.route at all: the requests no route was stamped on.
+func DurationStatusCountNoRoute(rm metricdata.ResourceMetrics, status int) uint64 {
+	var total uint64
+	eachHist(rm, "http.server.request.duration", func(dp metricdata.HistogramDataPoint[float64]) {
+		_, routed := dp.Attributes.Value(attribute.Key("http.route"))
+		c, ok := dp.Attributes.Value(attribute.Key("http.response.status_code"))
+		if !routed && ok && c.AsInt64() == int64(status) {
+			total += dp.Count
+		}
+	})
+	return total
+}
+
 // DurationTotal returns the cumulative http.server.request.duration observation
 // count across all attribute sets.
 func DurationTotal(rm metricdata.ResourceMetrics) uint64 {

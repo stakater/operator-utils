@@ -46,19 +46,53 @@ func Recovery() Middleware {
 // RouteTag stamps http.route (the matched route pattern) on the server span and
 // the duration metric, and renames the span to "{method} {route}". chi fills in
 // RoutePattern during routing, before the handler runs, so the stamp is
-// deferred and survives a panic unwinding past it. Unmatched requests are
-// skipped.
+// deferred and survives a panic unwinding past it.
+//
+// Middleware that answers before chi routes (authentication returning 401,
+// say) leaves RoutePattern empty. RouteTag then stamps the pattern chi would
+// have matched, so the rejection is attributed to its route. A request that
+// matches no route gets none. The lookup needs the router in the routing
+// context (chi sets it; a context made with chi.NewRouteContext needs Routes
+// set by hand) and is skipped when RouteTag sits inside a mounted router,
+// which keeps the mount's pattern.
 func RouteTag() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rctx := chi.RouteContext(r.Context())
+			// Captured now: routing into a mounted router sets RoutePath.
+			topLevel := rctx != nil && rctx.RoutePath == ""
 			defer func() {
-				if route := routePattern(r); route != "" {
+				if route := matchedRoute(r, topLevel); route != "" {
 					nethttp.StampRoute(r.Context(), r.Method, route)
 				}
 			}()
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// matchedRoute returns the pattern chi routed on or, when nothing was routed
+// and RouteTag runs on the top-level router, the pattern it would have used.
+func matchedRoute(r *http.Request, topLevel bool) string {
+	if route := routePattern(r); route != "" || !topLevel {
+		return route
+	}
+	return wouldMatch(r)
+}
+
+// wouldMatch asks the router in the routing context which pattern r would
+// match, with the path chi's own routing uses. Find follows mounted routers
+// and returns the joined pattern, or "" when nothing matches.
+func wouldMatch(r *http.Request) string {
+	rctx := chi.RouteContext(r.Context())
+	if rctx == nil || rctx.Routes == nil {
+		return ""
+	}
+	path := r.URL.RawPath
+	if path == "" {
+		path = r.URL.Path
+	}
+	return rctx.Routes.Find(chi.NewRouteContext(), r.Method, path)
 }
 
 // routePattern returns the matched route pattern, or "" when routing found no

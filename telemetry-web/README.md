@@ -379,7 +379,9 @@ Every adapter exposes the same three things:
   `Handler` already applies.
 - **`RouteTag()`** — stamps `http.route` on the span and the duration metric and
   renames the span to `"{method} {route}"`. That is the whole per-route metric
-  story; there is no counter middleware.
+  story; there is no counter middleware. On **chi**, a request that middleware
+  answers before routing (a 401 from authentication, say) still gets the route
+  chi would have matched; one that matches no route gets none.
 
 Ordering: **gin** and **chi** need `Instrument` *before* any route is registered
 and panic if you call it late, rather than instrumenting nothing — gin with its own

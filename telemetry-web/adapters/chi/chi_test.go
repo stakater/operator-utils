@@ -1,6 +1,7 @@
 package chitel
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -205,4 +206,95 @@ func TestExportedRecoveryReRaisesErrAbortHandler(t *testing.T) {
 		}
 	}()
 	get(t, h, "/chi/abort")
+}
+
+// rejectAll answers 401 before chi routes, as authentication middleware does.
+func rejectAll(http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+}
+
+func okFunc(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
+
+// assertRejected checks one 401 was recorded with route wantRoute, or with no
+// route at all when wantRoute is "".
+func assertRejected(t *testing.T, h http.Handler, path, wantRoute string) {
+	t.Helper()
+	count := func() uint64 {
+		rm := adaptertest.Collect(t)
+		if wantRoute == "" {
+			return adaptertest.DurationStatusCountNoRoute(rm, http.StatusUnauthorized)
+		}
+		return adaptertest.DurationStatusCount(rm, wantRoute, http.StatusUnauthorized)
+	}
+	before := count()
+	if rec := get(t, h, path); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if delta := count() - before; delta != 1 {
+		t.Errorf("401 observations for route %q: delta = %d, want 1", wantRoute, delta)
+	}
+}
+
+// Middleware that answers before chi routes leaves RoutePattern empty;
+// RouteTag still names the route chi would have matched, through mounted
+// routers too. A path that matches nothing keeps no route.
+func TestRouteTagNamesRejectedRequests(t *testing.T) {
+	r := chi.NewRouter()
+	h := Instrument(r)
+	r.Use(rejectAll)
+	r.Get("/rej/items/{id}", okFunc)
+	sub := chi.NewRouter()
+	sub.Get("/users/{id}", okFunc)
+	r.Mount("/rej/api", sub)
+
+	tests := []struct{ name, path, wantRoute string }{
+		{"top-level route", "/rej/items/7", "/rej/items/{id}"},
+		{"mounted router", "/rej/api/users/7", "/rej/api/users/{id}"},
+		{"no route matches", "/rej/nope", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) { assertRejected(t, h, tt.path, tt.wantRoute) })
+	}
+}
+
+// The lookup uses the router chi records in the routing context, with the
+// path that router routes on. A context made by hand needs Routes set.
+// RouteTag inside a mounted router does no lookup: it keeps the mount's
+// pattern, which chi recorded while routing into it, as before.
+func TestRouteTagLookupNeedsTheRouter(t *testing.T) {
+	handMade := func(setRoutes bool) http.Handler {
+		r := chi.NewRouter()
+		r.Use(RouteTag(), rejectAll)
+		r.Get("/ctx/items/{id}", okFunc)
+		return nethttp.Handler(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			rctx := chi.NewRouteContext()
+			if setRoutes {
+				rctx.Routes = r
+			}
+			r.ServeHTTP(w, req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx)))
+		}))
+	}
+	mounted := func() http.Handler {
+		r := chi.NewRouter()
+		r.Route("/ctx", func(p chi.Router) {
+			p.Use(RouteTag(), rejectAll)
+			p.Get("/items/{id}", okFunc)
+		})
+		return nethttp.Handler(r)
+	}
+
+	tests := []struct {
+		name      string
+		h         http.Handler
+		wantRoute string
+	}{
+		{"hand-made context with Routes", handMade(true), "/ctx/items/{id}"},
+		{"hand-made context without Routes", handMade(false), ""},
+		{"RouteTag inside a mounted router", mounted(), "/ctx/*"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) { assertRejected(t, tt.h, "/ctx/items/7", tt.wantRoute) })
+	}
 }
