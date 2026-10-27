@@ -209,7 +209,7 @@ high-value operations.
 | Metric | Type | Attributes | Source |
 | --- | --- | --- | --- |
 | `http.server.request.duration` | histogram (s) | method, route*, status, … | `otelhttp` (via `nethttp.Handler`) |
-| `http.server.active_requests` | up/down counter | method, scheme | `otelhttp` |
+| `http.server.active_requests` | up/down counter | method, scheme | `nethttp.Handler` |
 | `endpoint.duration` | histogram (s) | `endpoint`, `outcome` | `endpoint.Instrument` |
 | `http.server.panics` | counter | `http.route` (when known) | `endpoint.Recovered` / `endpoint.RecordPanic` |
 | `go.goroutine.count`, `go.memory.used`, `go.memory.allocated`, `go.memory.gc.goal`, `go.processor.limit`, `go.config.gogc` | various | — | `contrib/runtime` |

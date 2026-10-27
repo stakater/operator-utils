@@ -400,6 +400,7 @@ for how the recovery layers fit together.
 | Metric                     | Type      | Source                                    |
 |----------------------------|-----------|-------------------------------------------|
 | `http.server.request.duration` & other `http.server.*` | histogram/… | `otelhttp` (via `nethttp.Handler`); carries `http.route` once `RouteTag`/`StampRoute` runs |
+| `http.server.active_requests` | up/down counter | `nethttp.Handler` (`http.request.method`, `url.scheme`); requests in progress, skipped paths excluded |
 | `endpoint.duration`        | histogram | `endpoint.Instrument` (`endpoint`, `outcome`) |
 | `http.server.panics`       | counter   | `endpoint.Recovered` / `nethttp.Recovery` |
 | runtime (goroutines/GC/heap) | gauges/counters | `contrib/runtime` (via `Init`)      |
