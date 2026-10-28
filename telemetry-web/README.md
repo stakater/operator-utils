@@ -379,7 +379,9 @@ Every adapter exposes the same three things:
   `Handler` already applies.
 - **`RouteTag()`** — stamps `http.route` on the span and the duration metric and
   renames the span to `"{method} {route}"`. That is the whole per-route metric
-  story; there is no counter middleware.
+  story; there is no counter middleware. On **chi**, a request that middleware
+  answers before routing (a 401 from authentication, say) still gets the route
+  chi would have matched; one that matches no route gets none.
 
 Ordering: **gin** and **chi** need `Instrument` *before* any route is registered
 and panic if you call it late, rather than instrumenting nothing — gin with its own
@@ -400,6 +402,7 @@ for how the recovery layers fit together.
 | Metric                     | Type      | Source                                    |
 |----------------------------|-----------|-------------------------------------------|
 | `http.server.request.duration` & other `http.server.*` | histogram/… | `otelhttp` (via `nethttp.Handler`); carries `http.route` once `RouteTag`/`StampRoute` runs |
+| `http.server.active_requests` | up/down counter | `nethttp.Handler` (`http.request.method`, `url.scheme`); requests in progress, skipped paths excluded |
 | `endpoint.duration`        | histogram | `endpoint.Instrument` (`endpoint`, `outcome`) |
 | `http.server.panics`       | counter   | `endpoint.Recovered` / `nethttp.Recovery` |
 | runtime (goroutines/GC/heap) | gauges/counters | `contrib/runtime` (via `Init`)      |

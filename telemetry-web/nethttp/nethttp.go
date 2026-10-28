@@ -19,9 +19,11 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
+	"go.opentelemetry.io/otel/semconv/v1.41.0/httpconv"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/stakater/operator-utils/telemetry-web/endpoint"
+	"github.com/stakater/operator-utils/telemetry-web/internal/ident"
 	"github.com/stakater/operator-utils/telemetry-web/logging"
 )
 
@@ -109,11 +111,11 @@ func Handler(next http.Handler, opts ...Option) http.Handler {
 	}
 
 	instrumented := &followMeter{build: func(mp metric.MeterProvider) http.Handler {
-		return otelhttp.NewHandler(inner, "server",
+		return countActive(otelhttp.NewHandler(inner, "server",
 			otelhttp.WithFilter(func(r *http.Request) bool { return !skipped(r.Context()) }),
 			otelhttp.WithSpanNameFormatter(spanName),
 			otelhttp.WithMeterProvider(mp),
-		)
+		), mp)
 	}}
 
 	if len(cfg.skipPaths) == 0 {
@@ -166,6 +168,41 @@ func (f *followMeter) handler() http.Handler {
 	b := &boundHandler{mp: mp, h: f.build(mp)}
 	f.current.Store(b)
 	return b.h
+}
+
+// countActive keeps http.server.active_requests: up when a request starts,
+// down when it ends. otelhttp v0.69 does not emit it. It sits outside
+// otelhttp so a panic escaping under WithoutRecovery still brings the count
+// down, and it is built per provider like the handler it wraps.
+func countActive(next http.Handler, mp metric.MeterProvider) http.Handler {
+	meter := mp.Meter(ident.ModulePath, metric.WithInstrumentationVersion(ident.Version()))
+	// On error this is a working no-op; the only cause is an invalid name,
+	// which the constant name rules out.
+	active, _ := httpconv.NewServerActiveRequests(meter)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if skipped(r.Context()) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		method, scheme := activeAttrs(r)
+		active.Add(r.Context(), 1, method, scheme)
+		defer active.Add(r.Context(), -1, method, scheme)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// activeAttrs returns the attributes the convention requires on
+// http.server.active_requests, normalized as otelhttp normalizes them on its
+// duration metric so the two line up: unknown methods become _OTHER.
+func activeAttrs(r *http.Request) (httpconv.RequestMethodAttr, string) {
+	method := httpconv.RequestMethodOther
+	if m := strings.ToUpper(r.Method); stdMethods[m] {
+		method = httpconv.RequestMethodAttr(m)
+	}
+	if r.TLS != nil {
+		return method, "https"
+	}
+	return method, "http"
 }
 
 // trackWrites returns w wrapped so responded reports whether anything has been

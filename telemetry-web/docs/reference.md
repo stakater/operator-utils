@@ -209,7 +209,7 @@ high-value operations.
 | Metric | Type | Attributes | Source |
 | --- | --- | --- | --- |
 | `http.server.request.duration` | histogram (s) | method, route*, status, … | `otelhttp` (via `nethttp.Handler`) |
-| `http.server.active_requests` | up/down counter | method, scheme | `otelhttp` |
+| `http.server.active_requests` | up/down counter | method, scheme | `nethttp.Handler` |
 | `endpoint.duration` | histogram (s) | `endpoint`, `outcome` | `endpoint.Instrument` |
 | `http.server.panics` | counter | `http.route` (when known) | `endpoint.Recovered` / `endpoint.RecordPanic` |
 | `go.goroutine.count`, `go.memory.used`, `go.memory.allocated`, `go.memory.gc.goal`, `go.processor.limit`, `go.config.gogc` | various | — | `contrib/runtime` |
@@ -537,6 +537,16 @@ echo. Second, `Instrument` deliberately does **not** install `Recovery()`:
 `nethttp.Handler` already recovers and `chitel.Recovery` *is* `nethttp.Recovery`,
 so installing both would count every panic twice. Use `Recovery()` only when
 building a chain by hand or alongside `nethttp.WithoutRecovery()`.
+
+Third, a request that middleware answers before chi routes (authentication
+returning `401`, say) has no `RoutePattern()`. `RouteTag` then asks the router
+which pattern the request would have matched (`chi.Routes.Find`, which follows
+mounted subrouters) and stamps that, so rejections are attributed to their
+route; a path that matches nothing still gets no `http.route`. The lookup uses
+the router chi records in the routing context. A dispatcher that serves a
+router under a context made with `chi.NewRouteContext()` must set `Routes` on
+it. `RouteTag` installed inside a mounted router does no lookup and keeps the
+mount's pattern (`/api/*`), as before.
 
 Mounted subrouters record chi's joined pattern (`/api/users/{id}`) as-is. Like
 Gin, call `Instrument` **before** registering routes (chi panics on late `Use`).
