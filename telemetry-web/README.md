@@ -280,6 +280,24 @@ func (h *TenantController) GetAllTenants(c *gin.Context) {
 }
 ```
 
+To see the steps of an operation in a trace as well, open a span per step.
+Both helpers return the span's context, for the step's own calls, and a
+finisher that takes the error's address like `Instrument`'s; an error is
+recorded on the span and marks it failed.
+
+- **`Span(ctx, name string, attrs ...attribute.KeyValue) (context.Context, func(err *error))`**
+  — a child span only.
+- **`InstrumentSpan(ctx, name string, attrs ...attribute.KeyValue) (context.Context, func(err *error))`**
+  — a child span plus `Instrument` under the same name.
+
+```go
+func BuildBundle(ctx context.Context) (err error) {
+    ctx, end := endpoint.InstrumentSpan(ctx, "bundle.build")
+    defer end(&err)
+    // ... pass ctx on, so the step's own spans are its children ...
+}
+```
+
 ### Trace-correlated logging — `logging`
 
 - **`Logger() *slog.Logger`** — the logger this library writes through, and a

@@ -19,6 +19,7 @@
 //	logging.Logger() / logging.NewLogHandler  trace-correlated slog
 //	logging.SetDefault(l)                     redirect what the library logs
 //	endpoint.Instrument(ctx, name)(&err)      time a named operation, outcome from err
+//	endpoint.Span / endpoint.InstrumentSpan   a child span per step, optionally timed too
 //	endpoint.Recovered(ctx, recovered)        the shared recovery rule (false => re-panic)
 //	endpoint.RecordPanic(ctx, recovered)      panic -> span + log + counter
 //	nethttp.Handler / nethttp.Recovery        inbound spans/metrics/recovery
