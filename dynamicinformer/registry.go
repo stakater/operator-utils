@@ -63,15 +63,18 @@ type WatchEntry struct {
 }
 
 // recordWatchError returns the informer's watch error handler. It logs like client-go's default and
-// stores the informer's resource version in errorRV, except for routine watch closes (expired, EOF),
-// after which the reflector just relists. r is nil from kcp's forked informer, which runs its own
+// stores the informer's resource version in errorRV, except for the errors that default does not log
+// as errors (expired, and an unwrapped EOF). r is nil from kcp's forked informer, which runs its own
 // reflector, so the version comes from the informer.
 func recordWatchError(key WatchKey, informer cache.SharedIndexInformer, errorRV *atomic.Pointer[string]) cache.WatchErrorHandlerWithContext {
 	return func(ctx context.Context, r *cache.Reflector, err error) {
 		if r != nil {
 			cache.DefaultWatchErrorHandler(ctx, r, err)
 		}
-		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// Mirrors cache.DefaultWatchErrorHandler (k8s.io/client-go/tools/cache/reflector.go): what it does
+		// not log as an error is not a failure. Its isExpiredError is unexported, so the check is copied.
+		// Recheck on a client-go bump.
+		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || err == io.EOF || err == io.ErrUnexpectedEOF {
 			if r == nil {
 				klog.FromContext(ctx).V(4).Info("Watch closed", "gvr", key.GVR.String(), "namespace", key.Namespace, "err", err)
 			}
@@ -104,10 +107,11 @@ type WatchRegistration struct {
 // Shared by every consumer of the key.
 //
 // Not seen, client-go retries them without reporting: connection refused and 429 on a watch or a
-// streaming list. Routine watch closes (expired, EOF) are not failures. False for a registration
-// not returned by EnsureWatchSet.
+// streaming list. Errors client-go's default handler does not log as errors are not failures either
+// (expired, and an unwrapped EOF). False once the watch stopped for this consumer (see GetIndexer),
+// and for a registration not returned by EnsureWatchSet.
 func (w *WatchRegistration) IsWatchHealthy() bool {
-	if w.errorRV == nil {
+	if w.errorRV == nil || isClosed(w.released) || isClosed(w.done) {
 		return false
 	}
 	rv := w.errorRV.Load()

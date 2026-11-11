@@ -3,6 +3,7 @@ package dynamicinformer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"slices"
@@ -2498,7 +2499,7 @@ func TestIsWatchHealthy_SameRVRelistWaitsForNewerRV(t *testing.T) {
 	waitUntil(t, "healthy after a newer bookmark", reg.IsWatchHealthy)
 }
 
-// A list with an expired resource version is routine, the reflector then lists from the latest version.
+// client-go's default handler does not log an expired list as an error, the reflector already retried from the latest version.
 func TestIsWatchHealthy_ExpiredListStaysHealthy(t *testing.T) {
 	s := &scriptedListWatch{listRV: "1"}
 	reg, _ := startScripted(t, s.informerFunc)
@@ -2510,6 +2511,36 @@ func TestIsWatchHealthy_ExpiredListStaysHealthy(t *testing.T) {
 	waitUntil(t, "a failed list", func() bool { _, failed := s.counts(); return failed >= 1 })
 	if !reg.IsWatchHealthy() {
 		t.Error("an expired list must not mark the watch unhealthy")
+	}
+}
+
+func TestIsWatchHealthy_FalseOnceStopped(t *testing.T) {
+	registry := NewWatchRegistry(newFakeDynamicClient(), 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := WatchKey{GVR: configmapsGVR, Namespace: "default"}
+	released, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cancelled, err := registry.EnsureWatchSet(ctx, "consumer-2", []WatchRequest{{Key: WatchKey{GVR: secretsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	waitUntil(t, "synced", func() bool { return released[0].HasSynced() && cancelled[0].HasSynced() })
+	if !released[0].IsWatchHealthy() || !cancelled[0].IsWatchHealthy() {
+		t.Fatal("expected healthy watches after sync")
+	}
+
+	if err := registry.ReleaseAll("consumer-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if released[0].IsWatchHealthy() {
+		t.Error("expected unhealthy after ReleaseAll")
+	}
+	cancel()
+	if cancelled[0].IsWatchHealthy() {
+		t.Error("expected unhealthy after parentCtx cancel")
 	}
 }
 
@@ -2576,12 +2607,13 @@ func TestIsWatchHealthy_NilReflectorFromForkedInformer(t *testing.T) {
 	for _, err := range []error{apierrors.NewResourceExpired("expired"), io.EOF, io.ErrUnexpectedEOF} {
 		captured.handler(ctx, nil, err)
 		if !reg.IsWatchHealthy() {
-			t.Fatalf("expected healthy after the routine watch close %v", err)
+			t.Fatalf("expected healthy after %v, client-go's default handler does not log it as an error", err)
 		}
 	}
 
-	captured.handler(ctx, nil, errForbidden)
+	// client-go's default handler logs a wrapped EOF, a failed list, as an error.
+	captured.handler(ctx, nil, fmt.Errorf("failed to list configmaps: %w", io.EOF))
 	if reg.IsWatchHealthy() {
-		t.Error("expected unhealthy after an error reported with a nil reflector")
+		t.Error("expected unhealthy after a failed list reported with a nil reflector")
 	}
 }
