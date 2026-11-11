@@ -12,11 +12,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/dynamic"
 	kubedynamicinformer "k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // WatchKey uniquely identifies a watch by GVR, namespace, and identity.
@@ -74,14 +73,17 @@ func recordWatchError(key WatchKey, informer cache.SharedIndexInformer, errorRV 
 		// Mirrors cache.DefaultWatchErrorHandler (k8s.io/client-go/tools/cache/reflector.go): what it does
 		// not log as an error is not a failure. Its isExpiredError is unexported, so the check is copied.
 		// Recheck on a client-go bump.
-		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || err == io.EOF || err == io.ErrUnexpectedEOF {
-			if r == nil {
-				klog.FromContext(ctx).V(4).Info("Watch closed", "gvr", key.GVR.String(), "namespace", key.Namespace, "err", err)
-			}
-			return
-		}
+		routine := apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || err == io.EOF || err == io.ErrUnexpectedEOF
 		if r == nil {
-			utilruntime.HandleErrorWithContext(ctx, err, "Failed to list or watch", "gvr", key.GVR.String(), "namespace", key.Namespace)
+			logger := log.FromContext(ctx).WithName("dynamicinformer").WithValues("gvr", key.GVR.String(), "namespace", key.Namespace)
+			if routine {
+				logger.V(4).Info("Watch closed", "err", err)
+			} else {
+				logger.Error(err, "Failed to list or watch")
+			}
+		}
+		if routine {
+			return
 		}
 		rv := informer.LastSyncResourceVersion()
 		errorRV.Store(&rv)
@@ -482,7 +484,7 @@ func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey
 		errorRV:  errorRV,
 	}
 	r.watches[key] = entry
-	go informer.Run(ctx.Done())
+	go informer.RunWithContext(ctx)
 	started = true
 	return entry, nil
 }
