@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -1386,6 +1387,14 @@ func TestClientReleaser_NotImplementedIsNoop(t *testing.T) {
 	}
 }
 
+// acceptsWatchErrorHandler lets a stopped informer past the watch error handler
+// step, so the test reaches AddEventHandler.
+type acceptsWatchErrorHandler struct{ cache.SharedIndexInformer }
+
+func (acceptsWatchErrorHandler) SetWatchErrorHandlerWithContext(cache.WatchErrorHandlerWithContext) error {
+	return nil
+}
+
 func TestClientReleaser_AddEventHandlerFailureStopsFreshInformer(t *testing.T) {
 	registry, provider, ctx := newReleasingRegistry(t)
 
@@ -1396,13 +1405,13 @@ func TestClientReleaser_AddEventHandlerFailureStopsFreshInformer(t *testing.T) {
 		stop := make(chan struct{})
 		close(stop)
 		informer.Run(stop)
-		return informer, nil
+		return acceptsWatchErrorHandler{informer}, nil
 	}
 
 	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
 	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
-	if err == nil {
-		t.Fatal("expected error when the handler cannot be added")
+	if err == nil || !strings.Contains(err.Error(), "event handler") {
+		t.Fatalf("expected an event handler error, got %v", err)
 	}
 
 	// The entry must not linger as a handler-less informer, and the one
@@ -2329,5 +2338,229 @@ func TestGetIndexer_ErrorsAfterParentCancel(t *testing.T) {
 	cancel()
 	if _, err := regs[0].GetIndexer(); !errors.Is(err, ErrWatchStopped) {
 		t.Errorf("expected ErrWatchStopped after parentCtx cancel, got %v", err)
+	}
+}
+
+// noWatchListClient makes the reflector list instead of using watch list, which
+// a scripted watch cannot serve.
+type noWatchListClient struct{}
+
+func (noWatchListClient) IsWatchListSemanticsUnSupported() bool { return true }
+
+// scriptedListWatch lists and watches under test control.
+type scriptedListWatch struct {
+	mu          sync.Mutex
+	listErr     error
+	listRV      string
+	lists       int // successful lists
+	failedLists int
+	watches     []*watch.FakeWatcher
+}
+
+func (s *scriptedListWatch) setList(err error, rv string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listErr, s.listRV = err, rv
+}
+
+func (s *scriptedListWatch) counts() (lists, failedLists int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lists, s.failedLists
+}
+
+func (s *scriptedListWatch) lastWatch() *watch.FakeWatcher {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.watches) == 0 {
+		return nil
+	}
+	return s.watches[len(s.watches)-1]
+}
+
+func (s *scriptedListWatch) informerFunc(dynamic.Interface, WatchKey, time.Duration) (cache.SharedIndexInformer, error) {
+	lw := &cache.ListWatch{
+		ListWithContextFunc: func(context.Context, metav1.ListOptions) (runtime.Object, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.listErr != nil {
+				s.failedLists++
+				return nil, s.listErr
+			}
+			s.lists++
+			list := &unstructured.UnstructuredList{Object: map[string]any{"apiVersion": "v1", "kind": "ConfigMapList"}}
+			list.SetResourceVersion(s.listRV)
+			return list, nil
+		},
+		WatchFuncWithContext: func(context.Context, metav1.ListOptions) (watch.Interface, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			w := watch.NewFake()
+			s.watches = append(s.watches, w)
+			return w, nil
+		},
+	}
+	return cache.NewSharedIndexInformer(cache.ToListWatcherWithWatchListSemantics(lw, noWatchListClient{}),
+		&unstructured.Unstructured{}, 0, cache.Indexers{}), nil
+}
+
+// startScripted registers one watch on a registry whose informers come from s.
+func startScripted(t *testing.T, s *scriptedListWatch) *WatchRegistration {
+	t.Helper()
+	registry := NewWatchRegistry(newFakeDynamicClient(), 0, WithInformerFunc(s.informerFunc))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return regs[0]
+}
+
+// waitUntil polls cond for up to 30s, the reflector backs off 800ms doubling with jitter between failed lists.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting until %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+var errForbidden = apierrors.NewForbidden(configmapsGVR.GroupResource(), "", errors.New("grant revoked"))
+
+func TestIsWatchHealthy_ListErrorAfterSyncUntilNextList(t *testing.T) {
+	s := &scriptedListWatch{listRV: "1"}
+	reg := startScripted(t, s)
+	waitUntil(t, "synced", reg.HasSynced)
+	waitUntil(t, "watch open", func() bool { return s.lastWatch() != nil })
+	if !reg.IsWatchHealthy() {
+		t.Fatal("expected a healthy watch after sync")
+	}
+
+	s.setList(errForbidden, "1")
+	s.lastWatch().Stop()
+	waitUntil(t, "unhealthy", func() bool { return !reg.IsWatchHealthy() })
+	if !reg.HasSynced() {
+		t.Error("HasSynced must stay true after a watch error")
+	}
+
+	s.setList(nil, "2")
+	waitUntil(t, "healthy after the next list", reg.IsWatchHealthy)
+}
+
+func TestIsWatchHealthy_ErrorBeforeFirstSync(t *testing.T) {
+	s := &scriptedListWatch{listErr: errForbidden}
+	reg := startScripted(t, s)
+	waitUntil(t, "unhealthy", func() bool { return !reg.IsWatchHealthy() })
+	if reg.HasSynced() {
+		t.Fatal("expected not synced while every list fails")
+	}
+
+	s.setList(nil, "1")
+	waitUntil(t, "healthy after the first list", reg.IsWatchHealthy)
+	if !reg.HasSynced() {
+		t.Error("expected synced after the first list")
+	}
+}
+
+func TestIsWatchHealthy_SameRVRelistWaitsForNewerRV(t *testing.T) {
+	s := &scriptedListWatch{listRV: "1"}
+	reg := startScripted(t, s)
+	waitUntil(t, "synced", reg.HasSynced)
+	waitUntil(t, "watch open", func() bool { return s.lastWatch() != nil })
+	first := s.lastWatch()
+
+	s.setList(errForbidden, "1")
+	first.Stop()
+	waitUntil(t, "unhealthy", func() bool { return !reg.IsWatchHealthy() })
+
+	s.setList(nil, "1")
+	waitUntil(t, "relisted and watching", func() bool {
+		lists, _ := s.counts()
+		return lists >= 2 && s.lastWatch() != first
+	})
+	if reg.IsWatchHealthy() {
+		t.Fatal("a relist at the error's resource version must not clear it")
+	}
+
+	bookmark := &unstructured.Unstructured{}
+	bookmark.SetResourceVersion("2")
+	s.lastWatch().Action(watch.Bookmark, bookmark)
+	waitUntil(t, "healthy after a newer bookmark", reg.IsWatchHealthy)
+}
+
+func TestIsWatchHealthy_ZeroRegistration(t *testing.T) {
+	if (&WatchRegistration{}).IsWatchHealthy() {
+		t.Error("a registration not from EnsureWatchSet must not be healthy")
+	}
+}
+
+func TestClientReleaser_WatchErrorHandlerFailureReleasesClient(t *testing.T) {
+	registry, provider, ctx := newReleasingRegistry(t)
+
+	// An informer that already ran refuses a watch error handler.
+	registry.newInformer = func(cli dynamic.Interface, key WatchKey, resyncPeriod time.Duration) (cache.SharedIndexInformer, error) {
+		informer, _ := newDynamicInformer(cli, key, resyncPeriod)
+		stop := make(chan struct{})
+		close(stop)
+		informer.Run(stop)
+		return informer, nil
+	}
+
+	key := WatchKey{GVR: secretsGVR, Namespace: "shared", Identity: "team-a/reader"}
+	_, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: key, Callback: noopCallback()}})
+	if err == nil || !strings.Contains(err.Error(), "watch error handler") {
+		t.Fatalf("expected a watch error handler error, got %v", err)
+	}
+
+	registry.mu.Lock()
+	if len(registry.watches) != 0 || len(registry.consumerKeys) != 0 {
+		t.Errorf("expected nothing stored, got %d watches, %d consumers", len(registry.watches), len(registry.consumerKeys))
+	}
+	registry.mu.Unlock()
+
+	if got := provider.acquired(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected one ClientFor call, got %v", got)
+	}
+	if got := provider.released(); !slices.Equal(got, []string{"team-a/reader"}) {
+		t.Errorf("expected one release, got %v", got)
+	}
+}
+
+// capturesWatchErrorHandler keeps the handler the registry sets, so a test can call it.
+type capturesWatchErrorHandler struct {
+	cache.SharedIndexInformer
+	handler cache.WatchErrorHandlerWithContext
+}
+
+func (c *capturesWatchErrorHandler) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
+	c.handler = handler
+	return c.SharedIndexInformer.SetWatchErrorHandlerWithContext(handler)
+}
+
+// kcp's forked informer runs its own reflector and passes a nil *cache.Reflector to the handler.
+func TestIsWatchHealthy_NilReflectorFromForkedInformer(t *testing.T) {
+	s := &scriptedListWatch{listRV: "1"}
+	var captured *capturesWatchErrorHandler
+	registry := NewWatchRegistry(newFakeDynamicClient(), 0, WithInformerFunc(
+		func(cli dynamic.Interface, key WatchKey, resync time.Duration) (cache.SharedIndexInformer, error) {
+			informer, _ := s.informerFunc(cli, key, resync)
+			captured = &capturesWatchErrorHandler{SharedIndexInformer: informer}
+			return captured, nil
+		}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	waitUntil(t, "synced", regs[0].HasSynced)
+
+	captured.handler(ctx, nil, errForbidden)
+	if regs[0].IsWatchHealthy() {
+		t.Error("expected unhealthy after an error reported with a nil reflector")
 	}
 }
