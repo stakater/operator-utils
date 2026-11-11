@@ -320,7 +320,7 @@ After sync, `reg.GetIndexer()` returns the informer's cache (`GetByKey`, `List`,
 
 `GetIndexer` returns `ErrWatchStopped` once this consumer released the key (`ReleaseAll`, or a later `EnsureWatchSet` without it) or `parentCtx` was cancelled. Keep the registration, not the indexer, and call `GetIndexer` on every read, so a stopped watch is noticed. `HasSynced` is unchanged: it reports whether the shared informer has synced.
 
-`HasSynced` never turns false again, so after a failed list or watch the cache keeps its last state while the reflector retries. `IsWatchHealthy` turns false when a list or watch fails and true once the informer passes that error's resource version: the next list with a newer resource version, or a later event or bookmark. A consumer that makes decisions from the cache should read it only when `HasSynced() && IsWatchHealthy()`. The registry sets the informer's watch error handler for this, so an `InformerFunc` must not set its own.
+`HasSynced` never turns false again, so after a failed list or watch the cache keeps its last state while the reflector retries. `IsWatchHealthy` turns false when a list or watch fails and true once the informer passes that error's resource version: the next list with a newer resource version, or a later event or bookmark. Routine watch closes (expired resource version, EOF) are not failures, the reflector just relists. A consumer that makes decisions from the cache should read it only when `HasSynced() && IsWatchHealthy()`. The registry sets the informer's watch error handler for this, so an `InformerFunc` must not set its own.
 
 ## Running the Interactive Example
 

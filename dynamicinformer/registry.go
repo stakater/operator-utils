@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/dynamic"
 	kubedynamicinformer "k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 // WatchKey uniquely identifies a watch by GVR, namespace, and identity.
@@ -55,40 +59,30 @@ type WatchEntry struct {
 	done     <-chan struct{} // closed once the informer is stopped
 	informer cache.SharedIndexInformer
 	handlers map[string]*handlerRegistration // keyed by consumerID
-	health   *watchHealth
+	errorRV  *atomic.Pointer[string]         // LastSyncResourceVersion at the last list or watch error, nil if none
 }
 
-// watchHealth records the informer's last list or watch error.
-type watchHealth struct {
-	key      WatchKey
-	informer cache.SharedIndexInformer
-
-	mu      sync.Mutex
-	failed  bool
-	errorRV string // LastSyncResourceVersion at the last error
-}
-
-// recordWatchError is the informer's watch error handler. It logs like client-go's default. r is nil
-// from kcp's forked informer, which runs its own reflector, so the version comes from the informer.
-func (h *watchHealth) recordWatchError(ctx context.Context, r *cache.Reflector, err error) {
-	if r != nil {
-		cache.DefaultWatchErrorHandler(ctx, r, err)
-	} else {
-		utilruntime.HandleErrorWithContext(ctx, err, "Failed to list or watch", "gvr", h.key.GVR.String(), "namespace", h.key.Namespace)
+// recordWatchError returns the informer's watch error handler. It logs like client-go's default and
+// stores the informer's resource version in errorRV, except for routine watch closes (expired, EOF),
+// after which the reflector just relists. r is nil from kcp's forked informer, which runs its own
+// reflector, so the version comes from the informer.
+func recordWatchError(key WatchKey, informer cache.SharedIndexInformer, errorRV *atomic.Pointer[string]) cache.WatchErrorHandlerWithContext {
+	return func(ctx context.Context, r *cache.Reflector, err error) {
+		if r != nil {
+			cache.DefaultWatchErrorHandler(ctx, r, err)
+		}
+		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if r == nil {
+				klog.FromContext(ctx).V(4).Info("Watch closed", "gvr", key.GVR.String(), "namespace", key.Namespace, "err", err)
+			}
+			return
+		}
+		if r == nil {
+			utilruntime.HandleErrorWithContext(ctx, err, "Failed to list or watch", "gvr", key.GVR.String(), "namespace", key.Namespace)
+		}
+		rv := informer.LastSyncResourceVersion()
+		errorRV.Store(&rv)
 	}
-	rv := h.informer.LastSyncResourceVersion()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.failed = true
-	h.errorRV = rv
-}
-
-// healthy is true until an error, then again once the informer moved past the error's resource version.
-func (h *watchHealth) healthy() bool {
-	rv := h.informer.LastSyncResourceVersion()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return !h.failed || rv != h.errorRV
 }
 
 // WatchRegistration is returned to the consumer as a handle for optional cache
@@ -98,7 +92,7 @@ type WatchRegistration struct {
 	ConsumerID string
 	HasSynced  cache.InformerSynced
 	informer   cache.SharedIndexInformer
-	health     *watchHealth
+	errorRV    *atomic.Pointer[string]
 	released   <-chan struct{} // this consumer released the key
 	done       <-chan struct{} // the shared watch stopped
 }
@@ -110,12 +104,14 @@ type WatchRegistration struct {
 // Shared by every consumer of the key.
 //
 // Not seen, client-go retries them without reporting: connection refused and 429 on a watch or a
-// streaming list. False for a registration not returned by EnsureWatchSet.
+// streaming list. Routine watch closes (expired, EOF) are not failures. False for a registration
+// not returned by EnsureWatchSet.
 func (w *WatchRegistration) IsWatchHealthy() bool {
-	if w.health == nil {
+	if w.errorRV == nil {
 		return false
 	}
-	return w.health.healthy()
+	rv := w.errorRV.Load()
+	return rv == nil || w.informer.LastSyncResourceVersion() != *rv
 }
 
 // ErrWatchStopped is returned by GetIndexer once this consumer released the key
@@ -154,7 +150,7 @@ func newRegistration(key WatchKey, consumerID string, entry *WatchEntry) *WatchR
 		ConsumerID: consumerID,
 		HasSynced:  entry.informer.HasSynced,
 		informer:   entry.informer,
-		health:     entry.health,
+		errorRV:    entry.errorRV,
 		released:   entry.handlers[consumerID].released,
 		done:       entry.done,
 	}
@@ -468,8 +464,8 @@ func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey
 		return nil, fmt.Errorf("failed to build informer for %v: %w", key, err)
 	}
 
-	health := &watchHealth{key: key, informer: informer}
-	if err := informer.SetWatchErrorHandlerWithContext(health.recordWatchError); err != nil {
+	errorRV := &atomic.Pointer[string]{}
+	if err := informer.SetWatchErrorHandlerWithContext(recordWatchError(key, informer, errorRV)); err != nil {
 		return nil, fmt.Errorf("failed to set watch error handler for %v: %w", key, err)
 	}
 
@@ -479,7 +475,7 @@ func (r *WatchRegistry) startWatchLocked(parentCtx context.Context, key WatchKey
 		done:     ctx.Done(),
 		informer: informer,
 		handlers: make(map[string]*handlerRegistration),
-		health:   health,
+		errorRV:  errorRV,
 	}
 	r.watches[key] = entry
 	go informer.Run(ctx.Done())

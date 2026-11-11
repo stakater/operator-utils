@@ -3,6 +3,7 @@ package dynamicinformer
 import (
 	"context"
 	"errors"
+	"io"
 	"reflect"
 	"slices"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
@@ -2404,36 +2406,40 @@ func (s *scriptedListWatch) informerFunc(dynamic.Interface, WatchKey, time.Durat
 		&unstructured.Unstructured{}, 0, cache.Indexers{}), nil
 }
 
-// startScripted registers one watch on a registry whose informers come from s.
-func startScripted(t *testing.T, s *scriptedListWatch) *WatchRegistration {
+// startScripted registers one watch on a registry whose informers come from newInformer.
+func startScripted(t *testing.T, newInformer InformerFunc) (*WatchRegistration, context.Context) {
 	t.Helper()
-	registry := NewWatchRegistry(newFakeDynamicClient(), 0, WithInformerFunc(s.informerFunc))
+	registry := NewWatchRegistry(newFakeDynamicClient(), 0, WithInformerFunc(newInformer))
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	return regs[0]
+	return regs[0], ctx
 }
 
 // waitUntil polls cond for up to 30s, the reflector backs off 800ms doubling with jitter between failed lists.
 func waitUntil(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting until %s", what)
-		}
-		time.Sleep(20 * time.Millisecond)
+	err := wait.PollUntilContextTimeout(t.Context(), 20*time.Millisecond, 30*time.Second, true,
+		func(context.Context) (bool, error) { return cond(), nil })
+	if err != nil {
+		t.Fatalf("timed out waiting until %s", what)
 	}
+}
+
+// expireWatch ends the watch with 410 Expired, so the reflector relists. Stopping the watch
+// relists only if it lasted under a second, otherwise the reflector opens a new watch.
+func expireWatch(w *watch.FakeWatcher) {
+	w.Error(&apierrors.NewResourceExpired("watch expired").ErrStatus)
 }
 
 var errForbidden = apierrors.NewForbidden(configmapsGVR.GroupResource(), "", errors.New("grant revoked"))
 
 func TestIsWatchHealthy_ListErrorAfterSyncUntilNextList(t *testing.T) {
 	s := &scriptedListWatch{listRV: "1"}
-	reg := startScripted(t, s)
+	reg, _ := startScripted(t, s.informerFunc)
 	waitUntil(t, "synced", reg.HasSynced)
 	waitUntil(t, "watch open", func() bool { return s.lastWatch() != nil })
 	if !reg.IsWatchHealthy() {
@@ -2441,7 +2447,7 @@ func TestIsWatchHealthy_ListErrorAfterSyncUntilNextList(t *testing.T) {
 	}
 
 	s.setList(errForbidden, "1")
-	s.lastWatch().Stop()
+	expireWatch(s.lastWatch())
 	waitUntil(t, "unhealthy", func() bool { return !reg.IsWatchHealthy() })
 	if !reg.HasSynced() {
 		t.Error("HasSynced must stay true after a watch error")
@@ -2453,7 +2459,7 @@ func TestIsWatchHealthy_ListErrorAfterSyncUntilNextList(t *testing.T) {
 
 func TestIsWatchHealthy_ErrorBeforeFirstSync(t *testing.T) {
 	s := &scriptedListWatch{listErr: errForbidden}
-	reg := startScripted(t, s)
+	reg, _ := startScripted(t, s.informerFunc)
 	waitUntil(t, "unhealthy", func() bool { return !reg.IsWatchHealthy() })
 	if reg.HasSynced() {
 		t.Fatal("expected not synced while every list fails")
@@ -2468,13 +2474,13 @@ func TestIsWatchHealthy_ErrorBeforeFirstSync(t *testing.T) {
 
 func TestIsWatchHealthy_SameRVRelistWaitsForNewerRV(t *testing.T) {
 	s := &scriptedListWatch{listRV: "1"}
-	reg := startScripted(t, s)
+	reg, _ := startScripted(t, s.informerFunc)
 	waitUntil(t, "synced", reg.HasSynced)
 	waitUntil(t, "watch open", func() bool { return s.lastWatch() != nil })
 	first := s.lastWatch()
 
 	s.setList(errForbidden, "1")
-	first.Stop()
+	expireWatch(first)
 	waitUntil(t, "unhealthy", func() bool { return !reg.IsWatchHealthy() })
 
 	s.setList(nil, "1")
@@ -2490,6 +2496,21 @@ func TestIsWatchHealthy_SameRVRelistWaitsForNewerRV(t *testing.T) {
 	bookmark.SetResourceVersion("2")
 	s.lastWatch().Action(watch.Bookmark, bookmark)
 	waitUntil(t, "healthy after a newer bookmark", reg.IsWatchHealthy)
+}
+
+// A list with an expired resource version is routine, the reflector then lists from the latest version.
+func TestIsWatchHealthy_ExpiredListStaysHealthy(t *testing.T) {
+	s := &scriptedListWatch{listRV: "1"}
+	reg, _ := startScripted(t, s.informerFunc)
+	waitUntil(t, "synced", reg.HasSynced)
+	waitUntil(t, "watch open", func() bool { return s.lastWatch() != nil })
+
+	s.setList(apierrors.NewResourceExpired("too old resource version"), "1")
+	expireWatch(s.lastWatch())
+	waitUntil(t, "a failed list", func() bool { _, failed := s.counts(); return failed >= 1 })
+	if !reg.IsWatchHealthy() {
+		t.Error("an expired list must not mark the watch unhealthy")
+	}
 }
 
 func TestIsWatchHealthy_ZeroRegistration(t *testing.T) {
@@ -2545,22 +2566,22 @@ func (c *capturesWatchErrorHandler) SetWatchErrorHandlerWithContext(handler cach
 func TestIsWatchHealthy_NilReflectorFromForkedInformer(t *testing.T) {
 	s := &scriptedListWatch{listRV: "1"}
 	var captured *capturesWatchErrorHandler
-	registry := NewWatchRegistry(newFakeDynamicClient(), 0, WithInformerFunc(
-		func(cli dynamic.Interface, key WatchKey, resync time.Duration) (cache.SharedIndexInformer, error) {
-			informer, _ := s.informerFunc(cli, key, resync)
-			captured = &capturesWatchErrorHandler{SharedIndexInformer: informer}
-			return captured, nil
-		}))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	regs, err := registry.EnsureWatchSet(ctx, "consumer-1", []WatchRequest{{Key: WatchKey{GVR: configmapsGVR, Namespace: "default"}}})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	reg, ctx := startScripted(t, func(cli dynamic.Interface, key WatchKey, resync time.Duration) (cache.SharedIndexInformer, error) {
+		informer, _ := s.informerFunc(cli, key, resync)
+		captured = &capturesWatchErrorHandler{SharedIndexInformer: informer}
+		return captured, nil
+	})
+	waitUntil(t, "synced", reg.HasSynced)
+
+	for _, err := range []error{apierrors.NewResourceExpired("expired"), io.EOF, io.ErrUnexpectedEOF} {
+		captured.handler(ctx, nil, err)
+		if !reg.IsWatchHealthy() {
+			t.Fatalf("expected healthy after the routine watch close %v", err)
+		}
 	}
-	waitUntil(t, "synced", regs[0].HasSynced)
 
 	captured.handler(ctx, nil, errForbidden)
-	if regs[0].IsWatchHealthy() {
+	if reg.IsWatchHealthy() {
 		t.Error("expected unhealthy after an error reported with a nil reflector")
 	}
 }
