@@ -320,6 +320,8 @@ After sync, `reg.GetIndexer()` returns the informer's cache (`GetByKey`, `List`,
 
 `GetIndexer` returns `ErrWatchStopped` once this consumer released the key (`ReleaseAll`, or a later `EnsureWatchSet` without it) or `parentCtx` was cancelled. Keep the registration, not the indexer, and call `GetIndexer` on every read, so a stopped watch is noticed. `HasSynced` is unchanged: it reports whether the shared informer has synced.
 
+`HasSynced` never turns false again, so after a failed list or watch the cache keeps its last state while the reflector retries. `IsWatchHealthy` turns false when a list or watch fails and true once the informer passes that error's resource version: the next list with a newer resource version, or a later event or bookmark. Errors client-go's default watch error handler does not log as errors are not failures either: expired resource version, and an unwrapped EOF (a watch that ended, not a failed list). `IsWatchHealthy` is also false once `GetIndexer` would return `ErrWatchStopped`. A consumer that makes decisions from the cache should read it only when `HasSynced() && IsWatchHealthy()`. The registry sets the informer's watch error handler for this, so an `InformerFunc` must not set its own. Informers run with `parentCtx`, so list and watch errors are logged through the logger in it (`log.IntoContext`), whether client-go or the registry logs them. Without one, client-go falls back to klog and the registry to controller-runtime's global logger.
+
 ## Running the Interactive Example
 
 An interactive example program is included that demonstrates the registry against a live cluster.
@@ -399,6 +401,7 @@ kind delete cluster --name demo
 | Per-key callbacks over a single callback | Different resource types may need different event handling. Consumers that want one callback for all keys pass the same `EventCallback` in every `WatchRequest`. |
 | Reverse index (`consumerKeys`) | Gives O(1) lookup of a consumer's keys. Makes stale-watch detection a set difference instead of a full scan. |
 | Stable callbacks, not call-site closures | `EnsureWatchSet` registers handlers once. Callbacks resolve all dynamic state from the event object at invocation time. |
+| `IsWatchHealthy` separate from `HasSynced` | `WaitForCacheSync` callers expect `HasSynced` to stay true once synced. Health after a later failure is a different question, asked on every read. |
 | Expose `HasSynced` instead of waiting internally | Most consumers don't need the guarantee — resync catches missed events. Those who do can opt in. |
 | Non-blocking channel sends in helpers | Backpressure drops events instead of blocking informer goroutines. The non-zero resync period recovers dropped events on the next relist. |
 | Best-effort handler removal | If `RemoveEventHandler` fails (typically because the informer is already stopped), the handler is removed from the map regardless. |
@@ -408,7 +411,7 @@ kind delete cluster --name demo
 ## Known Limitations
 
 - **Event gap during initial list.** Handlers registered before the informer syncs may miss events. Use `HasSynced` to wait if needed.
-- **Informer startup errors are not surfaced programmatically.** The reflector retries with backoff and logs errors. Monitor reflector logs for persistent failures (RBAC, missing GVR).
+- **`IsWatchHealthy` sees only the errors the reflector reports.** client-go retries connection refused and 429 on a watch or a streaming list itself without reporting them, so the cache stays healthy but frozen until the retry succeeds (backoff capped at 30s). A relist that returns the same resource version as at the error stays unhealthy until a newer event or bookmark. The resource version is set just before the indexer catches up with a relist, so `IsWatchHealthy` can turn true a few milliseconds early.
 - **Parent context cancellation is not a release.** It is meant for process shutdown; use `ReleaseAll` to tear a consumer down while running. Cancelling `parentCtx` stops its informers but leaves their entries in place: registrations return `ErrWatchStopped`, and `Release` is called only when the key is later released or pruned. A later `EnsureWatchSet` keeps using the stopped entries: a consumer that already holds the key gets a dead registration with no error, and another consumer may fail to add its handler, depending on whether `Run` has returned yet. Do not reuse the registry after cancelling `parentCtx`.
 - **A shared informer runs under the first consumer's `parentCtx`.** If consumers pass different contexts and that one is cancelled, the informer stops for every consumer of the key. Pass the same long lived context (the manager's) from every consumer.
 - **Stopped registrations keep their informer.** A registration references its informer, so a stopped informer's cache stays in memory while the registration is held. Refresh registrations from the latest `EnsureWatchSet` and drop old ones.
