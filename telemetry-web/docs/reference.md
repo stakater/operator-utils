@@ -21,7 +21,7 @@ web framework**; framework glue lives in separate adapter modules.
 - [Package reference](#package-reference)
   - [`telemetry`](#package-telemetry) — setup
   - [`telemetry-web/logging`](#package-logging) — trace-correlated logs
-  - [`telemetry-web/endpoint`](#package-endpoint) — operation timing & panics
+  - [`telemetry-web/endpoint`](#package-endpoint) — operation timing, step spans & panics
   - [`telemetry-web/nethttp`](#package-nethttp) — net/http server & client
   - [`adapters/gin`](#package-adaptersgin) — Gin adapter
   - [`adapters/echo`](#package-adaptersecho) — Echo adapter
@@ -330,6 +330,8 @@ re-delegates, so an instrument created earlier would stay bound to it forever.)
 
 ```go
 func Instrument(ctx context.Context, name string) func(err *error)
+func Span(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, func(err *error))
+func InstrumentSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, func(err *error))
 func Recovered(ctx context.Context, recovered any, attrs ...attribute.KeyValue) bool
 func RecordPanic(ctx context.Context, recovered any, attrs ...attribute.KeyValue)
 ```
@@ -351,6 +353,14 @@ Do **not** reach for this inside an HTTP handler served through
 `http.server.request.duration`, per route, method and status. `Instrument` is for
 the work *inside* the handler that no HTTP metric covers, and for operations
 outside any request at all.
+
+**`Span`** — opens a child span of the span in `ctx` for one step and returns
+its context plus a finisher with `Instrument`'s pointer contract; a non-nil
+error is recorded on the span and sets its status to `Error`. The tracer is
+looked up from the global provider on every call, for the same reason the
+instruments are rebuilt. **`InstrumentSpan`** is `Span` plus `Instrument`
+under the same name, so one call both traces and times the step. Span names
+follow the same rule as `Instrument` names: constants, not identifiers.
 
 The histogram is 17 Prometheus series per `{endpoint, outcome}` pair (15 buckets
 plus `_sum` and `_count`), so name operations, don't enumerate identifiers.

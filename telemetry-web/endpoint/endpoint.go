@@ -1,6 +1,6 @@
-// Package endpoint times named operations and records panics against the global
-// OpenTelemetry meter. Instruments are created lazily on first use and rebuilt
-// whenever the global MeterProvider changes.
+// Package endpoint times named operations, traces their steps and records
+// panics against the global OpenTelemetry providers. Instruments are created
+// lazily on first use and rebuilt whenever the global MeterProvider changes.
 package endpoint
 
 import (
