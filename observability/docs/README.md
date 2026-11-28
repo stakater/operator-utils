@@ -9,6 +9,7 @@ runnable program, see [`example/`](../example/).
 | [configuration.md](configuration.md) | Every field on `publisher.Config`, `publisher.PrometheusConfig` and `publisher.OTLPConfig`, default values, environment-variable overrides, and the merge order |
 | [instruments.md](instruments.md) | The `Counter`, `Gauge`, and `Histogram` interfaces — method signatures, semantics, attribute usage, when to pick each |
 | [custom-metrics.md](custom-metrics.md) | Registering metrics via `publisher.CustomMetrics`: validation rules, reserved prefixes, duplicate-name handling, `Must*` panic semantics |
+| [objstate.md](objstate.md) | Per-OBJECT state metrics with correct series lifecycle — a series exists exactly while its object does: one-hot enums, lazy timestamps, condition reasons, storm counters |
 | [exporters.md](exporters.md) | The Prometheus `/metrics` reader and its name translation, OTLP gRPC vs HTTP wiring, stdout exporter, headers, TLS, compression, reader composition, graceful degradation |
 | [extension-points.md](extension-points.md) | Using `resource.Build` and the `bridge` package without going through the `Publisher` — for callers who wire their own `MeterProvider` |
 
